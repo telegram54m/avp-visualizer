@@ -913,7 +913,8 @@ enum DodecahedronVisualizer {
         frames: [FeatureFrame],
         deltaTime: Double,
         appResetCounter: Int,
-        bpmOverride: Float? = nil
+        bpmOverride: Float? = nil,
+        danceabilityOverride: Float? = nil
     ) {
         guard var state = root.components[DodecahedronRootComponent.self] else { return }
         guard !frames.isEmpty else { return }
@@ -1090,17 +1091,33 @@ enum DodecahedronVisualizer {
         // wobble (which happens on instrumental sections with weak
         // percussion) reads as gradual intensity change, not strobing.
         // When `bpmOverride` is set (Shazam-verified canonical BPM from
-        // Tunebat), use it directly instead of the BeatTracker estimate.
-        // Override skips octave folding (Tunebat values are already in
-        // perceived-tempo) and skips confidence weighting (Shazam ID +
-        // database lookup is high-confidence by definition). Falls
-        // through to the BeatTracker path when override is nil.
+        // GetSongBPM), use it directly instead of the BeatTracker
+        // estimate. Override skips octave folding (database values are
+        // already in perceived-tempo) and skips confidence weighting
+        // (Shazam ID + DB lookup is high-confidence by definition).
+        //
+        // When `danceabilityOverride` is ALSO set, blend it with the
+        // BPM-derived tempoT — a slow-but-groovy song (Stayin' Alive
+        // at 104 BPM, danceability 85) should read more energetic than
+        // its tempo alone suggests, and a fast-but-restrained song
+        // (a 130 BPM acoustic piece, danceability 30) should read less
+        // disco than its tempo alone suggests. Weighted 40% tempo /
+        // 60% danceability — danceability is the more direct "should
+        // this feel energetic" signal.
+        //
+        // Falls through to the BeatTracker path when bpm override is nil.
         let blendedTempoT: Float
         let hasBeat: Bool
         if let override = bpmOverride, override > 30 {
             hasBeat = true
-            blendedTempoT = min(1.0, max(0.0,
+            let bpmT = min(1.0, max(0.0,
                 (override - slowBpm) / (fastBpm - slowBpm)))
+            if let dance = danceabilityOverride {
+                let danceT = min(1.0, max(0.0, dance / 100.0))
+                blendedTempoT = bpmT * 0.4 + danceT * 0.6
+            } else {
+                blendedTempoT = bpmT
+            }
         } else {
             let foldedBpm = octaveFoldBpm(f.beat.bpm)
             hasBeat = f.beat.confidence >= beatConfidenceFloor && foldedBpm > 0

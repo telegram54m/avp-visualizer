@@ -42,12 +42,17 @@ enum TunebatBpmFetcher {
     /// the BeatTracker.
     private static let apiKey: String = Secrets.getSongBpmKey
 
-    /// Result of a successful lookup. Carries the BPM and the
-    /// canonical title/artist that GetSongBPM matched (useful for
-    /// logging when our Shazam title doesn't exactly match the
+    /// Result of a successful lookup. Carries the BPM, danceability,
+    /// and the canonical title/artist that GetSongBPM matched (useful
+    /// for logging when our Shazam title doesn't exactly match the
     /// database title — e.g. "Foo (Remastered 2019)" vs "Foo").
+    ///
+    /// `danceability` is GetSongBPM's 0-100 score (their docs call it
+    /// "from 0 to 100"). Sourced from AcousticBrainz per their v1.3
+    /// changelog. Optional because not every track has it indexed.
     struct Result {
         let bpm: Float
+        let danceability: Float?
         let canonicalTitle: String
         let canonicalArtist: String
     }
@@ -73,7 +78,8 @@ enum TunebatBpmFetcher {
 
         if let result = await fetchFromAPI(title: title, artist: artist) {
             writeCache(cacheKey, result: result)
-            bpmLog.info("HV-BPM api \(title, privacy: .public) → \(result.bpm) BPM (\(result.canonicalTitle, privacy: .public) / \(result.canonicalArtist, privacy: .public))")
+            let danceStr = result.danceability.map { "\(Int($0)) dance" } ?? "no dance"
+            bpmLog.info("HV-BPM api \(title, privacy: .public) → \(result.bpm) BPM, \(danceStr, privacy: .public) (\(result.canonicalTitle, privacy: .public) / \(result.canonicalArtist, privacy: .public))")
             return result
         }
 
@@ -230,8 +236,23 @@ enum TunebatBpmFetcher {
             return queryArtist
         }()
 
+        // Danceability: 0-100 from GetSongBPM (sourced from
+        // AcousticBrainz, per their v1.3 changelog). Optional —
+        // older or less popular tracks may not have it indexed.
+        let danceability: Float? = {
+            if let n = item["danceability"] as? NSNumber {
+                let v = n.floatValue
+                return (v >= 0 && v <= 100) ? v : nil
+            }
+            if let s = item["danceability"] as? String, let f = Float(s) {
+                return (f >= 0 && f <= 100) ? f : nil
+            }
+            return nil
+        }()
+
         return Result(
             bpm: bpm,
+            danceability: danceability,
             canonicalTitle: canonicalTitle,
             canonicalArtist: canonicalArtist
         )
@@ -239,11 +260,11 @@ enum TunebatBpmFetcher {
 
     // MARK: - Caching
 
-    // Bumped from `.v1.` after fixing the request headers — older
-    // cached "no match" sentinels reflected 403s from Cloudflare, not
-    // genuine misses. Bump again any time the request shape changes
-    // enough to invalidate previously-failing songs.
-    private static let cachePrefix = "HighVidelity.GetSongBPM.v2."
+    // Bumped to v3 when danceability was added to Result — older
+    // cache entries don't have the field so we need to re-fetch to
+    // populate it for previously-looked-up songs. Bump again any
+    // time the cache value shape changes.
+    private static let cachePrefix = "HighVidelity.GetSongBPM.v3."
 
     private static func makeCacheKey(title: String, artist: String) -> String {
         cachePrefix + normalize("\(title)|\(artist)")
@@ -255,19 +276,25 @@ enum TunebatBpmFetcher {
         }
         if let zero = dict["bpm"] as? Double, zero <= 0 { return nil }
         guard let bpm = dict["bpm"] as? Double, bpm > 30 else { return nil }
+        // Danceability stored as Double; absent in older cache schemas.
+        let danceability: Float? = (dict["danceability"] as? Double).map(Float.init)
         return Result(
             bpm: Float(bpm),
+            danceability: danceability,
             canonicalTitle: (dict["title"] as? String) ?? "",
             canonicalArtist: (dict["artist"] as? String) ?? ""
         )
     }
 
     private static func writeCache(_ key: String, result: Result) {
-        let dict: [String: Any] = [
+        var dict: [String: Any] = [
             "bpm": Double(result.bpm),
             "title": result.canonicalTitle,
             "artist": result.canonicalArtist
         ]
+        if let d = result.danceability {
+            dict["danceability"] = Double(d)
+        }
         UserDefaults.standard.set(dict, forKey: key)
     }
 

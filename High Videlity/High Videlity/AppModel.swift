@@ -109,6 +109,17 @@ class AppModel {
     /// Cached per-song in UserDefaults so repeat plays of the same
     /// song skip the network call.
     var shazamBpmOverride: Float?
+    /// Shazam-verified danceability score from GetSongBPM (0-100 from
+    /// AcousticBrainz). Cleared on track changes; populated alongside
+    /// `shazamBpmOverride` from the same lookup. Nil when:
+    ///   • no Shazam ID yet
+    ///   • lookup hasn't returned
+    ///   • the song genuinely has no danceability in the database
+    /// Tempo-aware visualizers combine this with the BPM-derived
+    /// intensity scale — a 95 BPM song with danceability 90 (think
+    /// disco-era groove) should read more energetic than its tempo
+    /// alone would suggest.
+    var shazamDanceabilityOverride: Float?
     /// Generation counter for `shazamBpmOverride` lookups. Incremented
     /// every time a new Shazam match arrives. The Task that fetches
     /// the BPM captures its generation; on completion it only writes
@@ -564,13 +575,16 @@ class AppModel {
         // from a previous song: if a user track-changes faster than
         // network latency, the older Task's result won't be applied.
         shazamBpmOverride = nil
+        shazamDanceabilityOverride = nil
         bpmLookupGeneration += 1
         let myGeneration = bpmLookupGeneration
         Task { @MainActor in
             if let result = await TunebatBpmFetcher.lookup(title: title, artist: artist) {
                 guard myGeneration == self.bpmLookupGeneration else { return }
                 self.shazamBpmOverride = result.bpm
-                print("[HighVidelity] Tunebat BPM \"\(title)\" — \(artist): \(result.bpm)")
+                self.shazamDanceabilityOverride = result.danceability
+                let danceStr = result.danceability.map { ", dance \(Int($0))" } ?? ""
+                print("[HighVidelity] GetSongBPM \"\(title)\" — \(artist): \(result.bpm) BPM\(danceStr)")
             }
         }
 
