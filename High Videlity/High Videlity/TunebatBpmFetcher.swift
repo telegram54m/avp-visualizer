@@ -182,20 +182,25 @@ enum TunebatBpmFetcher {
               let root = json as? [String: Any] else { return nil }
 
         // Response shapes observed:
-        //   { "search": [ {item}, ... ] }
-        //   { "search": {item} }              // single-result endpoint
-        //   { "search": "Nothing found" }     // "no result" string
+        //   { "search": [ {item}, ... ] }         // normal result list
+        //   { "search": { "error": "no result" }} // empty-DB sentinel
+        //   { "search": {item} }                   // single-result variant
+        //   { "search": "Nothing found" }          // legacy string sentinel
         let items: [[String: Any]] = {
             if let arr = root["search"] as? [[String: Any]] {
                 return arr
             }
             if let single = root["search"] as? [String: Any] {
+                // Treat the error-wrapper variant as "no result"
+                // rather than scoring it as a malformed match. Sentinel
+                // shape: { "error": "no result" }.
+                if single["error"] != nil { return [] }
                 return [single]
             }
             return []
         }()
         guard !items.isEmpty else {
-            bpmLog.notice("HV-BPM api search empty / unexpected shape")
+            bpmLog.notice("HV-BPM api search returned no result")
             return nil
         }
 
