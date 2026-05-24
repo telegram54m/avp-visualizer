@@ -64,11 +64,17 @@ enum MusicBrainzBpmFetcher {
         // the first that does.
         for mbid in mbids {
             if let analysis = await fetchAcousticBrainzLowLevel(mbid: mbid) {
-                let danceability = await fetchAcousticBrainzDanceability(mbid: mbid)
-                mbLog.info("HV-MB hit \(mbid, privacy: .public) → \(analysis.bpm) BPM, key \(analysis.key?.name ?? "?", privacy: .public), dance \(String(describing: danceability), privacy: .public)")
+                // High-level classifiers (danceability, mood_aggressive,
+                // mood_acoustic) come from a separate endpoint — fetch
+                // ONCE and extract everything from the same JSON to
+                // avoid two HTTP round-trips per song.
+                let classifiers = await fetchAcousticBrainzHighLevel(mbid: mbid)
+                mbLog.info("HV-MB hit \(mbid, privacy: .public) → \(analysis.bpm) BPM, key \(analysis.key?.name ?? "?", privacy: .public), dance \(String(describing: classifiers?.danceability), privacy: .public), acoust \(String(describing: classifiers?.acousticness), privacy: .public), aggro \(String(describing: classifiers?.aggressiveness), privacy: .public)")
                 return Result(
                     bpm: analysis.bpm,
-                    danceability: danceability,
+                    danceability: classifiers?.danceability,
+                    acousticness: classifiers?.acousticness,
+                    aggressiveness: classifiers?.aggressiveness,
                     key: analysis.key,
                     canonicalTitle: title,
                     canonicalArtist: artist
@@ -185,19 +191,34 @@ enum MusicBrainzBpmFetcher {
         }
     }
 
-    // MARK: - AcousticBrainz: high-level (danceability classifier)
+    // MARK: - AcousticBrainz: high-level (mood + character classifiers)
 
-    /// Returns a 0-100 danceability score mapped from AcousticBrainz's
-    /// binary classifier + probability. Same scale as GetSongBPM's
-    /// numeric danceability so dodec's downstream blending works
-    /// unchanged.
+    /// All the high-level classifiers we currently consume, each
+    /// mapped from AcousticBrainz's binary "value" + "probability"
+    /// shape into a 0-100 scale (same range as GetSongBPM's numeric
+    /// fields). Nil entries mean the classifier wasn't present in
+    /// the JSON for this MBID.
+    private struct HighLevelClassifiers {
+        let danceability: Float?
+        let acousticness: Float?
+        let aggressiveness: Float?
+    }
+
+    /// Returns 0-100 scores mapped from AcousticBrainz's binary
+    /// classifiers + probability. Mapping used for ALL of them:
+    ///   - `positiveValue ? p*100 : (1-p)*100`
+    /// where `positiveValue` is the classifier-specific "yes" value:
+    ///   - danceability:  "danceable"
+    ///   - mood_acoustic: "acoustic"
+    ///   - mood_aggressive: "aggressive"
     ///
-    /// Mapping: `danceable ? probability*100 : (1-probability)*100`.
-    ///   - danceable, p=1.0  → 100 (definitely danceable)
-    ///   - danceable, p=0.5  → 50  (uncertain)
-    ///   - not_danceable, p=0.5 → 50 (uncertain)
-    ///   - not_danceable, p=1.0 → 0 (definitely not)
-    private static func fetchAcousticBrainzDanceability(mbid: String) async -> Float? {
+    /// Why a single fetch returns all three: each AcousticBrainz call
+    /// is a round-trip to their server; fetching once and extracting
+    /// multiple fields is half the latency of separate calls. JSON
+    /// payload includes ~15 classifiers; we only parse the ones we
+    /// currently use, but adding more (mood_happy, mood_relaxed,
+    /// voice_instrumental, etc.) is one line each.
+    private static func fetchAcousticBrainzHighLevel(mbid: String) async -> HighLevelClassifiers? {
         guard let url = URL(string: "https://acousticbrainz.org/api/v1/\(mbid)/high-level")
         else { return nil }
         var request = URLRequest(url: url)
@@ -210,15 +231,35 @@ enum MusicBrainzBpmFetcher {
                 return nil
             }
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let highlevel = json["highlevel"] as? [String: Any],
-                  let dance = highlevel["danceability"] as? [String: Any],
-                  let value = dance["value"] as? String,
-                  let probability = dance["probability"] as? NSNumber
+                  let highlevel = json["highlevel"] as? [String: Any]
             else { return nil }
-            let p = probability.floatValue
-            return value == "danceable" ? p * 100 : (1 - p) * 100
+            return HighLevelClassifiers(
+                danceability: Self.binaryClassifierScore(
+                    in: highlevel, key: "danceability", positiveValue: "danceable"),
+                acousticness: Self.binaryClassifierScore(
+                    in: highlevel, key: "mood_acoustic", positiveValue: "acoustic"),
+                aggressiveness: Self.binaryClassifierScore(
+                    in: highlevel, key: "mood_aggressive", positiveValue: "aggressive")
+            )
         } catch {
             return nil
         }
+    }
+
+    /// Extract a single AcousticBrainz binary classifier and map to
+    /// 0-100. See `fetchAcousticBrainzHighLevel` doc for the mapping
+    /// formula. Returns nil if the classifier is missing or its
+    /// fields don't parse.
+    private static func binaryClassifierScore(
+        in highlevel: [String: Any],
+        key: String,
+        positiveValue: String
+    ) -> Float? {
+        guard let dict = highlevel[key] as? [String: Any],
+              let value = dict["value"] as? String,
+              let probability = dict["probability"] as? NSNumber
+        else { return nil }
+        let p = probability.floatValue
+        return value == positiveValue ? p * 100 : (1 - p) * 100
     }
 }

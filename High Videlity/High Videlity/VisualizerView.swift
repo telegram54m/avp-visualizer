@@ -364,6 +364,8 @@ struct VisualizerView: View {
                         appResetCounter: appModel.liveModeResetCounter,
                         bpmOverride: appModel.shazamBpmOverride,
                         danceabilityOverride: appModel.shazamDanceabilityOverride,
+                        acousticnessOverride: appModel.shazamAcousticnessOverride,
+                        aggressivenessOverride: appModel.shazamAggressivenessOverride,
                         keyOverride: appModel.shazamKeyOverride
                     )
                     // Surface beat tracker bpm + confidence to the
@@ -531,6 +533,12 @@ struct BeatBadge: View {
                 var parts: [String] = ["\(Int(override.rounded())) bpm"]
                 if let dance = appModel.shazamDanceabilityOverride {
                     parts.append("D\(Int(dance.rounded()))")
+                }
+                if let acoust = appModel.shazamAcousticnessOverride {
+                    parts.append("A\(Int(acoust.rounded()))")
+                }
+                if let aggro = appModel.shazamAggressivenessOverride {
+                    parts.append("X\(Int(aggro.rounded()))")
                 }
                 if let key = appModel.shazamKeyOverride {
                     // Compact key notation: "Em" / "C" / "F#m"

@@ -58,7 +58,20 @@ enum TunebatBpmFetcher {
     /// data in the DB.
     struct Result {
         let bpm: Float
+        /// 0-100, both from GetSongBPM (direct field) and the
+        /// MusicBrainz fallback (mapped from AcousticBrainz binary
+        /// classifier).
         let danceability: Float?
+        /// 0-100. From GetSongBPM's numeric `acousticness` field, or
+        /// derived from AcousticBrainz's binary `mood_acoustic` (via
+        /// the same prob→0..100 mapping used for danceability).
+        /// Higher = more acoustic, lower = more electronic.
+        let acousticness: Float?
+        /// 0-100. Derived from AcousticBrainz's binary
+        /// `mood_aggressive` classifier — GetSongBPM doesn't expose
+        /// an equivalent field, so this is nil when only GetSongBPM
+        /// has the song.
+        let aggressiveness: Float?
         let key: Key?
         let canonicalTitle: String
         let canonicalArtist: String
@@ -85,9 +98,7 @@ enum TunebatBpmFetcher {
 
         if let result = await fetchFromAPI(title: title, artist: artist) {
             writeCache(cacheKey, result: result)
-            let danceStr = result.danceability.map { "\(Int($0)) dance" } ?? "no dance"
-            let keyStr = result.key.map { $0.name } ?? "no key"
-            bpmLog.info("HV-BPM api \(title, privacy: .public) → \(result.bpm) BPM, \(danceStr, privacy: .public), \(keyStr, privacy: .public) (\(result.canonicalTitle, privacy: .public) / \(result.canonicalArtist, privacy: .public))")
+            bpmLog.info("HV-BPM api \(title, privacy: .public) → \(self.describe(result), privacy: .public)")
             return result
         }
 
@@ -98,9 +109,7 @@ enum TunebatBpmFetcher {
         // pre-2018 catalog) coverage.
         if let mbResult = await MusicBrainzBpmFetcher.lookup(title: title, artist: artist) {
             writeCache(cacheKey, result: mbResult)
-            let danceStr = mbResult.danceability.map { "\(Int($0)) dance" } ?? "no dance"
-            let keyStr = mbResult.key.map { $0.name } ?? "no key"
-            bpmLog.info("HV-BPM mb-fallback \(title, privacy: .public) → \(mbResult.bpm) BPM, \(danceStr, privacy: .public), \(keyStr, privacy: .public)")
+            bpmLog.info("HV-BPM mb-fallback \(title, privacy: .public) → \(self.describe(mbResult), privacy: .public)")
             return mbResult
         }
 
@@ -111,6 +120,20 @@ enum TunebatBpmFetcher {
         writeNegativeCache(cacheKey)
         bpmLog.info("HV-BPM no match (both sources) \(title, privacy: .public) — \(artist, privacy: .public)")
         return nil
+    }
+
+    /// Compact one-line description of a Result for logging. Skips
+    /// missing fields. Reads as e.g. "126 BPM, 80 dance, 20 acoust,
+    /// 75 aggro, E major (Stress / Justice)".
+    private static func describe(_ r: Result) -> String {
+        var parts: [String] = ["\(Int(r.bpm.rounded())) BPM"]
+        if let d = r.danceability { parts.append("\(Int(d.rounded())) dance") }
+        if let a = r.acousticness { parts.append("\(Int(a.rounded())) acoust") }
+        if let ag = r.aggressiveness { parts.append("\(Int(ag.rounded())) aggro") }
+        if let k = r.key { parts.append(k.name) }
+        var s = parts.joined(separator: ", ")
+        s += " (\(r.canonicalTitle) / \(r.canonicalArtist))"
+        return s
     }
 
     // MARK: - API call
@@ -284,9 +307,30 @@ enum TunebatBpmFetcher {
             return Self.parseKey(s)
         }()
 
+        // Acousticness: 0-100 from GetSongBPM, same shape as
+        // danceability. Higher = more acoustic. NOT to be confused
+        // with AcousticBrainz's binary `mood_acoustic` — the
+        // MusicBrainz fallback maps that classifier into this
+        // numeric scale so the downstream consumer doesn't have to
+        // branch on source.
+        let acousticness: Float? = {
+            if let n = item["acousticness"] as? NSNumber {
+                let v = n.floatValue
+                return (v >= 0 && v <= 100) ? v : nil
+            }
+            if let s = item["acousticness"] as? String, let f = Float(s) {
+                return (f >= 0 && f <= 100) ? f : nil
+            }
+            return nil
+        }()
+        // GetSongBPM doesn't expose aggressiveness directly — only
+        // the MB fallback populates this.
+
         return Result(
             bpm: bpm,
             danceability: danceability,
+            acousticness: acousticness,
+            aggressiveness: nil,
             key: key,
             canonicalTitle: canonicalTitle,
             canonicalArtist: canonicalArtist
@@ -357,14 +401,10 @@ enum TunebatBpmFetcher {
 
     // MARK: - Caching
 
-    // Bumped to v5 when the MusicBrainz + AcousticBrainz fallback
-    // was added. Negative cache entries from before would have been
-    // stored as "no result" but ONLY against GetSongBPM — the new
-    // chain has a second-chance at finding the song. Bumping the
-    // prefix forces re-lookup so MB gets a shot at previously-missed
-    // titles like Bee Gees' "How Deep Is Your Love" (which GetSongBPM
-    // doesn't have but AcousticBrainz does).
-    private static let cachePrefix = "HighVidelity.GetSongBPM.v5."
+    // Bumped to v6 when acousticness + aggressiveness were added to
+    // Result. Older cache entries don't carry these fields, so
+    // re-fetching populates them for previously-looked-up songs.
+    private static let cachePrefix = "HighVidelity.GetSongBPM.v6."
 
     private static func makeCacheKey(title: String, artist: String) -> String {
         cachePrefix + normalize("\(title)|\(artist)")
@@ -377,6 +417,8 @@ enum TunebatBpmFetcher {
         if let zero = dict["bpm"] as? Double, zero <= 0 { return nil }
         guard let bpm = dict["bpm"] as? Double, bpm > 30 else { return nil }
         let danceability: Float? = (dict["danceability"] as? Double).map(Float.init)
+        let acousticness: Float? = (dict["acousticness"] as? Double).map(Float.init)
+        let aggressiveness: Float? = (dict["aggressiveness"] as? Double).map(Float.init)
         // Key stored as the original raw string (e.g. "Em") and
         // re-parsed on read — keeps the on-disk schema simple and
         // means parser improvements automatically apply to cached
@@ -388,6 +430,8 @@ enum TunebatBpmFetcher {
         return Result(
             bpm: Float(bpm),
             danceability: danceability,
+            acousticness: acousticness,
+            aggressiveness: aggressiveness,
             key: key,
             canonicalTitle: (dict["title"] as? String) ?? "",
             canonicalArtist: (dict["artist"] as? String) ?? ""
@@ -402,6 +446,12 @@ enum TunebatBpmFetcher {
         ]
         if let d = result.danceability {
             dict["danceability"] = Double(d)
+        }
+        if let a = result.acousticness {
+            dict["acousticness"] = Double(a)
+        }
+        if let ag = result.aggressiveness {
+            dict["aggressiveness"] = Double(ag)
         }
         if let k = result.key {
             // Store as a stable key string we can re-parse.

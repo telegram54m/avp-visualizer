@@ -141,6 +141,8 @@ struct ImmersiveView: View {
                         appResetCounter: appModel.liveModeResetCounter,
                         bpmOverride: appModel.shazamBpmOverride,
                         danceabilityOverride: appModel.shazamDanceabilityOverride,
+                        acousticnessOverride: appModel.shazamAcousticnessOverride,
+                        aggressivenessOverride: appModel.shazamAggressivenessOverride,
                         keyOverride: appModel.shazamKeyOverride
                     )
                 }

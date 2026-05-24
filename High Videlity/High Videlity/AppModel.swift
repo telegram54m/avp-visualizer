@@ -127,6 +127,18 @@ class AppModel {
     /// this to anchor the song's tonic to a distinct visual treatment,
     /// independent of which pitch class is loudest at any moment.
     var shazamKeyOverride: Key?
+    /// Shazam-verified acousticness (0-100). From GetSongBPM's numeric
+    /// `acousticness` field, OR from AcousticBrainz's binary
+    /// `mood_acoustic` classifier mapped to the same scale. Higher =
+    /// more acoustic, lower = more electronic. Visualizers use this
+    /// alongside danceability + aggressiveness to characterize
+    /// "what does this song feel like" beyond just tempo.
+    var shazamAcousticnessOverride: Float?
+    /// Shazam-verified aggressiveness (0-100). Derived from
+    /// AcousticBrainz's binary `mood_aggressive` classifier; nil when
+    /// only GetSongBPM has the song (they don't expose an equivalent).
+    /// Higher = more aggressive / punchy / driving.
+    var shazamAggressivenessOverride: Float?
     /// Generation counter for `shazamBpmOverride` lookups. Incremented
     /// every time a new Shazam match arrives. The Task that fetches
     /// the BPM captures its generation; on completion it only writes
@@ -584,6 +596,8 @@ class AppModel {
         shazamBpmOverride = nil
         shazamDanceabilityOverride = nil
         shazamKeyOverride = nil
+        shazamAcousticnessOverride = nil
+        shazamAggressivenessOverride = nil
         bpmLookupGeneration += 1
         let myGeneration = bpmLookupGeneration
         Task { @MainActor in
@@ -592,9 +606,13 @@ class AppModel {
                 self.shazamBpmOverride = result.bpm
                 self.shazamDanceabilityOverride = result.danceability
                 self.shazamKeyOverride = result.key
+                self.shazamAcousticnessOverride = result.acousticness
+                self.shazamAggressivenessOverride = result.aggressiveness
                 let danceStr = result.danceability.map { ", dance \(Int($0))" } ?? ""
+                let acoustStr = result.acousticness.map { ", acoust \(Int($0))" } ?? ""
+                let aggroStr = result.aggressiveness.map { ", aggro \(Int($0))" } ?? ""
                 let keyStr = result.key.map { ", \($0.name)" } ?? ""
-                print("[HighVidelity] GetSongBPM \"\(title)\" — \(artist): \(result.bpm) BPM\(danceStr)\(keyStr)")
+                print("[HighVidelity] GetSongBPM \"\(title)\" — \(artist): \(result.bpm) BPM\(danceStr)\(acoustStr)\(aggroStr)\(keyStr)")
             }
         }
 

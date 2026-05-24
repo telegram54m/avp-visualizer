@@ -956,6 +956,8 @@ enum DodecahedronVisualizer {
         appResetCounter: Int,
         bpmOverride: Float? = nil,
         danceabilityOverride: Float? = nil,
+        acousticnessOverride: Float? = nil,
+        aggressivenessOverride: Float? = nil,
         keyOverride: Key? = nil
     ) {
         guard var state = root.components[DodecahedronRootComponent.self] else { return }
@@ -1169,19 +1171,29 @@ enum DodecahedronVisualizer {
         // wobble (which happens on instrumental sections with weak
         // percussion) reads as gradual intensity change, not strobing.
         // When `bpmOverride` is set (Shazam-verified canonical BPM from
-        // GetSongBPM), use it directly instead of the BeatTracker
-        // estimate. Override skips octave folding (database values are
-        // already in perceived-tempo) and skips confidence weighting
-        // (Shazam ID + DB lookup is high-confidence by definition).
+        // GetSongBPM / MusicBrainz), use it directly instead of the
+        // BeatTracker estimate. Override skips octave folding (database
+        // values are already in perceived-tempo) and skips confidence
+        // weighting (Shazam ID + DB lookup is high-confidence).
         //
-        // When `danceabilityOverride` is ALSO set, blend it with the
-        // BPM-derived tempoT — a slow-but-groovy song (Stayin' Alive
-        // at 104 BPM, danceability 85) should read more energetic than
-        // its tempo alone suggests, and a fast-but-restrained song
-        // (a 130 BPM acoustic piece, danceability 30) should read less
-        // disco than its tempo alone suggests. Weighted 40% tempo /
-        // 60% danceability — danceability is the more direct "should
-        // this feel energetic" signal.
+        // When ANY additional character signals are set, blend them
+        // into a 4-axis "intensity character" tempoT:
+        //   - bpmT          (0-1) — tempo position in slow→fast range
+        //   - danceT        (0-1) — danceability (energy / groove)
+        //   - aggressiveT   (0-1) — punching / driving feel
+        //   - electronicT   (0-1) — inverse of acousticness; high
+        //                          for electronic, low for acoustic
+        // Missing signals default to 0.5 (neutral) so a song with only
+        // a BPM lookup behaves predictably. Weights chosen so tempo +
+        // danceability dominate (most reliable signals), with
+        // aggression + electronic-vs-acoustic refining the character:
+        //   bpm 0.30 + dance 0.30 + aggressive 0.25 + electronic 0.15
+        //
+        // Concrete cases this fixes:
+        //   - 90 BPM aggressive metal: now medium-high intensity instead
+        //     of being treated like a slow ballad
+        //   - 130 BPM acoustic singer-songwriter: now medium intensity
+        //     instead of being treated like full-disco
         //
         // Falls through to the BeatTracker path when bpm override is nil.
         let blendedTempoT: Float
@@ -1190,12 +1202,24 @@ enum DodecahedronVisualizer {
             hasBeat = true
             let bpmT = min(1.0, max(0.0,
                 (override - slowBpm) / (fastBpm - slowBpm)))
-            if let dance = danceabilityOverride {
-                let danceT = min(1.0, max(0.0, dance / 100.0))
-                blendedTempoT = bpmT * 0.4 + danceT * 0.6
-            } else {
-                blendedTempoT = bpmT
-            }
+            let danceT: Float = danceabilityOverride.map {
+                min(1.0, max(0.0, $0 / 100.0))
+            } ?? 0.5
+            let aggressiveT: Float = aggressivenessOverride.map {
+                min(1.0, max(0.0, $0 / 100.0))
+            } ?? 0.5
+            // Acousticness is INVERTED — high acoustic should DAMPEN
+            // intensity (an acoustic song is calmer); high electronic
+            // should BOOST it (an electronic song is more synthetic
+            // and punchy).
+            let electronicT: Float = acousticnessOverride.map {
+                1.0 - min(1.0, max(0.0, $0 / 100.0))
+            } ?? 0.5
+            blendedTempoT =
+                bpmT        * 0.30 +
+                danceT      * 0.30 +
+                aggressiveT * 0.25 +
+                electronicT * 0.15
         } else {
             let foldedBpm = octaveFoldBpm(f.beat.bpm)
             hasBeat = f.beat.confidence >= beatConfidenceFloor && foldedBpm > 0
