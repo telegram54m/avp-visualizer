@@ -146,6 +146,17 @@ class AppModel {
     /// warmth, ORTHOGONAL to intensity — a happy song can be either
     /// energetic or chill; sadness has its own color temperature.
     var shazamHappinessOverride: Float?
+    /// Shazam-verified vocal vs instrumental score (0-100, 100 =
+    /// vocal). AcousticBrainz `voice_instrumental` classifier.
+    /// Visualizers use this to bias melody-vs-texture treatments.
+    var shazamVoiceVocalOverride: Float?
+    /// Shazam-verified timbre brightness (0-100, 100 = bright).
+    /// AcousticBrainz `timbre` classifier. Visualizers modulate
+    /// HDR / saturation of expressive elements (faces, halos).
+    var shazamTimbreBrightnessOverride: Float?
+    /// Shazam-verified time signature ("4/4", "3/4", "6/8", etc.)
+    /// from GetSongBPM. Visualizers can bias rotation cadence.
+    var shazamTimeSigOverride: String?
     /// Generation counter for `shazamBpmOverride` lookups. Incremented
     /// every time a new Shazam match arrives. The Task that fetches
     /// the BPM captures its generation; on completion it only writes
@@ -606,6 +617,9 @@ class AppModel {
         shazamAcousticnessOverride = nil
         shazamAggressivenessOverride = nil
         shazamHappinessOverride = nil
+        shazamVoiceVocalOverride = nil
+        shazamTimbreBrightnessOverride = nil
+        shazamTimeSigOverride = nil
         bpmLookupGeneration += 1
         let myGeneration = bpmLookupGeneration
         Task { @MainActor in
@@ -617,12 +631,9 @@ class AppModel {
                 self.shazamAcousticnessOverride = result.acousticness
                 self.shazamAggressivenessOverride = result.aggressiveness
                 self.shazamHappinessOverride = result.happiness
-                let danceStr = result.danceability.map { ", dance \(Int($0))" } ?? ""
-                let acoustStr = result.acousticness.map { ", acoust \(Int($0))" } ?? ""
-                let aggroStr = result.aggressiveness.map { ", aggro \(Int($0))" } ?? ""
-                let happyStr = result.happiness.map { ", happy \(Int($0))" } ?? ""
-                let keyStr = result.key.map { ", \($0.name)" } ?? ""
-                print("[HighVidelity] GetSongBPM \"\(title)\" — \(artist): \(result.bpm) BPM\(danceStr)\(acoustStr)\(aggroStr)\(happyStr)\(keyStr)")
+                self.shazamVoiceVocalOverride = result.voiceVocal
+                self.shazamTimbreBrightnessOverride = result.timbreBrightness
+                self.shazamTimeSigOverride = result.timeSig
             }
         }
 

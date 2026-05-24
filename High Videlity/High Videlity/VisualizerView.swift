@@ -367,6 +367,9 @@ struct VisualizerView: View {
                         acousticnessOverride: appModel.shazamAcousticnessOverride,
                         aggressivenessOverride: appModel.shazamAggressivenessOverride,
                         happinessOverride: appModel.shazamHappinessOverride,
+                        voiceVocalOverride: appModel.shazamVoiceVocalOverride,
+                        timbreBrightnessOverride: appModel.shazamTimbreBrightnessOverride,
+                        timeSigOverride: appModel.shazamTimeSigOverride,
                         keyOverride: appModel.shazamKeyOverride
                     )
                     // Surface beat tracker bpm + confidence to the
@@ -543,6 +546,16 @@ struct BeatBadge: View {
                 }
                 if let happy = appModel.shazamHappinessOverride {
                     parts.append("H\(Int(happy.rounded()))")
+                }
+                if let voc = appModel.shazamVoiceVocalOverride {
+                    // 'V' for vocal, 'I' for instrumental (visual mnemonic)
+                    parts.append(voc >= 50 ? "V\(Int(voc.rounded()))" : "I\(Int((100-voc).rounded()))")
+                }
+                if let brt = appModel.shazamTimbreBrightnessOverride {
+                    parts.append("T\(Int(brt.rounded()))")
+                }
+                if let ts = appModel.shazamTimeSigOverride {
+                    parts.append(ts)
                 }
                 if let key = appModel.shazamKeyOverride {
                     // Compact key notation: "Em" / "C" / "F#m"

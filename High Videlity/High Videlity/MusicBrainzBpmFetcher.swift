@@ -69,13 +69,16 @@ enum MusicBrainzBpmFetcher {
                 // ONCE and extract everything from the same JSON to
                 // avoid two HTTP round-trips per song.
                 let classifiers = await fetchAcousticBrainzHighLevel(mbid: mbid)
-                mbLog.info("HV-MB hit \(mbid, privacy: .public) → \(analysis.bpm) BPM, key \(analysis.key?.name ?? "?", privacy: .public), dance \(String(describing: classifiers?.danceability), privacy: .public), acoust \(String(describing: classifiers?.acousticness), privacy: .public), aggro \(String(describing: classifiers?.aggressiveness), privacy: .public)")
+                mbLog.info("HV-MB hit \(mbid, privacy: .public) → \(analysis.bpm) BPM, key \(analysis.key?.name ?? "?", privacy: .public)")
                 return Result(
                     bpm: analysis.bpm,
                     danceability: classifiers?.danceability,
                     acousticness: classifiers?.acousticness,
                     aggressiveness: classifiers?.aggressiveness,
                     happiness: classifiers?.happiness,
+                    voiceVocal: classifiers?.voiceVocal,
+                    timbreBrightness: classifiers?.timbreBrightness,
+                    timeSig: nil,  // AB doesn't expose time signature
                     key: analysis.key,
                     canonicalTitle: title,
                     canonicalArtist: artist
@@ -204,6 +207,10 @@ enum MusicBrainzBpmFetcher {
         let acousticness: Float?
         let aggressiveness: Float?
         let happiness: Float?
+        /// 0-100. 100 = vocal, 0 = instrumental.
+        let voiceVocal: Float?
+        /// 0-100. 100 = bright, 0 = dark.
+        let timbreBrightness: Float?
     }
 
     /// Returns 0-100 scores mapped from AcousticBrainz's binary
@@ -243,7 +250,11 @@ enum MusicBrainzBpmFetcher {
                 aggressiveness: Self.binaryClassifierScore(
                     in: highlevel, key: "mood_aggressive", positiveValue: "aggressive"),
                 happiness: Self.binaryClassifierScore(
-                    in: highlevel, key: "mood_happy", positiveValue: "happy")
+                    in: highlevel, key: "mood_happy", positiveValue: "happy"),
+                voiceVocal: Self.binaryClassifierScore(
+                    in: highlevel, key: "voice_instrumental", positiveValue: "voice"),
+                timbreBrightness: Self.binaryClassifierScore(
+                    in: highlevel, key: "timbre", positiveValue: "bright")
             )
         } catch {
             return nil

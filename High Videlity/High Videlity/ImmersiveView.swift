@@ -144,6 +144,9 @@ struct ImmersiveView: View {
                         acousticnessOverride: appModel.shazamAcousticnessOverride,
                         aggressivenessOverride: appModel.shazamAggressivenessOverride,
                         happinessOverride: appModel.shazamHappinessOverride,
+                        voiceVocalOverride: appModel.shazamVoiceVocalOverride,
+                        timbreBrightnessOverride: appModel.shazamTimbreBrightnessOverride,
+                        timeSigOverride: appModel.shazamTimeSigOverride,
                         keyOverride: appModel.shazamKeyOverride
                     )
                 }

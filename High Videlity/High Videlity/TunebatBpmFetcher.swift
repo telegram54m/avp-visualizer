@@ -73,14 +73,24 @@ enum TunebatBpmFetcher {
         /// has the song.
         let aggressiveness: Float?
         /// 0-100. Derived from AcousticBrainz's binary `mood_happy`
-        /// classifier. NOT exposed by GetSongBPM, so this is nil for
-        /// most pop songs (which hit GetSongBPM); populated for
-        /// catalog tracks that go through the MusicBrainz fallback.
-        /// Higher = happier, lower = sadder. Visualizers use this to
-        /// shift palette warmth (cool palette for sad, warm for happy)
-        /// — orthogonal to the intensity character axes since "happy"
-        /// can be either energetic or chill.
+        /// classifier. NOT exposed by GetSongBPM. Higher = happier,
+        /// lower = sadder. Visualizers use this to shift palette
+        /// warmth (cool for sad, warm for happy) — orthogonal to the
+        /// intensity axes since "happy" can be either energetic or chill.
         let happiness: Float?
+        /// 0-100. Derived from AcousticBrainz's binary
+        /// `voice_instrumental` classifier. 100 = vocal, 0 =
+        /// instrumental. Visualizers can use this to bias between
+        /// melody-driven and texture-driven treatments.
+        let voiceVocal: Float?
+        /// 0-100. Derived from AcousticBrainz's binary `timbre`
+        /// classifier. 100 = bright, 0 = dark. Visualizers use this
+        /// to modulate HDR/saturation of expressive elements.
+        let timbreBrightness: Float?
+        /// Time signature string from GetSongBPM (e.g. "4/4", "3/4",
+        /// "6/8"). NOT exposed by AcousticBrainz. Optional; some
+        /// tracks have it as "" or null.
+        let timeSig: String?
         let key: Key?
         let canonicalTitle: String
         let canonicalArtist: String
@@ -105,30 +115,84 @@ enum TunebatBpmFetcher {
             return cached
         }
 
-        if let result = await fetchFromAPI(title: title, artist: artist) {
-            writeCache(cacheKey, result: result)
-            bpmLog.info("HV-BPM api \(title, privacy: .public) → \(self.describe(result), privacy: .public)")
-            return result
-        }
+        // Run both sources CONCURRENTLY. The MB+AB chain (which makes
+        // 2-3 HTTP calls) used to only fire on GetSongBPM miss; that
+        // meant most modern pop songs (which hit GetSongBPM) never
+        // got AB's character classifiers (mood_happy / mood_aggressive
+        // / voice_instrumental / timbre / etc.). Running in parallel
+        // gets us all the AB data we have access to without slowing
+        // the happy path — the slowest call dominates, and on a cache
+        // hit there are zero calls.
+        async let gsbpmTask = fetchFromAPI(title: title, artist: artist)
+        async let mbTask = MusicBrainzBpmFetcher.lookup(title: title, artist: artist)
+        let gsbpm = await gsbpmTask
+        let mb = await mbTask
 
-        // GetSongBPM's database is curated and skews modern/pop.
-        // For classic catalog (Bee Gees, Beatles, etc.) it often has
-        // covers but not the originals. Fall through to MusicBrainz +
-        // AcousticBrainz, which has different (more comprehensive for
-        // pre-2018 catalog) coverage.
-        if let mbResult = await MusicBrainzBpmFetcher.lookup(title: title, artist: artist) {
-            writeCache(cacheKey, result: mbResult)
-            bpmLog.info("HV-BPM mb-fallback \(title, privacy: .public) → \(self.describe(mbResult), privacy: .public)")
-            return mbResult
+        // Merge results: GetSongBPM is authoritative for BPM /
+        // danceability / acousticness / key / time_sig (large
+        // curated DB, numeric fields where appropriate); AB fills
+        // in everything else.
+        if let merged = mergeResults(gsbpm: gsbpm, mb: mb,
+                                     queryTitle: title, queryArtist: artist) {
+            writeCache(cacheKey, result: merged)
+            let source: String = {
+                switch (gsbpm, mb) {
+                case (.some, .some): return "merged"
+                case (.some, .none): return "gsbpm"
+                case (.none, .some): return "mb"
+                case (.none, .none): return "neither"
+                }
+            }()
+            bpmLog.info("HV-BPM \(source, privacy: .public) \(title, privacy: .public) → \(self.describe(merged), privacy: .public)")
+            return merged
         }
 
         // Negative cache so we don't keep retrying the same no-match
         // song. TTL is implicit — entry stays until UserDefaults is
-        // cleared. Revisit if GetSongBPM coverage expands and a
-        // previously-missed song would now be found.
+        // cleared.
         writeNegativeCache(cacheKey)
         bpmLog.info("HV-BPM no match (both sources) \(title, privacy: .public) — \(artist, privacy: .public)")
         return nil
+    }
+
+    /// Merge a GSBPM result with an MB+AB result into one. Returns
+    /// nil only when BOTH inputs are nil (and a BPM can't be found).
+    /// Field precedence rationale:
+    ///   - GSBPM has a 6M-song curated DB with verified numeric
+    ///     danceability + acousticness. AB's danceability is a binary
+    ///     classifier; GSBPM's numeric value is more nuanced where
+    ///     available.
+    ///   - GSBPM exposes time_sig, which AB doesn't surface in its
+    ///     standard JSON.
+    ///   - AB exposes mood + character classifiers (aggressiveness,
+    ///     happiness, voice_instrumental, timbre, etc.) that GSBPM
+    ///     doesn't have. No precedence conflict — they're additive.
+    ///   - Key + BPM: both sources have them. GSBPM's are the
+    ///     canonical "published" key/tempo while AB's are
+    ///     fingerprinted from real audio. GSBPM tends to match what
+    ///     the songwriter labeled the song; AB matches the recording.
+    ///     Usually they agree; when they don't, GSBPM is closer to
+    ///     "intent" — prefer it.
+    private static func mergeResults(
+        gsbpm: Result?, mb: Result?,
+        queryTitle: String, queryArtist: String
+    ) -> Result? {
+        guard let bpm = gsbpm?.bpm ?? mb?.bpm else { return nil }
+        return Result(
+            bpm: bpm,
+            danceability: gsbpm?.danceability ?? mb?.danceability,
+            acousticness: gsbpm?.acousticness ?? mb?.acousticness,
+            aggressiveness: mb?.aggressiveness,      // AB-only
+            happiness: mb?.happiness,                // AB-only
+            voiceVocal: mb?.voiceVocal,              // AB-only
+            timbreBrightness: mb?.timbreBrightness,  // AB-only
+            timeSig: gsbpm?.timeSig,                 // GSBPM-only
+            key: gsbpm?.key ?? mb?.key,
+            canonicalTitle: gsbpm?.canonicalTitle
+                ?? mb?.canonicalTitle ?? queryTitle,
+            canonicalArtist: gsbpm?.canonicalArtist
+                ?? mb?.canonicalArtist ?? queryArtist
+        )
     }
 
     /// Compact one-line description of a Result for logging. Skips
@@ -140,6 +204,9 @@ enum TunebatBpmFetcher {
         if let a = r.acousticness { parts.append("\(Int(a.rounded())) acoust") }
         if let ag = r.aggressiveness { parts.append("\(Int(ag.rounded())) aggro") }
         if let h = r.happiness { parts.append("\(Int(h.rounded())) happy") }
+        if let v = r.voiceVocal { parts.append("\(Int(v.rounded())) voc") }
+        if let t = r.timbreBrightness { parts.append("\(Int(t.rounded())) brt") }
+        if let ts = r.timeSig { parts.append(ts) }
         if let k = r.key { parts.append(k.name) }
         var s = parts.joined(separator: ", ")
         s += " (\(r.canonicalTitle) / \(r.canonicalArtist))"
@@ -333,8 +400,17 @@ enum TunebatBpmFetcher {
             }
             return nil
         }()
-        // GetSongBPM doesn't expose aggressiveness or happiness — only
-        // the MB fallback populates those.
+        // GetSongBPM doesn't expose aggressiveness / happiness /
+        // voiceVocal / timbreBrightness — only the AcousticBrainz
+        // chain populates those.
+        //
+        // GetSongBPM DOES expose time_sig.
+        let timeSig: String? = {
+            guard let s = item["time_sig"] as? String, !s.isEmpty, s != "-" else {
+                return nil
+            }
+            return s
+        }()
 
         return Result(
             bpm: bpm,
@@ -342,6 +418,9 @@ enum TunebatBpmFetcher {
             acousticness: acousticness,
             aggressiveness: nil,
             happiness: nil,
+            voiceVocal: nil,
+            timbreBrightness: nil,
+            timeSig: timeSig,
             key: key,
             canonicalTitle: canonicalTitle,
             canonicalArtist: canonicalArtist
@@ -412,8 +491,11 @@ enum TunebatBpmFetcher {
 
     // MARK: - Caching
 
-    // Bumped to v7 when happiness was added to Result.
-    private static let cachePrefix = "HighVidelity.GetSongBPM.v7."
+    // Bumped to v8 when voiceVocal / timbreBrightness / timeSig were
+    // added AND when the always-fetch-both architecture landed
+    // (previously cached entries were source-specific; now we cache
+    // merged results so the schema is meaningfully different).
+    private static let cachePrefix = "HighVidelity.GetSongBPM.v8."
 
     private static func makeCacheKey(title: String, artist: String) -> String {
         cachePrefix + normalize("\(title)|\(artist)")
@@ -429,6 +511,9 @@ enum TunebatBpmFetcher {
         let acousticness: Float? = (dict["acousticness"] as? Double).map(Float.init)
         let aggressiveness: Float? = (dict["aggressiveness"] as? Double).map(Float.init)
         let happiness: Float? = (dict["happiness"] as? Double).map(Float.init)
+        let voiceVocal: Float? = (dict["voiceVocal"] as? Double).map(Float.init)
+        let timbreBrightness: Float? = (dict["timbreBrightness"] as? Double).map(Float.init)
+        let timeSig: String? = dict["timeSig"] as? String
         // Key stored as the original raw string (e.g. "Em") and
         // re-parsed on read — keeps the on-disk schema simple and
         // means parser improvements automatically apply to cached
@@ -443,6 +528,9 @@ enum TunebatBpmFetcher {
             acousticness: acousticness,
             aggressiveness: aggressiveness,
             happiness: happiness,
+            voiceVocal: voiceVocal,
+            timbreBrightness: timbreBrightness,
+            timeSig: timeSig,
             key: key,
             canonicalTitle: (dict["title"] as? String) ?? "",
             canonicalArtist: (dict["artist"] as? String) ?? ""
@@ -466,6 +554,15 @@ enum TunebatBpmFetcher {
         }
         if let h = result.happiness {
             dict["happiness"] = Double(h)
+        }
+        if let v = result.voiceVocal {
+            dict["voiceVocal"] = Double(v)
+        }
+        if let t = result.timbreBrightness {
+            dict["timbreBrightness"] = Double(t)
+        }
+        if let ts = result.timeSig {
+            dict["timeSig"] = ts
         }
         if let k = result.key {
             // Store as a stable key string we can re-parse.

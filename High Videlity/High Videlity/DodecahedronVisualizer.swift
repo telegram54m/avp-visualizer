@@ -1040,6 +1040,9 @@ enum DodecahedronVisualizer {
         acousticnessOverride: Float? = nil,
         aggressivenessOverride: Float? = nil,
         happinessOverride: Float? = nil,
+        voiceVocalOverride: Float? = nil,
+        timbreBrightnessOverride: Float? = nil,
+        timeSigOverride: String? = nil,
         keyOverride: Key? = nil
     ) {
         guard var state = root.components[DodecahedronRootComponent.self] else { return }
@@ -1170,7 +1173,24 @@ enum DodecahedronVisualizer {
 
         // Advance rotation. Two axes at different rates — Y (yaw) +
         // X (tumble) — gives a non-repeating tumble feel.
-        state.rotationAngle += Float(deltaTime) * rotationSpeed * 2 * .pi
+        //
+        // Time signature biases rotation speed:
+        //   - 3/4 (waltz): 0.75x — emphasizes the 3-beat cycle
+        //   - 6/8 (compound duple): 0.85x — slightly slower for the
+        //     compound feel
+        //   - 5/4, 7/8 (odd meters): 0.90x — slightly off-balance
+        //   - everything else (4/4, 2/4, etc.): 1.0x default
+        // Without override, falls back to 1.0x.
+        let rotationRateScale: Float = {
+            guard let ts = timeSigOverride else { return 1.0 }
+            switch ts {
+            case "3/4":           return 0.75
+            case "6/8":           return 0.85
+            case "5/4", "7/8":    return 0.90
+            default:              return 1.0
+            }
+        }()
+        state.rotationAngle += Float(deltaTime) * rotationSpeed * rotationRateScale * 2 * .pi
 
         // Apply rotation to the rotator subroot. Y first then X so the
         // tumble axis stays world-locked rather than rotating with the
@@ -1220,9 +1240,20 @@ enum DodecahedronVisualizer {
         // Slow continuous heartbeat for the tonic — independent of
         // beat tracker (which can be wobbly) so it's a steady "this
         // is home" signal. Centered on 1.0 so it modulates the
-        // baseline ±amplitude.
-        let tonicPulse: Float = 1.0 + sin(Float(clock) * tonicHeartbeatRate * 2 * .pi)
-            * tonicHeartbeatAmplitude
+        // baseline ±amplitude. Amplitude scales with vocal-vs-
+        // instrumental: vocal songs have a clear melodic lead, so
+        // the tonic pulses more obviously (~1.5× default); instrumental
+        // tracks distribute melody across instruments, so the tonic's
+        // identity is subtler (~0.5× default).
+        let heartbeatAmpScale: Float = {
+            guard let v = voiceVocalOverride else { return 1.0 }
+            // v=0 → 0.5x, v=50 → 1.0x, v=100 → 1.5x
+            return 0.5 + (v / 100.0) * 1.0
+        }()
+        let effectiveHeartbeatAmp = tonicHeartbeatAmplitude * heartbeatAmpScale
+        let tonicPulse: Float = 1.0
+            + sin(Float(clock) * tonicHeartbeatRate * 2 * .pi)
+            * effectiveHeartbeatAmp
 
         // Tempo-driven beam lerp rate. The beam opacity per face is
         // lerped toward an unsmoothed target each tick; the rate of
@@ -1403,13 +1434,27 @@ enum DodecahedronVisualizer {
             // even at rest. Tonic also pulses via tonicPulse.
             // Loudness contribution (0.8) is NOT key-scaled — a loud
             // chord on a non-diatonic note still lights up its face.
+            //
+            // FINAL multiplier: timbre brightness. Bright timbre →
+            // punchier highlights (multiplier up to 1.15×); dark
+            // timbre → more muted (down to 0.85×). Applied as a
+            // global modulator on the active-chroma + loudness
+            // contribution; baseline is unchanged so faces don't
+            // lose their key-anchor identity in dark timbre.
+            let timbreFactor: Float = {
+                guard let t = timbreBrightnessOverride else { return 1.0 }
+                // t=0 (dark) → 0.85, t=50 (neutral) → 1.0, t=100 (bright) → 1.15
+                return 0.85 + (t / 100.0) * 0.30
+            }()
+
             var baseline = faceBaselines[k]
             if tonicIndex == k {
                 baseline *= tonicPulse
             }
-            let emissiveStrength: Float = baseline
-                + min(1.0, Float(highMidIntensity)) * 1.65 * tempoIntensityScale
-                + Float(loud) * 0.8
+            let activeContribution = (min(1.0, Float(highMidIntensity)) * 1.65 * tempoIntensityScale
+                                      + Float(loud) * 0.8)
+                * timbreFactor
+            let emissiveStrength: Float = baseline + activeContribution
             mat.emissiveIntensity = emissiveStrength
             modelComp.materials[0] = mat
             model.components.set(modelComp)
