@@ -35,12 +35,12 @@ private let bpmLog = Logger(subsystem: "com.example.HighVidelity", category: "Ge
 
 enum TunebatBpmFetcher {
 
-    /// GetSongBPM API key. **Paste your key here** — get one (free,
-    /// requires attribution backlink to getsongbpm.com somewhere in
-    /// the app) from getsongbpm.com/api. If left empty, all lookups
-    /// short-circuit to nil and the visualizer falls back to the
-    /// BeatTracker.
-    private static let apiKey: String = "REPLACE_ME"
+    /// GetSongBPM API key. Pulled from the gitignored `Secrets.swift`
+    /// so it doesn't enter public git history. If the placeholder
+    /// `REPLACE_WITH_YOUR_KEY` is still in `Secrets.swift`, all
+    /// lookups short-circuit to nil and the visualizer falls back to
+    /// the BeatTracker.
+    private static let apiKey: String = Secrets.getSongBpmKey
 
     /// Result of a successful lookup. Carries the BPM and the
     /// canonical title/artist that GetSongBPM matched (useful for
@@ -60,7 +60,7 @@ enum TunebatBpmFetcher {
     /// UserDefaults under a normalized key. Second call for the same
     /// (title, artist) returns instantly without network.
     static func lookup(title: String, artist: String) async -> Result? {
-        guard apiKey != "REPLACE_ME", !apiKey.isEmpty else {
+        guard apiKey != "REPLACE_WITH_YOUR_KEY", !apiKey.isEmpty else {
             bpmLog.notice("HV-BPM api key unset — skipping lookup")
             return nil
         }

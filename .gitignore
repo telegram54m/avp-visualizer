@@ -18,6 +18,9 @@ Package.resolved
 # ---- Local Claude Code / IDE settings (personal preferences) ----
 .claude/
 
+# ---- Secrets (API keys etc.) — see Secrets.example.swift for template ----
+**/Secrets.swift
+
 # ---- macOS junk ----
 .DS_Store
 
