@@ -83,6 +83,12 @@ struct DodecahedronRootComponent: Component {
     /// `chromaLerpRate` reaction while beams react rhythmically.
     var smoothedCoreOpacity: [Float] = Array(repeating: 0, count: 12)
     var smoothedHaloOpacity: [Float] = Array(repeating: 0, count: 12)
+    /// Last `happiness` value (0-100) we applied to the sparkle +
+    /// shockwave materials. Materials only get rebuilt when this
+    /// changes — happens once per track change (lookup completes
+    /// with a new value, or song changes back to a value-less default).
+    /// `nil` initially so the first non-nil happiness triggers a refresh.
+    var lastAppliedHappiness: Float? = nil
     /// Smoothed `tempoT` (the [0, 1] position between slowBpm and
     /// fastBpm). The beat tracker bounces — confidence falls during
     /// instrumental sections, oscillates between adjacent locks
@@ -895,6 +901,81 @@ enum DodecahedronVisualizer {
         return root
     }
 
+    // MARK: - Mood-driven palette
+
+    /// Sparkle pool color, modulated by happiness 0..100. nil →
+    /// the original icy-blue default. Below 50 shifts toward a deeper
+    /// cool blue (sad); above 50 shifts toward warm pink (happy). The
+    /// curve is piecewise so the neutral midpoint matches the
+    /// hardcoded default — linear blending between extremes would
+    /// land at a magenta in the middle, which would mean the
+    /// happiness-nil case (most pop songs hitting GetSongBPM) looks
+    /// different from happiness=50.
+    static func sparkleColor(happiness: Float?) -> PlatformColor {
+        let hue: CGFloat
+        let saturation: CGFloat
+        if let h = happiness {
+            let t = CGFloat(min(1.0, max(0.0, h / 100.0)))
+            if t < 0.5 {
+                let f = t * 2  // 0..1 across the sad half
+                hue        = 0.62 - 0.04 * f       // deeper blue → icy default
+                saturation = 0.40 - 0.15 * f       // 0.40 → 0.25
+            } else {
+                let f = (t - 0.5) * 2  // 0..1 across the happy half
+                hue        = 0.58 + (0.92 - 0.58) * f  // icy → warm pink
+                saturation = 0.25 + 0.25 * f           // 0.25 → 0.50
+            }
+        } else {
+            hue = 0.58
+            saturation = 0.25
+        }
+        return PlatformColor.hdrColor(
+            hue: hue, saturation: saturation,
+            brightness: 1.0, hdrBoost: 2.0
+        )
+    }
+
+    /// Shockwave color, modulated by happiness. Sad → cool blue;
+    /// neutral → warm-white (original); happy → warm gold.
+    static func shockwaveColor(happiness: Float?) -> PlatformColor {
+        let hue: CGFloat
+        let saturation: CGFloat
+        if let h = happiness {
+            let t = CGFloat(min(1.0, max(0.0, h / 100.0)))
+            if t < 0.5 {
+                let f = t * 2
+                hue        = 0.60 - 0.54 * f       // cool blue → warm white
+                saturation = 0.40 - 0.20 * f       // 0.40 → 0.20
+            } else {
+                let f = (t - 0.5) * 2
+                hue        = 0.06 + 0.06 * f       // warm white → warm gold
+                saturation = 0.20 + 0.30 * f       // 0.20 → 0.50
+            }
+        } else {
+            hue = 0.06
+            saturation = 0.20
+        }
+        return PlatformColor.hdrColor(
+            hue: hue, saturation: saturation,
+            brightness: 1.0, hdrBoost: 2.5
+        )
+    }
+
+    /// In-place update to an entity's first UnlitMaterial color tint.
+    /// Used by the mood-palette refresh to recolor sparkle + shockwave
+    /// materials without rebuilding their entities or meshes.
+    /// `writesDepth = false` is preserved because that's a property of
+    /// the existing material we're mutating, not something we re-set.
+    private static func updateUnlitTint(_ entity: Entity, color: PlatformColor) {
+        guard let model = entity as? ModelEntity,
+              var modelComp = model.components[ModelComponent.self],
+              var mat = modelComp.materials.first as? UnlitMaterial
+        else { return }
+        mat.color = .init(tint: color)
+        modelComp.materials = [mat]
+        model.components.set(modelComp)
+    }
+
     // MARK: - Tempo helpers
 
     /// Canonical musical-BPM range. Anything outside this gets folded
@@ -958,6 +1039,7 @@ enum DodecahedronVisualizer {
         danceabilityOverride: Float? = nil,
         acousticnessOverride: Float? = nil,
         aggressivenessOverride: Float? = nil,
+        happinessOverride: Float? = nil,
         keyOverride: Key? = nil
     ) {
         guard var state = root.components[DodecahedronRootComponent.self] else { return }
@@ -1441,6 +1523,27 @@ enum DodecahedronVisualizer {
             let shimmer = shimmerBase * phaseWave
             let opacity = min(1.0, twinkle + shimmer)
             child.components.set(OpacityComponent(opacity: opacity))
+        }
+
+        // ---- Mood-driven palette refresh ----
+        // Sparkle pool + shockwave colors track the `happinessOverride`.
+        // We update materials only when the value CHANGES (per Shazam
+        // lookup that returns a happiness, or per track change to nil)
+        // rather than every tick — material replacement triggers a
+        // render-pipeline update each time, and there's no reason to
+        // pay that cost every frame for a value that only changes on
+        // song boundaries.
+        if state.lastAppliedHappiness != happinessOverride {
+            let sparkleTint = sparkleColor(happiness: happinessOverride)
+            let shockwaveTint = shockwaveColor(happiness: happinessOverride)
+            for child in rotator.children {
+                if child.components.has(DodecahedronShockwaveComponent.self) {
+                    updateUnlitTint(child, color: shockwaveTint)
+                } else if child.components.has(DodecahedronSparkleComponent.self) {
+                    updateUnlitTint(child, color: sparkleTint)
+                }
+            }
+            state.lastAppliedHappiness = happinessOverride
         }
 
         root.components.set(state)

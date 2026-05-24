@@ -75,6 +75,7 @@ enum MusicBrainzBpmFetcher {
                     danceability: classifiers?.danceability,
                     acousticness: classifiers?.acousticness,
                     aggressiveness: classifiers?.aggressiveness,
+                    happiness: classifiers?.happiness,
                     key: analysis.key,
                     canonicalTitle: title,
                     canonicalArtist: artist
@@ -202,6 +203,7 @@ enum MusicBrainzBpmFetcher {
         let danceability: Float?
         let acousticness: Float?
         let aggressiveness: Float?
+        let happiness: Float?
     }
 
     /// Returns 0-100 scores mapped from AcousticBrainz's binary
@@ -239,7 +241,9 @@ enum MusicBrainzBpmFetcher {
                 acousticness: Self.binaryClassifierScore(
                     in: highlevel, key: "mood_acoustic", positiveValue: "acoustic"),
                 aggressiveness: Self.binaryClassifierScore(
-                    in: highlevel, key: "mood_aggressive", positiveValue: "aggressive")
+                    in: highlevel, key: "mood_aggressive", positiveValue: "aggressive"),
+                happiness: Self.binaryClassifierScore(
+                    in: highlevel, key: "mood_happy", positiveValue: "happy")
             )
         } catch {
             return nil

@@ -143,6 +143,7 @@ struct ImmersiveView: View {
                         danceabilityOverride: appModel.shazamDanceabilityOverride,
                         acousticnessOverride: appModel.shazamAcousticnessOverride,
                         aggressivenessOverride: appModel.shazamAggressivenessOverride,
+                        happinessOverride: appModel.shazamHappinessOverride,
                         keyOverride: appModel.shazamKeyOverride
                     )
                 }

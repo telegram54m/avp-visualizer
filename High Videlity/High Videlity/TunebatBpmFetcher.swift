@@ -72,6 +72,15 @@ enum TunebatBpmFetcher {
         /// an equivalent field, so this is nil when only GetSongBPM
         /// has the song.
         let aggressiveness: Float?
+        /// 0-100. Derived from AcousticBrainz's binary `mood_happy`
+        /// classifier. NOT exposed by GetSongBPM, so this is nil for
+        /// most pop songs (which hit GetSongBPM); populated for
+        /// catalog tracks that go through the MusicBrainz fallback.
+        /// Higher = happier, lower = sadder. Visualizers use this to
+        /// shift palette warmth (cool palette for sad, warm for happy)
+        /// — orthogonal to the intensity character axes since "happy"
+        /// can be either energetic or chill.
+        let happiness: Float?
         let key: Key?
         let canonicalTitle: String
         let canonicalArtist: String
@@ -130,6 +139,7 @@ enum TunebatBpmFetcher {
         if let d = r.danceability { parts.append("\(Int(d.rounded())) dance") }
         if let a = r.acousticness { parts.append("\(Int(a.rounded())) acoust") }
         if let ag = r.aggressiveness { parts.append("\(Int(ag.rounded())) aggro") }
+        if let h = r.happiness { parts.append("\(Int(h.rounded())) happy") }
         if let k = r.key { parts.append(k.name) }
         var s = parts.joined(separator: ", ")
         s += " (\(r.canonicalTitle) / \(r.canonicalArtist))"
@@ -323,14 +333,15 @@ enum TunebatBpmFetcher {
             }
             return nil
         }()
-        // GetSongBPM doesn't expose aggressiveness directly — only
-        // the MB fallback populates this.
+        // GetSongBPM doesn't expose aggressiveness or happiness — only
+        // the MB fallback populates those.
 
         return Result(
             bpm: bpm,
             danceability: danceability,
             acousticness: acousticness,
             aggressiveness: nil,
+            happiness: nil,
             key: key,
             canonicalTitle: canonicalTitle,
             canonicalArtist: canonicalArtist
@@ -401,10 +412,8 @@ enum TunebatBpmFetcher {
 
     // MARK: - Caching
 
-    // Bumped to v6 when acousticness + aggressiveness were added to
-    // Result. Older cache entries don't carry these fields, so
-    // re-fetching populates them for previously-looked-up songs.
-    private static let cachePrefix = "HighVidelity.GetSongBPM.v6."
+    // Bumped to v7 when happiness was added to Result.
+    private static let cachePrefix = "HighVidelity.GetSongBPM.v7."
 
     private static func makeCacheKey(title: String, artist: String) -> String {
         cachePrefix + normalize("\(title)|\(artist)")
@@ -419,6 +428,7 @@ enum TunebatBpmFetcher {
         let danceability: Float? = (dict["danceability"] as? Double).map(Float.init)
         let acousticness: Float? = (dict["acousticness"] as? Double).map(Float.init)
         let aggressiveness: Float? = (dict["aggressiveness"] as? Double).map(Float.init)
+        let happiness: Float? = (dict["happiness"] as? Double).map(Float.init)
         // Key stored as the original raw string (e.g. "Em") and
         // re-parsed on read — keeps the on-disk schema simple and
         // means parser improvements automatically apply to cached
@@ -432,6 +442,7 @@ enum TunebatBpmFetcher {
             danceability: danceability,
             acousticness: acousticness,
             aggressiveness: aggressiveness,
+            happiness: happiness,
             key: key,
             canonicalTitle: (dict["title"] as? String) ?? "",
             canonicalArtist: (dict["artist"] as? String) ?? ""
@@ -452,6 +463,9 @@ enum TunebatBpmFetcher {
         }
         if let ag = result.aggressiveness {
             dict["aggressiveness"] = Double(ag)
+        }
+        if let h = result.happiness {
+            dict["happiness"] = Double(h)
         }
         if let k = result.key {
             // Store as a stable key string we can re-parse.

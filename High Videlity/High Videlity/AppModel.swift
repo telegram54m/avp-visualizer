@@ -139,6 +139,13 @@ class AppModel {
     /// only GetSongBPM has the song (they don't expose an equivalent).
     /// Higher = more aggressive / punchy / driving.
     var shazamAggressivenessOverride: Float?
+    /// Shazam-verified happiness (0-100). Derived from AcousticBrainz's
+    /// binary `mood_happy` classifier (so only MB-fallback songs have
+    /// it; GetSongBPM doesn't expose a happiness field). Higher =
+    /// happier, lower = sadder. Visualizers use this to shift palette
+    /// warmth, ORTHOGONAL to intensity — a happy song can be either
+    /// energetic or chill; sadness has its own color temperature.
+    var shazamHappinessOverride: Float?
     /// Generation counter for `shazamBpmOverride` lookups. Incremented
     /// every time a new Shazam match arrives. The Task that fetches
     /// the BPM captures its generation; on completion it only writes
@@ -598,6 +605,7 @@ class AppModel {
         shazamKeyOverride = nil
         shazamAcousticnessOverride = nil
         shazamAggressivenessOverride = nil
+        shazamHappinessOverride = nil
         bpmLookupGeneration += 1
         let myGeneration = bpmLookupGeneration
         Task { @MainActor in
@@ -608,11 +616,13 @@ class AppModel {
                 self.shazamKeyOverride = result.key
                 self.shazamAcousticnessOverride = result.acousticness
                 self.shazamAggressivenessOverride = result.aggressiveness
+                self.shazamHappinessOverride = result.happiness
                 let danceStr = result.danceability.map { ", dance \(Int($0))" } ?? ""
                 let acoustStr = result.acousticness.map { ", acoust \(Int($0))" } ?? ""
                 let aggroStr = result.aggressiveness.map { ", aggro \(Int($0))" } ?? ""
+                let happyStr = result.happiness.map { ", happy \(Int($0))" } ?? ""
                 let keyStr = result.key.map { ", \($0.name)" } ?? ""
-                print("[HighVidelity] GetSongBPM \"\(title)\" — \(artist): \(result.bpm) BPM\(danceStr)\(acoustStr)\(aggroStr)\(keyStr)")
+                print("[HighVidelity] GetSongBPM \"\(title)\" — \(artist): \(result.bpm) BPM\(danceStr)\(acoustStr)\(aggroStr)\(happyStr)\(keyStr)")
             }
         }
 
