@@ -91,12 +91,25 @@ enum TunebatBpmFetcher {
             return result
         }
 
+        // GetSongBPM's database is curated and skews modern/pop.
+        // For classic catalog (Bee Gees, Beatles, etc.) it often has
+        // covers but not the originals. Fall through to MusicBrainz +
+        // AcousticBrainz, which has different (more comprehensive for
+        // pre-2018 catalog) coverage.
+        if let mbResult = await MusicBrainzBpmFetcher.lookup(title: title, artist: artist) {
+            writeCache(cacheKey, result: mbResult)
+            let danceStr = mbResult.danceability.map { "\(Int($0)) dance" } ?? "no dance"
+            let keyStr = mbResult.key.map { $0.name } ?? "no key"
+            bpmLog.info("HV-BPM mb-fallback \(title, privacy: .public) → \(mbResult.bpm) BPM, \(danceStr, privacy: .public), \(keyStr, privacy: .public)")
+            return mbResult
+        }
+
         // Negative cache so we don't keep retrying the same no-match
         // song. TTL is implicit — entry stays until UserDefaults is
         // cleared. Revisit if GetSongBPM coverage expands and a
         // previously-missed song would now be found.
         writeNegativeCache(cacheKey)
-        bpmLog.info("HV-BPM no match \(title, privacy: .public) — \(artist, privacy: .public)")
+        bpmLog.info("HV-BPM no match (both sources) \(title, privacy: .public) — \(artist, privacy: .public)")
         return nil
     }
 
@@ -344,11 +357,14 @@ enum TunebatBpmFetcher {
 
     // MARK: - Caching
 
-    // Bumped to v4 when key was added to Result — older cache
-    // entries don't have the key field so we need to re-fetch to
-    // populate it for previously-looked-up songs. Bump any time
-    // the cache value shape changes.
-    private static let cachePrefix = "HighVidelity.GetSongBPM.v4."
+    // Bumped to v5 when the MusicBrainz + AcousticBrainz fallback
+    // was added. Negative cache entries from before would have been
+    // stored as "no result" but ONLY against GetSongBPM — the new
+    // chain has a second-chance at finding the song. Bumping the
+    // prefix forces re-lookup so MB gets a shot at previously-missed
+    // titles like Bee Gees' "How Deep Is Your Love" (which GetSongBPM
+    // doesn't have but AcousticBrainz does).
+    private static let cachePrefix = "HighVidelity.GetSongBPM.v5."
 
     private static func makeCacheKey(title: String, artist: String) -> String {
         cachePrefix + normalize("\(title)|\(artist)")
