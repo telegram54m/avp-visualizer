@@ -100,7 +100,13 @@ enum TunebatBpmFetcher {
         if !cleanedArtist.isEmpty {
             lookup += " artist:\(cleanedArtist)"
         }
-        var components = URLComponents(string: "https://api.getsongbpm.com/search/")
+        // Per their docs (changelog v1.2, 2024-09-25): the API moved to
+        // `api.getsong.co`. The old `api.getsongbpm.com` host now sits
+        // behind Cloudflare's bot challenge mode and 403s every native
+        // HTTP client (curl, URLSession) — only browsers pass. The new
+        // host doesn't have that protection and accepts plain HTTP/2
+        // requests.
+        var components = URLComponents(string: "https://api.getsong.co/search/")
         components?.queryItems = [
             URLQueryItem(name: "api_key", value: apiKey),
             URLQueryItem(name: "type", value: "both"),
@@ -233,7 +239,11 @@ enum TunebatBpmFetcher {
 
     // MARK: - Caching
 
-    private static let cachePrefix = "HighVidelity.GetSongBPM."
+    // Bumped from `.v1.` after fixing the request headers — older
+    // cached "no match" sentinels reflected 403s from Cloudflare, not
+    // genuine misses. Bump again any time the request shape changes
+    // enough to invalidate previously-failing songs.
+    private static let cachePrefix = "HighVidelity.GetSongBPM.v2."
 
     private static func makeCacheKey(title: String, artist: String) -> String {
         cachePrefix + normalize("\(title)|\(artist)")
