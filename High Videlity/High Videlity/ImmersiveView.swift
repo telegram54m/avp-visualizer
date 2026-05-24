@@ -140,7 +140,8 @@ struct ImmersiveView: View {
                         deltaTime: event.deltaTime,
                         appResetCounter: appModel.liveModeResetCounter,
                         bpmOverride: appModel.shazamBpmOverride,
-                        danceabilityOverride: appModel.shazamDanceabilityOverride
+                        danceabilityOverride: appModel.shazamDanceabilityOverride,
+                        keyOverride: appModel.shazamKeyOverride
                     )
                 }
             }

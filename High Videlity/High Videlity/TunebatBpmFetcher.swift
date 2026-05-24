@@ -30,6 +30,7 @@
 
 import Foundation
 import OSLog
+import AudioAnalysis
 
 private let bpmLog = Logger(subsystem: "com.example.HighVidelity", category: "GetSongBPM")
 
@@ -50,9 +51,15 @@ enum TunebatBpmFetcher {
     /// `danceability` is GetSongBPM's 0-100 score (their docs call it
     /// "from 0 to 100"). Sourced from AcousticBrainz per their v1.3
     /// changelog. Optional because not every track has it indexed.
+    ///
+    /// `key` is the canonical tonic + mode for the song (e.g. C major,
+    /// F# minor). Parsed from GetSongBPM's `key_of` string ("C", "Em",
+    /// "F#m", "Bb", etc.). Optional because not every track has key
+    /// data in the DB.
     struct Result {
         let bpm: Float
         let danceability: Float?
+        let key: Key?
         let canonicalTitle: String
         let canonicalArtist: String
     }
@@ -79,7 +86,8 @@ enum TunebatBpmFetcher {
         if let result = await fetchFromAPI(title: title, artist: artist) {
             writeCache(cacheKey, result: result)
             let danceStr = result.danceability.map { "\(Int($0)) dance" } ?? "no dance"
-            bpmLog.info("HV-BPM api \(title, privacy: .public) → \(result.bpm) BPM, \(danceStr, privacy: .public) (\(result.canonicalTitle, privacy: .public) / \(result.canonicalArtist, privacy: .public))")
+            let keyStr = result.key.map { $0.name } ?? "no key"
+            bpmLog.info("HV-BPM api \(title, privacy: .public) → \(result.bpm) BPM, \(danceStr, privacy: .public), \(keyStr, privacy: .public) (\(result.canonicalTitle, privacy: .public) / \(result.canonicalArtist, privacy: .public))")
             return result
         }
 
@@ -250,43 +258,122 @@ enum TunebatBpmFetcher {
             return nil
         }()
 
+        // Key: parse strings like "C", "Em", "F#m", "Bb", "Abm" into
+        // a Key (tonic + mode). Optional — older tracks sometimes
+        // have no key data. We don't trust empty strings or "-" etc.
+        let key: Key? = {
+            guard let s = item["key_of"] as? String, !s.isEmpty else { return nil }
+            return Self.parseKey(s)
+        }()
+
         return Result(
             bpm: bpm,
             danceability: danceability,
+            key: key,
             canonicalTitle: canonicalTitle,
             canonicalArtist: canonicalArtist
         )
     }
 
+    /// Parse GetSongBPM's `key_of` string into an `AudioAnalysis.Key`.
+    /// Their format mixes sharp and flat notation depending on the
+    /// song's canonical published key — we accept both and normalize
+    /// to the `PitchClass` enum's sharp-named cases.
+    ///
+    /// Examples:
+    ///   "C"   → C major
+    ///   "Em"  → E minor
+    ///   "F#m" → F# minor
+    ///   "Bb"  → Bb major (= A# in our PitchClass enum)
+    ///   "Abm" → Ab minor (= G# minor)
+    static func parseKey(_ raw: String) -> Key? {
+        var s = raw.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty else { return nil }
+        // Mode: "m" suffix → minor; otherwise major. Some sources
+        // write " minor" or " maj" — accept that too.
+        let lower = s.lowercased()
+        let mode: Mode
+        if lower.hasSuffix(" minor") {
+            mode = .minor
+            s = String(s.dropLast(" minor".count))
+        } else if lower.hasSuffix(" major") {
+            mode = .major
+            s = String(s.dropLast(" major".count))
+        } else if lower.hasSuffix("min") {
+            mode = .minor
+            s = String(s.dropLast("min".count))
+        } else if lower.hasSuffix("maj") {
+            mode = .major
+            s = String(s.dropLast("maj".count))
+        } else if s.hasSuffix("m") && s.count > 1 {
+            // Single trailing 'm' = minor. Must check count > 1 so
+            // that a bare "m" doesn't pass.
+            mode = .minor
+            s = String(s.dropLast())
+        } else {
+            mode = .major
+        }
+        s = s.trimmingCharacters(in: .whitespaces)
+
+        // Pitch class: handle natural, sharp, flat. Normalize flats
+        // by mapping to the equivalent sharp (PitchClass uses sharp
+        // names: c, cSharp, d, dSharp, ...).
+        let tonic: PitchClass
+        switch s.uppercased() {
+        case "C":            tonic = .c
+        case "C#", "DB":     tonic = .cSharp
+        case "D":            tonic = .d
+        case "D#", "EB":     tonic = .dSharp
+        case "E":            tonic = .e
+        case "F":            tonic = .f
+        case "F#", "GB":     tonic = .fSharp
+        case "G":            tonic = .g
+        case "G#", "AB":     tonic = .gSharp
+        case "A":            tonic = .a
+        case "A#", "BB":     tonic = .aSharp
+        case "B":            tonic = .b
+        default:             return nil
+        }
+        return Key(tonic: tonic, mode: mode)
+    }
+
     // MARK: - Caching
 
-    // Bumped to v3 when danceability was added to Result — older
-    // cache entries don't have the field so we need to re-fetch to
-    // populate it for previously-looked-up songs. Bump again any
-    // time the cache value shape changes.
-    private static let cachePrefix = "HighVidelity.GetSongBPM.v3."
+    // Bumped to v4 when key was added to Result — older cache
+    // entries don't have the key field so we need to re-fetch to
+    // populate it for previously-looked-up songs. Bump any time
+    // the cache value shape changes.
+    private static let cachePrefix = "HighVidelity.GetSongBPM.v4."
 
     private static func makeCacheKey(title: String, artist: String) -> String {
         cachePrefix + normalize("\(title)|\(artist)")
     }
 
-    private static func readCache(_ key: String) -> Result? {
-        guard let dict = UserDefaults.standard.dictionary(forKey: key) else {
+    private static func readCache(_ cacheKey: String) -> Result? {
+        guard let dict = UserDefaults.standard.dictionary(forKey: cacheKey) else {
             return nil
         }
         if let zero = dict["bpm"] as? Double, zero <= 0 { return nil }
         guard let bpm = dict["bpm"] as? Double, bpm > 30 else { return nil }
-        // Danceability stored as Double; absent in older cache schemas.
         let danceability: Float? = (dict["danceability"] as? Double).map(Float.init)
+        // Key stored as the original raw string (e.g. "Em") and
+        // re-parsed on read — keeps the on-disk schema simple and
+        // means parser improvements automatically apply to cached
+        // entries.
+        let key: Key? = {
+            guard let raw = dict["keyOf"] as? String, !raw.isEmpty else { return nil }
+            return parseKey(raw)
+        }()
         return Result(
             bpm: Float(bpm),
             danceability: danceability,
+            key: key,
             canonicalTitle: (dict["title"] as? String) ?? "",
             canonicalArtist: (dict["artist"] as? String) ?? ""
         )
     }
 
-    private static func writeCache(_ key: String, result: Result) {
+    private static func writeCache(_ cacheKey: String, result: Result) {
         var dict: [String: Any] = [
             "bpm": Double(result.bpm),
             "title": result.canonicalTitle,
@@ -295,7 +382,12 @@ enum TunebatBpmFetcher {
         if let d = result.danceability {
             dict["danceability"] = Double(d)
         }
-        UserDefaults.standard.set(dict, forKey: key)
+        if let k = result.key {
+            // Store as a stable key string we can re-parse.
+            let modeSuffix = k.mode == .minor ? "m" : ""
+            dict["keyOf"] = "\(k.tonic.name)\(modeSuffix)"
+        }
+        UserDefaults.standard.set(dict, forKey: cacheKey)
     }
 
     private static func writeNegativeCache(_ key: String) {

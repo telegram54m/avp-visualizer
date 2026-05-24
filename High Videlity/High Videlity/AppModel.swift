@@ -120,6 +120,13 @@ class AppModel {
     /// disco-era groove) should read more energetic than its tempo
     /// alone would suggest.
     var shazamDanceabilityOverride: Float?
+    /// Shazam-verified canonical Key (tonic pitch class + mode) from
+    /// GetSongBPM. Cleared on track changes; populated alongside the
+    /// other override values from the same lookup. Visualizers that
+    /// care about pitch identity (e.g. Dodecahedron's 12 faces) use
+    /// this to anchor the song's tonic to a distinct visual treatment,
+    /// independent of which pitch class is loudest at any moment.
+    var shazamKeyOverride: Key?
     /// Generation counter for `shazamBpmOverride` lookups. Incremented
     /// every time a new Shazam match arrives. The Task that fetches
     /// the BPM captures its generation; on completion it only writes
@@ -576,6 +583,7 @@ class AppModel {
         // network latency, the older Task's result won't be applied.
         shazamBpmOverride = nil
         shazamDanceabilityOverride = nil
+        shazamKeyOverride = nil
         bpmLookupGeneration += 1
         let myGeneration = bpmLookupGeneration
         Task { @MainActor in
@@ -583,8 +591,10 @@ class AppModel {
                 guard myGeneration == self.bpmLookupGeneration else { return }
                 self.shazamBpmOverride = result.bpm
                 self.shazamDanceabilityOverride = result.danceability
+                self.shazamKeyOverride = result.key
                 let danceStr = result.danceability.map { ", dance \(Int($0))" } ?? ""
-                print("[HighVidelity] GetSongBPM \"\(title)\" — \(artist): \(result.bpm) BPM\(danceStr)")
+                let keyStr = result.key.map { ", \($0.name)" } ?? ""
+                print("[HighVidelity] GetSongBPM \"\(title)\" — \(artist): \(result.bpm) BPM\(danceStr)\(keyStr)")
             }
         }
 

@@ -363,7 +363,8 @@ struct VisualizerView: View {
                         deltaTime: event.deltaTime,
                         appResetCounter: appModel.liveModeResetCounter,
                         bpmOverride: appModel.shazamBpmOverride,
-                        danceabilityOverride: appModel.shazamDanceabilityOverride
+                        danceabilityOverride: appModel.shazamDanceabilityOverride,
+                        keyOverride: appModel.shazamKeyOverride
                     )
                     // Surface beat tracker bpm + confidence to the
                     // debug BeatBadge. Throttled inside recordBeat so
@@ -525,13 +526,18 @@ struct BeatBadge: View {
             // Shazam-verified override takes precedence — show it
             // distinctly so we can see in the UI when the visualizer
             // is on locked-canonical-bpm vs falling back to the
-            // tracker. Includes danceability when available.
+            // tracker. Includes danceability + key when available.
             if let override = appModel.shazamBpmOverride {
-                let bpmText = "\(Int(override.rounded())) bpm"
+                var parts: [String] = ["\(Int(override.rounded())) bpm"]
                 if let dance = appModel.shazamDanceabilityOverride {
-                    return "\(bpmText) · D\(Int(dance.rounded())) ✓"
+                    parts.append("D\(Int(dance.rounded()))")
                 }
-                return "\(bpmText) ✓ shazam"
+                if let key = appModel.shazamKeyOverride {
+                    // Compact key notation: "Em" / "C" / "F#m"
+                    let modeSuffix = key.mode == .minor ? "m" : ""
+                    parts.append("\(key.tonic.name)\(modeSuffix)")
+                }
+                return parts.joined(separator: " · ") + " ✓"
             }
             if conf < 0.3 {
                 return "— bpm"

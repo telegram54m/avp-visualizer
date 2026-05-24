@@ -379,6 +379,47 @@ enum DodecahedronVisualizer {
     /// absolute dominant pitch fire at slow tempos.
     static let beamThresholdOffsetSlow: Float = 0.45
 
+    // MARK: - Key-anchored face treatment
+
+    /// Per-face baseline emissive intensity when a canonical song key
+    /// is known. The 12 faces split into three tiers:
+    /// - TONIC: the song's home pitch class — brightest baseline,
+    ///   visibly "breathes" via a slow sin pulse so it's recognizable
+    ///   regardless of what the chromagram is currently doing.
+    /// - DIATONIC (other 6 scale degrees): noticeable baseline; reads
+    ///   as the song's "color palette" lit up.
+    /// - NON-DIATONIC (the 5 outside-the-scale pitches): near-dark
+    ///   baseline; only lights up when its chromagram bin really
+    ///   activates (i.e. when the song accidentally hits one of those
+    ///   notes — chromatic passing tones, modulations, etc.).
+    ///
+    /// At rest (silence), the constellation of bright vs dim faces
+    /// spells out the song's key visually. Songs in different keys
+    /// look immediately distinct.
+    ///
+    /// When NO key is known (no Shazam ID, or DB miss), falls back to
+    /// a uniform 0.15 baseline (matching the pre-key-override era).
+    static let tonicBaseline: Float = 0.55
+    static let diatonicBaseline: Float = 0.30
+    static let nonDiatonicBaseline: Float = 0.10
+    static let noKeyBaseline: Float = 0.15
+
+    /// Tonic-face heartbeat — slow sin pulse so the home note is
+    /// recognizable even at rest. 0.5 Hz = 2-second period; amplitude
+    /// 0.15 (small) — enough to read as "alive" without being
+    /// distracting.
+    static let tonicHeartbeatRate: Float = 0.5
+    static let tonicHeartbeatAmplitude: Float = 0.15
+
+    /// Major-scale step set (semitones from tonic). Diatonic
+    /// membership for any major key is `{ (tonic.raw + s) % 12 for s in this }`.
+    static let majorScaleSteps: [Int] = [0, 2, 4, 5, 7, 9, 11]
+    /// Natural minor scale step set. Note: this is the natural minor;
+    /// harmonic and melodic minor have raised 7ths/6ths that GetSongBPM
+    /// doesn't distinguish. Natural minor is the right default for
+    /// "what notes belong in this song" visualization.
+    static let minorScaleSteps: [Int] = [0, 2, 3, 5, 7, 8, 10]
+
     /// Per-face beam-fan threshold for the OUTER halo. The bass band's
     /// pitch-class energy at face k must cross this fraction of the
     /// band's max-bin to fire that face's halo. Lower than the
@@ -914,7 +955,8 @@ enum DodecahedronVisualizer {
         deltaTime: Double,
         appResetCounter: Int,
         bpmOverride: Float? = nil,
-        danceabilityOverride: Float? = nil
+        danceabilityOverride: Float? = nil,
+        keyOverride: Key? = nil
     ) {
         guard var state = root.components[DodecahedronRootComponent.self] else { return }
         guard !frames.isEmpty else { return }
@@ -1061,6 +1103,42 @@ enum DodecahedronVisualizer {
         rotator.orientation = tumbleQ * yawQ
         let rotatorRotation = rotator.orientation
         let loud = state.smoothedLoudness
+
+        // Key-anchored per-face baseline. When the song's canonical
+        // key is known, every face gets a baseline emissive intensity
+        // that reflects its membership in the song's scale: tonic
+        // (1 face) > diatonic (6 other scale degrees) > non-diatonic
+        // (5 outside-the-scale pitches). The TONIC face additionally
+        // pulses via a slow sin "heartbeat" so it's recognizable
+        // independent of the chromagram. When no key is known, all
+        // faces get the legacy uniform baseline.
+        let faceBaselines: [Float] = {
+            guard let key = keyOverride else {
+                return Array(repeating: noKeyBaseline, count: 12)
+            }
+            let tonicIndex = key.tonic.rawValue
+            let stepsFromTonic = key.mode == .major
+                ? majorScaleSteps : minorScaleSteps
+            let diatonicSet = Set(stepsFromTonic.map { (tonicIndex + $0) % 12 })
+            var out = [Float](repeating: 0, count: 12)
+            for k in 0..<12 {
+                if k == tonicIndex {
+                    out[k] = tonicBaseline
+                } else if diatonicSet.contains(k) {
+                    out[k] = diatonicBaseline
+                } else {
+                    out[k] = nonDiatonicBaseline
+                }
+            }
+            return out
+        }()
+        let tonicIndex: Int? = keyOverride.map { $0.tonic.rawValue }
+        // Slow continuous heartbeat for the tonic — independent of
+        // beat tracker (which can be wobbly) so it's a steady "this
+        // is home" signal. Centered on 1.0 so it modulates the
+        // baseline ±amplitude.
+        let tonicPulse: Float = 1.0 + sin(Float(clock) * tonicHeartbeatRate * 2 * .pi)
+            * tonicHeartbeatAmplitude
 
         // Tempo-driven beam lerp rate. The beam opacity per face is
         // lerped toward an unsmoothed target each tick; the rate of
@@ -1213,11 +1291,17 @@ enum DodecahedronVisualizer {
             // where the song's melodic identity lives. The chroma
             // contribution scales with `tempoIntensityScale` so slow
             // songs read as softer glows rather than constantly
-            // saturated metal. Baseline (0.15) and loudness
-            // contribution (0.8) are NOT scaled — faces never go fully
-            // dark, and a loud-but-slow ballad still glows from the
-            // loudness term.
-            let emissiveStrength: Float = 0.15
+            // saturated metal. Baseline is now KEY-AWARE:
+            // tonic / diatonic / non-diatonic faces get different
+            // baselines so the song's scale "spells itself out"
+            // even at rest. Tonic also pulses via tonicPulse.
+            // Loudness contribution (0.8) is NOT key-scaled — a loud
+            // chord on a non-diatonic note still lights up its face.
+            var baseline = faceBaselines[k]
+            if tonicIndex == k {
+                baseline *= tonicPulse
+            }
+            let emissiveStrength: Float = baseline
                 + min(1.0, Float(highMidIntensity)) * 1.65 * tempoIntensityScale
                 + Float(loud) * 0.8
             mat.emissiveIntensity = emissiveStrength
