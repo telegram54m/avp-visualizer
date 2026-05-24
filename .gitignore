@@ -1,0 +1,27 @@
+# ---- Xcode / Swift build artifacts ----
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+**/xcuserdata/
+**/.swiftpm/xcode/xcuserdata/
+.swiftpm/
+.build/
+# Xcode-managed resolved SPM cache (NOT local packages like
+# High Videlity/Packages/RealityKitContent — those are tracked source)
+**/project.xcworkspace/xcshareddata/swiftpm/
+Package.resolved
+*.xcworkspace/xcuserdata/
+# Reality Composer Pro user-specific files
+*.rcuserdata
+
+# ---- Local Claude Code / IDE settings (personal preferences) ----
+.claude/
+
+# ---- macOS junk ----
+.DS_Store
+
+# ---- Logs / temp / OS ----
+*.log
+*.tmp
+*.swp

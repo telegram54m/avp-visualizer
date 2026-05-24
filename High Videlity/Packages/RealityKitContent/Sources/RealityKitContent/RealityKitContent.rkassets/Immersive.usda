@@ -1,0 +1,1232 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "Root"
+{
+    reorder nameChildren = ["Sphere_Left", "Sphere_Right", "GridMaterial", "WaterSurface", "Nebula", "Caustics"]
+    def Sphere "Sphere_Right" (
+        active = true
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </Root/GridMaterial/GridMaterial> (
+            bindMaterialAs = "weakerThanDescendants"
+        )
+        double radius = 0.1
+        quatf xformOp:orient = (1, 0, 0, 0)
+        float3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (0.5, 1.5, -1.5)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+    }
+
+    def Sphere "Sphere_Left" (
+        active = true
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </Root/GridMaterial/GridMaterial> (
+            bindMaterialAs = "weakerThanDescendants"
+        )
+        double radius = 0.1
+        quatf xformOp:orient = (1, 0, 0, 0)
+        float3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (-0.5, 1.5, -1.5)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+    }
+
+    def "GridMaterial" (
+        active = true
+        references = @Materials/GridMaterial.usda@
+    )
+    {
+        float3 xformOp:scale = (1, 1, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+    }
+
+    def Material "WaterSurface"
+    {
+        # Uniform parameter — Swift sets this each animate-tick to drive
+        # the noise scroll. Stage B: animated procedural water surface.
+        float inputs:time = 0 (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 200)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        # Stage C — Swift derives this from the smoothed chromagram via
+        # TonalColor (vector sum on the circle of fifths). The song's
+        # tonal center becomes the water's tint color.
+        color3f inputs:chromaColor = (0.2, 0.5, 0.8) (
+            colorSpace = "srgb_displayp3"
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 400)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        # Stage C — Swift derives this from TonalColor.saturation (how
+        # tonally focused the music is) × a tint-strength constant. 0 =
+        # pure procedural water, 1 = fully chroma-tinted. Gates the mix
+        # so silent / atonal passages don't muddy the water with the
+        # default chromaColor.
+        float inputs:chromaMix = 0 (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 600)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        # Stage C — smoothed loudness uniform. Currently UNUSED in the
+        # shader (the original plan was to multiply the final water
+        # color by (1 + loudness × 0.5) via ND_multiply_color3FA, but
+        # that node turned out to be silently broken — see
+        # [[rcp-shadergraph-workflow]]). Loudness reactivity is now
+        # baked in via the `sparkleAmount` uniform below + Swift-side
+        # boost to chromaMix. Kept here for future re-use if a
+        # verified color×float multiply becomes available.
+        float inputs:loudness = 0 (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 800)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        # Swift sets each tick from smoothedLoudness: typically ~0.5
+        # at quiet passages, ~1.5+ on loud peaks. Multiplied into the
+        # SparkleCubed mix factor below so sparkle density visibly
+        # pumps with the music. Uses verified ND_multiply_float.
+        float inputs:sparkleAmount = 1.0 (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 1000)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        token outputs:mtlx:surface.connect = </Root/WaterSurface/PreviewSurface.outputs:out>
+        token outputs:realitykit:vertex
+        float2 ui:nodegraph:realitykit:subgraphOutputs:pos = (1700, 100)
+
+        # Final PreviewSurface — diffuseColor comes from TintedWater
+        # (Stage C: chroma-tinted; loudness brightness is pre-baked into
+        # chromaColor on the Swift side, sidestepping the unverified
+        # ND_multiply_color3FA node).
+        #
+        # opacity = 0.55 — matches the pre-Stage-A UnlitMaterial
+        # fallback that this shader replaced. The water surface sits
+        # ABOVE the wedge tiles / water haze / caustics in alpha-blend
+        # order (deeper Y but rendered last because of how RealityKit
+        # composites transparency), so tile colors must glow THROUGH
+        # the water tint to read as "lights under water." Stage C
+        # initially shipped at opacity 1.0 which silently broke every
+        # other lake layer; bug caught on first composite check.
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "ND_UsdPreviewSurface_surfaceshader"
+            color3f inputs:diffuseColor.connect = </Root/WaterSurface/LoudWhiteMix.outputs:out>
+            float inputs:opacity = 0.55
+            float inputs:roughness = 0.5
+            token outputs:out
+            float2 ui:nodegraph:node:pos = (1500, 100)
+            int ui:nodegraph:node:stackingOrder = 3
+            string[] ui:nodegraph:realitykit:node:attributesShowingChildren = ["inputs:diffuseColor"]
+        }
+
+        # Slow `time` down (×0.08) so the noise scroll is gently flowing —
+        # bumped 0.05 → 0.08 to give a visible "this is moving water"
+        # cue rather than a near-static surface.
+        def Shader "ScaleTime"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface.inputs:time>
+            float inputs:in2 = 0.08
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (0, 200)
+        }
+
+        # Pack scaled time into a 2D vector (same value in X and Y =
+        # diagonal scroll across the UV plane).
+        def Shader "ScrollVec"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/WaterSurface/ScaleTime.outputs:out>
+            float inputs:in2.connect = </Root/WaterSurface/ScaleTime.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 200)
+        }
+
+        # Texture coordinates of the lake disk (0..1 across its area).
+        def Shader "UV"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (0, 0)
+        }
+
+        # Scale UV by (8, 8) so noise samples at much higher frequency
+        # across the disk — without this, the entire 36 m surface
+        # samples noise at near-uniform value, making the whole lake
+        # shift colour as one big blob rather than showing spatial
+        # ripple-style variation.
+        def Shader "ScaleUV"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/WaterSurface/UV.outputs:out>
+            float2 inputs:in2 = (8, 8)
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 0)
+        }
+
+        # Scaled-UV + time-driven scroll vector = animated noise input.
+        def Shader "AnimatedUV"
+        {
+            uniform token info:id = "ND_add_vector2"
+            float2 inputs:in1.connect = </Root/WaterSurface/ScaleUV.outputs:out>
+            float2 inputs:in2.connect = </Root/WaterSurface/ScrollVec.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (400, 100)
+        }
+
+        # Perlin noise sampled at the animated UV — float output, roughly
+        # -1..1 range.
+        def Shader "Noise"
+        {
+            uniform token info:id = "ND_noise2d_float"
+            float2 inputs:texcoord.connect = </Root/WaterSurface/AnimatedUV.outputs:out>
+            float inputs:amplitude = 1.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (600, 100)
+        }
+
+        # === Second noise octave — large slow waves ===
+        # Real water reads as multiple frequencies overlaid: small
+        # ripples on top of big waves. This second layer samples noise
+        # at a LOWER UV scale (UV×3 vs base UV×8) for larger spatial
+        # features, scrolls VERTICALLY (vs base's diagonal) so the two
+        # motions don't lock into a single direction, and averages
+        # with the base noise before the [0,1] remap. The interference
+        # pattern between the two scrolls is what reads as "this is
+        # moving water, not a procedural disk."
+
+        # Slightly slower time scale than base (0.08) for ponderous waves.
+        def Shader "WaveTime"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface.inputs:time>
+            float inputs:in2 = 0.055
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (0, -200)
+        }
+
+        # Negated WaveTime so the wave octave can scroll on the
+        # ANTI-DIAGONAL (-t, +t) rather than pure-vertical (0, +t). The
+        # earlier vertical-only scroll left every horizontal line of
+        # the lake carrying the same temporal phase for this octave,
+        # which the eye reads as visible horizontal banding at low
+        # camera angles. Anti-diagonal motion + asymmetry to the base
+        # diagonal (+t, +t) keeps the two layers from agreeing on any
+        # axis.
+        def Shader "WaveTimeNeg"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface/WaveTime.outputs:out>
+            float inputs:in2 = -1
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (100, -200)
+        }
+
+        # Anti-diagonal scroll — perpendicular to base's (+t, +t)
+        # diagonal but signed so the two octaves move in genuinely
+        # different directions (not just different magnitudes).
+        def Shader "WaveScrollVec"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/WaterSurface/WaveTimeNeg.outputs:out>
+            float inputs:in2.connect = </Root/WaterSurface/WaveTime.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, -200)
+        }
+
+        # Larger spatial scale (UV×3) → big slow features.
+        def Shader "WaveUVScale"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/WaterSurface/UV.outputs:out>
+            float2 inputs:in2 = (3, 3)
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, -300)
+        }
+
+        def Shader "WaveAnimUV"
+        {
+            uniform token info:id = "ND_add_vector2"
+            float2 inputs:in1.connect = </Root/WaterSurface/WaveUVScale.outputs:out>
+            float2 inputs:in2.connect = </Root/WaterSurface/WaveScrollVec.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (400, -250)
+        }
+
+        def Shader "WaveNoise"
+        {
+            uniform token info:id = "ND_noise2d_float"
+            float2 inputs:texcoord.connect = </Root/WaterSurface/WaveAnimUV.outputs:out>
+            float inputs:amplitude = 1.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (600, -250)
+        }
+
+        # === Third noise octave — mid-scale ripple ===
+        # Two octaves alone (base UV×8 + wave UV×3) still left visible
+        # horizontal-band artifacts at low camera angles — the two
+        # frequencies are too far apart to fully break up coherent
+        # directions. This third octave at UV×5 (right between the
+        # other two) plus yet-another scroll direction (anti-diagonal
+        # mirror: +t, -t) introduces a third interference pattern that
+        # breaks remaining alignment.
+
+        def Shader "RippleTime"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface.inputs:time>
+            float inputs:in2 = 0.13
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (0, -500)
+        }
+
+        def Shader "RippleTimeNeg"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface/RippleTime.outputs:out>
+            float inputs:in2 = -1
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (100, -500)
+        }
+
+        # Anti-diagonal MIRROR of wave: (+t, -t). Three distinct scroll
+        # directions across the three octaves:
+        #   base   (+t, +t)  diagonal
+        #   wave   (-t, +t)  anti-diagonal
+        #   ripple (+t, -t)  anti-diagonal mirror
+        def Shader "RippleScrollVec"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/WaterSurface/RippleTime.outputs:out>
+            float inputs:in2.connect = </Root/WaterSurface/RippleTimeNeg.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, -500)
+        }
+
+        # Scale between base UV×8 and wave UV×3 — fills the spectral
+        # gap so no one spatial frequency dominates.
+        def Shader "RippleUVScale"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/WaterSurface/UV.outputs:out>
+            float2 inputs:in2 = (5, 5)
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, -600)
+        }
+
+        def Shader "RippleAnimUV"
+        {
+            uniform token info:id = "ND_add_vector2"
+            float2 inputs:in1.connect = </Root/WaterSurface/RippleUVScale.outputs:out>
+            float2 inputs:in2.connect = </Root/WaterSurface/RippleScrollVec.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (400, -550)
+        }
+
+        def Shader "RippleNoise"
+        {
+            uniform token info:id = "ND_noise2d_float"
+            float2 inputs:texcoord.connect = </Root/WaterSurface/RippleAnimUV.outputs:out>
+            float inputs:amplitude = 1.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (600, -550)
+        }
+
+        # Combine three noise layers: ((Noise + WaveNoise) + RippleNoise)
+        # × 0.333 keeps the combined output in the original [-1, 1]
+        # range so the existing NoiseHalf → NoiseShift remap still
+        # works without changes.
+        def Shader "CombinedNoise"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/WaterSurface/Noise.outputs:out>
+            float inputs:in2.connect = </Root/WaterSurface/WaveNoise.outputs:out>
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (700, -100)
+        }
+
+        def Shader "CombinedNoise3"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/WaterSurface/CombinedNoise.outputs:out>
+            float inputs:in2.connect = </Root/WaterSurface/RippleNoise.outputs:out>
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (750, -100)
+        }
+
+        def Shader "AveragedNoise"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface/CombinedNoise3.outputs:out>
+            float inputs:in2 = 0.3333
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (800, -100)
+        }
+
+        # Remap noise from [-1..1] to [0..1] — two-step (multiply by 0.5,
+        # then add 0.5) so the Mix node's `mix` factor stays in its
+        # valid range. Now reads from AveragedNoise (which folded in
+        # the second octave) instead of raw Noise.
+        def Shader "NoiseHalf"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface/AveragedNoise.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (900, 0)
+        }
+
+        def Shader "NoiseShift"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/WaterSurface/NoiseHalf.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (800, 0)
+        }
+
+        # Mix deep blue (low noise) with bright cyan (high noise).
+        def Shader "ColorMix"
+        {
+            uniform token info:id = "ND_mix_color3"
+            color3f inputs:bg = (0.05, 0.12, 0.35) (
+                colorSpace = "srgb_displayp3"
+            )
+            color3f inputs:fg = (0.30, 0.70, 0.95) (
+                colorSpace = "srgb_displayp3"
+            )
+            float inputs:mix.connect = </Root/WaterSurface/NoiseShift.outputs:out>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (900, 100)
+        }
+
+        # Stage C — blend the tonal-center color over the procedural
+        # water. `chromaMix` (0..~0.4) controls how much chromaColor
+        # bleeds into the lake; gated by dominant-pitch weight on the
+        # Swift side so silent / atonal music leaves the water pure.
+        def Shader "TintedWater"
+        {
+            uniform token info:id = "ND_mix_color3"
+            color3f inputs:bg.connect = </Root/WaterSurface/ColorMix.outputs:out>
+            color3f inputs:fg.connect = </Root/WaterSurface.inputs:chromaColor>
+            float inputs:mix.connect = </Root/WaterSurface.inputs:chromaMix>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (1100, 100)
+        }
+
+        # === Specular sparkle layer ===
+        # Sun-glint analog: a fast, high-frequency noise raised to the
+        # 3rd power so only sparse peaks remain — then mixed as white
+        # over TintedWater. Reads as "light bouncing off ripple tops"
+        # and is the single biggest "this is water" cue this graph
+        # carries.
+
+        # 4× the base scroll speed — sparkles flicker faster than the
+        # underlying water flows. Sells "tiny moving facets."
+        def Shader "SparkleTime"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface.inputs:time>
+            float inputs:in2 = 0.32
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (0, 600)
+        }
+
+        # Asymmetric scroll vector: X-only motion so sparkle drifts
+        # sideways while the base noise scrolls diagonally. Two
+        # directions in motion at once is part of what reads as
+        # "water" vs "ink flowing one way."
+        def Shader "SparkleScrollVec"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/WaterSurface/SparkleTime.outputs:out>
+            float inputs:in2 = 0
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 600)
+        }
+
+        # 6× the base UV scale (8 → 48) — high spatial frequency so
+        # sparkle peaks are tight dots rather than blobs. Stepped 32
+        # → 48 per Jesse's "tighter width" brief: at 32 the peaks read
+        # as soft splotches; at 48 they read as discrete glints.
+        def Shader "SparkleUVScale"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/WaterSurface/UV.outputs:out>
+            float2 inputs:in2 = (48, 48)
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 500)
+        }
+
+        def Shader "SparkleAnimatedUV"
+        {
+            uniform token info:id = "ND_add_vector2"
+            float2 inputs:in1.connect = </Root/WaterSurface/SparkleUVScale.outputs:out>
+            float2 inputs:in2.connect = </Root/WaterSurface/SparkleScrollVec.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (400, 550)
+        }
+
+        def Shader "SparkleNoise"
+        {
+            uniform token info:id = "ND_noise2d_float"
+            float2 inputs:texcoord.connect = </Root/WaterSurface/SparkleAnimatedUV.outputs:out>
+            float inputs:amplitude = 1.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (600, 550)
+        }
+
+        # Remap [-1..1] → [0..1] (same two-step pattern as base noise).
+        def Shader "SparkleHalf"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface/SparkleNoise.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (700, 500)
+        }
+
+        def Shader "SparkleShift"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/WaterSurface/SparkleHalf.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (800, 500)
+        }
+
+        # Cubed (x³) falloff — keeps only the brightest peaks. Mid
+        # values (0.5) compress to 0.125 → barely visible white wash;
+        # peaks (1.0) stay at 1.0 → full sparkle. Without the cubing,
+        # the whole water would look hazy-white; with cubing, only the
+        # sparse "sun glint" points brighten.
+        def Shader "SparkleSquared"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface/SparkleShift.outputs:out>
+            float inputs:in2.connect = </Root/WaterSurface/SparkleShift.outputs:out>
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (900, 500)
+        }
+
+        def Shader "SparkleCubed"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface/SparkleSquared.outputs:out>
+            float inputs:in2.connect = </Root/WaterSurface/SparkleShift.outputs:out>
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1000, 500)
+        }
+
+        # Multiply the cubed sparkle by the loudness-driven
+        # `sparkleAmount` uniform. The mix node downstream still
+        # treats values >1 as "100% white peak" via internal
+        # clamping, so amounts above 1 don't blow out — they just
+        # widen the bright tops of the cubed curve. Effect: quiet
+        # passages → fewer/dimmer glints; loud passages → many
+        # bright glints pumping with the music.
+        def Shader "ScaledSparkle"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface/SparkleCubed.outputs:out>
+            float inputs:in2.connect = </Root/WaterSurface.inputs:sparkleAmount>
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1150, 500)
+        }
+
+        # Final layer: white sparkle over TintedWater. Peak fg dialed
+        # 0.75 → 0.40 because the 0.75-white peaks were reading as
+        # brief "lightning flashes" rather than gentle water shimmer
+        # — each cubed-noise peak hit ~50% white blend at baseline
+        # sparkleAmount=0.5, which is bright enough that the eye
+        # registers it as a discrete event rather than continuous
+        # glitter. 0.40 keeps the sparkle PATTERN (still a noise-
+        # peak grid, still scrolling, still the water-cue) but each
+        # individual peak is softer-bright. Mix factor still comes
+        # from ScaledSparkle (loudness-modulated) so loud music can
+        # still push peaks toward full intensity via the clamp.
+        def Shader "SparkleMix"
+        {
+            uniform token info:id = "ND_mix_color3"
+            color3f inputs:bg.connect = </Root/WaterSurface/TintedWater.outputs:out>
+            color3f inputs:fg = (0.40, 0.40, 0.40)
+            float inputs:mix.connect = </Root/WaterSurface/ScaledSparkle.outputs:out>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (1300, 300)
+        }
+
+        # Stage C — loudness × 0.5 gives a 0..~0.5 brightness boost
+        # added to 1.0 below. Cap on Swift side keeps the multiplier
+        # within sane visual range.
+        def Shader "LoudGain"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface.inputs:loudness>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (900, 400)
+        }
+
+        # Final brightness multiplier = 1 + loudness × 0.5 (range
+        # ~1.0..1.5). Multiplied into TintedWater below.
+        def Shader "LoudPlusOne"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/WaterSurface/LoudGain.outputs:out>
+            float inputs:in2 = 1.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1100, 400)
+        }
+
+        # Stage C — scale TintedWater by the loudness multiplier. Uses
+        # MaterialX's standard color3 × float multiply (`color3FA` =
+        # color3 with Float scalar Argument). NOTE: this node is
+        # AUTHORED BUT UNUSED — `ND_multiply_color3FA` proved silently
+        # broken on RealityKit's MaterialX (output collapsed to near-
+        # white). Kept here as a reference site if Apple ever expands
+        # the node coverage. The working loudness-brightness path is
+        # `LoudWhiteMix` below using the verified ND_mix_color3 node.
+        def Shader "BrightWater"
+        {
+            uniform token info:id = "ND_multiply_color3FA"
+            color3f inputs:in1.connect = </Root/WaterSurface/TintedWater.outputs:out>
+            float inputs:in2.connect = </Root/WaterSurface/LoudPlusOne.outputs:out>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (1300, 100)
+        }
+
+        # Working loudness-brightness path — sidesteps the broken
+        # ND_multiply_color3FA by lerping toward pure white via the
+        # verified ND_mix_color3 node. A small mix factor (~0..6% at
+        # typical loudness peaks) gives a subtle but observable
+        # brightness pulse on loud passages, ON TOP of the sparkle-
+        # density pump driven by `sparkleAmount`. Two layered loudness
+        # cues compose better than one — the visual reads as both
+        # "more glints" AND "the whole surface lifts in brightness"
+        # when the music swells.
+
+        # Gain factor: LoudGain × 0.5 → typical peak ~0.06 (smoothed
+        # loudness peaks ≈ 0.25 → LoudGain ≈ 0.125 → ×0.5 ≈ 0.06).
+        # Kept tiny on purpose — louder ratios wash the water.
+        def Shader "LoudBrightnessGain"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/WaterSurface/LoudGain.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1300, 400)
+        }
+
+        # Lerp SparkleMix toward white by LoudBrightnessGain. At rest
+        # (loudness=0) the output equals SparkleMix exactly — the
+        # surface looks identical to the pre-loudness shader on quiet
+        # passages. On peaks the whole surface gains a few percent
+        # white blend, reading as "the lake brightens on the drop."
+        def Shader "LoudWhiteMix"
+        {
+            uniform token info:id = "ND_mix_color3"
+            color3f inputs:bg.connect = </Root/WaterSurface/SparkleMix.outputs:out>
+            color3f inputs:fg = (1.0, 1.0, 1.0) (
+                colorSpace = "srgb_displayp3"
+            )
+            float inputs:mix.connect = </Root/WaterSurface/LoudBrightnessGain.outputs:out>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (1450, 300)
+        }
+    }
+
+    # Nebula sky background. Inside-out sphere mesh (scale -1,1,1 from
+    # Swift) of radius ~30, rendered BEHIND the starfield (radius 25)
+    # so star sprites composite in front. Two-octave procedural color
+    # field mixed with a song-keyed chroma tint and a vertical fade
+    # so the horizon stays dark.
+    def Material "Nebula"
+    {
+        # Swift sets each tick for slow nebula drift.
+        float inputs:time = 0 (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 200)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        # Song's tonal-center color — same source as the water
+        # `chromaColor` so the whole scene reads cohesively when a
+        # chord lands. Default kept VERY dark so that if Swift isn't
+        # overriding (e.g. during the first-frame lerp from initial
+        # value), the sky stays near-black rather than flashing a
+        # vivid uniform color.
+        color3f inputs:chromaColor = (0.04, 0.02, 0.08) (
+            colorSpace = "srgb_displayp3"
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 400)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        # Mix factor for the chroma tint (gated by dominant pitch
+        # weight on the Swift side). Capped low (~0.20) because the
+        # nebula covers the whole upper hemisphere — a strong tint
+        # would overwhelm the scene.
+        float inputs:chromaMix = 0 (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 600)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        token outputs:mtlx:surface.connect = </Root/Nebula/PreviewSurface.outputs:out>
+        token outputs:realitykit:vertex
+        float2 ui:nodegraph:realitykit:subgraphOutputs:pos = (1700, 100)
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "ND_UsdPreviewSurface_surfaceshader"
+            color3f inputs:diffuseColor.connect = </Root/Nebula/ChromaTinted.outputs:out>
+            # opacity = 0.95 (NOT 1.0) — kicks the material into
+            # RealityKit's transparent pass with back-to-front depth
+            # sorting. With opacity 1.0 the opaque nebula sphere
+            # somehow occluded the star sprites at radius 25 despite
+            # being itself at radius 30; the inverted entity.scale
+            # (-1, 1, 1) plus opaque rendering produced an artifact
+            # where stars were invisible. 0.95 fixes it. The 5%
+            # transparency is imperceptible at the nebula's very
+            # dark color values.
+            float inputs:opacity = 0.95
+            float inputs:roughness = 1.0
+            token outputs:out
+            float2 ui:nodegraph:node:pos = (1500, 100)
+        }
+
+        # Slow time scale — nebula drifts almost imperceptibly. Faster
+        # than this and it feels animated; slower and it's static.
+        def Shader "NebulaTime"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Nebula.inputs:time>
+            float inputs:in2 = 0.012
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (0, 200)
+        }
+
+        def Shader "ScrollVec"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/Nebula/NebulaTime.outputs:out>
+            float inputs:in2.connect = </Root/Nebula/NebulaTime.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 200)
+        }
+
+        # Sphere UV from generateSphere: x = longitude (0..1 around),
+        # y = latitude (0..1 south→north). Used by everything below.
+        def Shader "UV"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (0, 0)
+        }
+
+        # === Large-scale nebula clouds ===
+        # Low UV scale (×2.5) → big soft cloud patches across the sky.
+        def Shader "LargeScale"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/Nebula/UV.outputs:out>
+            float2 inputs:in2 = (2.5, 2.5)
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 0)
+        }
+
+        def Shader "LargeAnimUV"
+        {
+            uniform token info:id = "ND_add_vector2"
+            float2 inputs:in1.connect = </Root/Nebula/LargeScale.outputs:out>
+            float2 inputs:in2.connect = </Root/Nebula/ScrollVec.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (400, 100)
+        }
+
+        def Shader "LargeNoise"
+        {
+            uniform token info:id = "ND_noise2d_float"
+            float2 inputs:texcoord.connect = </Root/Nebula/LargeAnimUV.outputs:out>
+            float inputs:amplitude = 1.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (600, 100)
+        }
+
+        # Remap [-1,1] → [0,1].
+        def Shader "LargeHalf"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Nebula/LargeNoise.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (700, 0)
+        }
+
+        def Shader "LargeShift"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/Nebula/LargeHalf.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (800, 0)
+        }
+
+        # Mix deep space (near-black with a hint of cool indigo) toward
+        # a much dimmer nebula color — dialed way down from earlier
+        # draft (0.18, 0.05, 0.28) → (0.05, 0.015, 0.08) per Jesse's
+        # "nebula drowns the stars" feedback. Stars need a near-black
+        # void to register as discrete sparkles; even a moderately
+        # bright nebula washes them out via accumulated alpha against
+        # the camera.
+        def Shader "BaseColor"
+        {
+            uniform token info:id = "ND_mix_color3"
+            # Near-pure black void.
+            color3f inputs:bg = (0.001, 0.001, 0.003) (
+                colorSpace = "srgb_displayp3"
+            )
+            # Deep purple nebula peak — still very dim so stars register.
+            color3f inputs:fg = (0.016, 0.005, 0.025) (
+                colorSpace = "srgb_displayp3"
+            )
+            float inputs:mix.connect = </Root/Nebula/LargeShift.outputs:out>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (1000, 50)
+        }
+
+        # === Fine-scale gas swirls ===
+        # Higher UV scale (×8) + counter-direction (no scroll add → no
+        # parallax with large layer) for finer texture detail. Sampled
+        # again from base UV so the two layers don't lock together.
+        def Shader "FineScale"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/Nebula/UV.outputs:out>
+            float2 inputs:in2 = (8.0, 8.0)
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 300)
+        }
+
+        def Shader "FineNoise"
+        {
+            uniform token info:id = "ND_noise2d_float"
+            float2 inputs:texcoord.connect = </Root/Nebula/FineScale.outputs:out>
+            float inputs:amplitude = 1.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (400, 300)
+        }
+
+        def Shader "FineHalf"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Nebula/FineNoise.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (600, 300)
+        }
+
+        def Shader "FineShift"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/Nebula/FineHalf.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (700, 300)
+        }
+
+        # Modulate the base color with fine detail via a soft mix
+        # toward a slightly brighter warm tone — dialed way down from
+        # earlier draft (0.45, 0.18, 0.55) → (0.10, 0.04, 0.13) so the
+        # internal nebula structure stays visible but doesn't pop bright
+        # enough to wash the stars.
+        def Shader "DetailedNebula"
+        {
+            uniform token info:id = "ND_mix_color3"
+            color3f inputs:bg.connect = </Root/Nebula/BaseColor.outputs:out>
+            # Fine-detail highlight — also dialed way down.
+            color3f inputs:fg = (0.03, 0.012, 0.04) (
+                colorSpace = "srgb_displayp3"
+            )
+            float inputs:mix.connect = </Root/Nebula/FineShift.outputs:out>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (1100, 200)
+        }
+
+        # === Song-keyed chroma tint ===
+        # Subtle bleed of the dominant-pitch color into the nebula.
+        # chromaMix is capped low (~0.20) on Swift side.
+        def Shader "ChromaTinted"
+        {
+            uniform token info:id = "ND_mix_color3"
+            color3f inputs:bg.connect = </Root/Nebula/DetailedNebula.outputs:out>
+            color3f inputs:fg.connect = </Root/Nebula.inputs:chromaColor>
+            float inputs:mix.connect = </Root/Nebula.inputs:chromaMix>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (1250, 100)
+        }
+
+        # NOTE: vertical horizon fade was authored here in an earlier
+        # draft but required `ND_separate2_vector2` to extract UV.y,
+        # which isn't in our verified-working node list. Deferred to
+        # v2 — the lake disk occludes the lower hemisphere anyway, so
+        # a hard nebula-meets-horizon line shouldn't be visible in
+        # practice. If it becomes a problem, options are: (a) verify
+        # ND_separate2_vector2 with a smoke-test material first, (b)
+        # darken via the chromaMix uniform from Swift based on view
+        # angle (computed per-frame), or (c) raise the nebula sphere
+        # radius so the horizon line falls outside the user's pitch
+        # clamp range.
+    }
+
+    # Procedural caustic shader. Replaces the earlier MeshInstance
+    # sprite-streak approach with a single disk mesh + multi-noise
+    # intersection math. Two noises at different scales scrolling in
+    # different directions; their product cubed gives sharp peaks
+    # that approximate caustic-like light patterns on the water.
+    # opacity is connect-driven by the caustic intensity so non-
+    # caustic regions are truly transparent.
+    def Material "Caustics"
+    {
+        # Swift sets each tick.
+        float inputs:time = 0 (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 200)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        # Song's tonal-center color — shifts caustic hue slightly with
+        # the chord. Source same as water surface (smoothedWaterRGB).
+        color3f inputs:chromaColor = (0.7, 0.95, 1.0) (
+            colorSpace = "srgb_displayp3"
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 400)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        # Mix factor: how much chromaColor blends in. Capped low so
+        # caustics stay readable as "cool surface shimmer" rather
+        # than fully song-colored.
+        float inputs:chromaMix = 0 (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 600)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        # Loudness: boosts caustic intensity on loud passages so the
+        # shimmer pumps with the music.
+        float inputs:loudness = 0 (
+            customData = {
+                dictionary realitykit = {
+                    float2 positionInSubgraph = (-200, 800)
+                    int stackingOrderInSubgraph = 4
+                }
+            }
+        )
+        token outputs:mtlx:surface.connect = </Root/Caustics/PreviewSurface.outputs:out>
+        token outputs:realitykit:vertex
+        float2 ui:nodegraph:realitykit:subgraphOutputs:pos = (1900, 100)
+
+        # PreviewSurface — opacity CONNECTED to CausticOpacity so
+        # transparency varies per fragment. Untested pattern; if
+        # opacity.connect doesn't actually drive per-fragment alpha,
+        # the material will compile but render as a uniform opacity.
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "ND_UsdPreviewSurface_surfaceshader"
+            color3f inputs:diffuseColor.connect = </Root/Caustics/CausticColor.outputs:out>
+            float inputs:opacity.connect = </Root/Caustics/CausticOpacity.outputs:out>
+            float inputs:roughness = 1.0
+            token outputs:out
+            float2 ui:nodegraph:node:pos = (1700, 100)
+        }
+
+        # Time scales — A slow, B opposite direction.
+        def Shader "TimeA"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics.inputs:time>
+            float inputs:in2 = 0.04
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (0, 200)
+        }
+
+        def Shader "TimeB"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics.inputs:time>
+            float inputs:in2 = -0.03
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (0, 400)
+        }
+
+        def Shader "ScrollA"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/Caustics/TimeA.outputs:out>
+            float inputs:in2 = 0
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 200)
+        }
+
+        def Shader "ScrollB"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1 = 0
+            float inputs:in2.connect = </Root/Caustics/TimeB.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 400)
+        }
+
+        def Shader "UV"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (0, 0)
+        }
+
+        # === Noise A === larger scale (UV×6) for big patterns.
+        def Shader "ScaleUVA"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/Caustics/UV.outputs:out>
+            float2 inputs:in2 = (6, 6)
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 0)
+        }
+
+        def Shader "AnimUVA"
+        {
+            uniform token info:id = "ND_add_vector2"
+            float2 inputs:in1.connect = </Root/Caustics/ScaleUVA.outputs:out>
+            float2 inputs:in2.connect = </Root/Caustics/ScrollA.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (400, 100)
+        }
+
+        def Shader "NoiseA"
+        {
+            uniform token info:id = "ND_noise2d_float"
+            float2 inputs:texcoord.connect = </Root/Caustics/AnimUVA.outputs:out>
+            float inputs:amplitude = 1.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (600, 100)
+        }
+
+        def Shader "HalfA"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics/NoiseA.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (700, 0)
+        }
+
+        def Shader "ShiftA"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/Caustics/HalfA.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (800, 0)
+        }
+
+        # === Noise B === finer scale (UV×9).
+        def Shader "ScaleUVB"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/Caustics/UV.outputs:out>
+            float2 inputs:in2 = (9, 9)
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (200, 500)
+        }
+
+        def Shader "AnimUVB"
+        {
+            uniform token info:id = "ND_add_vector2"
+            float2 inputs:in1.connect = </Root/Caustics/ScaleUVB.outputs:out>
+            float2 inputs:in2.connect = </Root/Caustics/ScrollB.outputs:out>
+            float2 outputs:out
+            float2 ui:nodegraph:node:pos = (400, 500)
+        }
+
+        def Shader "NoiseB"
+        {
+            uniform token info:id = "ND_noise2d_float"
+            float2 inputs:texcoord.connect = </Root/Caustics/AnimUVB.outputs:out>
+            float inputs:amplitude = 1.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (600, 500)
+        }
+
+        def Shader "HalfB"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics/NoiseB.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (700, 500)
+        }
+
+        def Shader "ShiftB"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/Caustics/HalfB.outputs:out>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (800, 500)
+        }
+
+        # === Intersection: product ===
+        # Bright where BOTH noises are high. The two scrolling at
+        # different speeds/directions produces shifting intersection
+        # patterns that approximate caustic-like networks.
+        def Shader "Product"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics/ShiftA.outputs:out>
+            float inputs:in2.connect = </Root/Caustics/ShiftB.outputs:out>
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1000, 300)
+        }
+
+        # Squared, then cubed — sharpens peaks to be sparse.
+        def Shader "ProductSq"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics/Product.outputs:out>
+            float inputs:in2.connect = </Root/Caustics/Product.outputs:out>
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1100, 300)
+        }
+
+        def Shader "ProductCubed"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics/ProductSq.outputs:out>
+            float inputs:in2.connect = </Root/Caustics/Product.outputs:out>
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1200, 300)
+        }
+
+        # 4th power for sharper peaks — add one more multiply.
+        # Cubed avg 0.0156 × Product 0.25 = 0.0039 → very sparse base.
+        def Shader "ProductQuad"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics/ProductCubed.outputs:out>
+            float inputs:in2.connect = </Root/Caustics/Product.outputs:out>
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1250, 300)
+        }
+
+        # Modest boost (3.0) — average becomes 0.012 (very low), peaks
+        # become 3 (clamped). Most pixels are below the threshold below.
+        def Shader "Boosted"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics/ProductQuad.outputs:out>
+            float inputs:in2 = 3.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1350, 300)
+        }
+
+        # Threshold — pushes all average-and-below pixels to negative
+        # → 0 opacity → fully transparent water. Only peaks survive.
+        def Shader "Thresholded"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/Caustics/Boosted.outputs:out>
+            float inputs:in2 = -0.20
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1450, 300)
+        }
+
+        # Loudness pump (additive only — 1.0 baseline, +loud × 0.5 boost).
+        def Shader "LoudScale"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics.inputs:loudness>
+            float inputs:in2 = 0.5
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1300, 500)
+        }
+
+        def Shader "LoudPlusOne"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/Caustics/LoudScale.outputs:out>
+            float inputs:in2 = 1.0
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1400, 500)
+        }
+
+        def Shader "LoudPumped"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics/Thresholded.outputs:out>
+            float inputs:in2.connect = </Root/Caustics/LoudPlusOne.outputs:out>
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1500, 400)
+        }
+
+        # Final opacity cap — multiply by 0.45 so even peak caustic
+        # spots stay subtle (~0.45 max opacity instead of 1.0).
+        def Shader "CausticOpacity"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/Caustics/LoudPumped.outputs:out>
+            float inputs:in2 = 0.45
+            float outputs:out
+            float2 ui:nodegraph:node:pos = (1600, 400)
+        }
+
+        # Color: cool cyan-white mixed with the chromaColor tint.
+        def Shader "CausticColor"
+        {
+            uniform token info:id = "ND_mix_color3"
+            color3f inputs:bg = (0.85, 0.98, 1.0) (
+                colorSpace = "srgb_displayp3"
+            )
+            color3f inputs:fg.connect = </Root/Caustics.inputs:chromaColor>
+            float inputs:mix.connect = </Root/Caustics.inputs:chromaMix>
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (1500, 100)
+        }
+    }
+}
+
