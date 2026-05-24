@@ -79,6 +79,8 @@ enum MusicBrainzBpmFetcher {
                     voiceVocal: classifiers?.voiceVocal,
                     timbreBrightness: classifiers?.timbreBrightness,
                     timeSig: nil,  // AB doesn't expose time signature
+                    party: classifiers?.party,
+                    relaxed: classifiers?.relaxed,
                     key: analysis.key,
                     canonicalTitle: title,
                     canonicalArtist: artist
@@ -211,6 +213,11 @@ enum MusicBrainzBpmFetcher {
         let voiceVocal: Float?
         /// 0-100. 100 = bright, 0 = dark.
         let timbreBrightness: Float?
+        /// 0-100. 100 = party (energetic celebration vibe).
+        let party: Float?
+        /// 0-100. 100 = relaxed (calm vibe). Inverted by visualizers
+        /// since high relaxed should DAMP intensity, not add to it.
+        let relaxed: Float?
     }
 
     /// Returns 0-100 scores mapped from AcousticBrainz's binary
@@ -254,7 +261,11 @@ enum MusicBrainzBpmFetcher {
                 voiceVocal: Self.binaryClassifierScore(
                     in: highlevel, key: "voice_instrumental", positiveValue: "voice"),
                 timbreBrightness: Self.binaryClassifierScore(
-                    in: highlevel, key: "timbre", positiveValue: "bright")
+                    in: highlevel, key: "timbre", positiveValue: "bright"),
+                party: Self.binaryClassifierScore(
+                    in: highlevel, key: "mood_party", positiveValue: "party"),
+                relaxed: Self.binaryClassifierScore(
+                    in: highlevel, key: "mood_relaxed", positiveValue: "relaxed")
             )
         } catch {
             return nil

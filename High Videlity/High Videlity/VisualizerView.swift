@@ -370,6 +370,8 @@ struct VisualizerView: View {
                         voiceVocalOverride: appModel.shazamVoiceVocalOverride,
                         timbreBrightnessOverride: appModel.shazamTimbreBrightnessOverride,
                         timeSigOverride: appModel.shazamTimeSigOverride,
+                        partyOverride: appModel.shazamPartyOverride,
+                        relaxedOverride: appModel.shazamRelaxedOverride,
                         keyOverride: appModel.shazamKeyOverride
                     )
                     // Surface beat tracker bpm + confidence to the
@@ -553,6 +555,12 @@ struct BeatBadge: View {
                 }
                 if let brt = appModel.shazamTimbreBrightnessOverride {
                     parts.append("T\(Int(brt.rounded()))")
+                }
+                if let party = appModel.shazamPartyOverride {
+                    parts.append("P\(Int(party.rounded()))")
+                }
+                if let relax = appModel.shazamRelaxedOverride {
+                    parts.append("R\(Int(relax.rounded()))")
                 }
                 if let ts = appModel.shazamTimeSigOverride {
                     parts.append(ts)

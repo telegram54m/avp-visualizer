@@ -157,6 +157,14 @@ class AppModel {
     /// Shazam-verified time signature ("4/4", "3/4", "6/8", etc.)
     /// from GetSongBPM. Visualizers can bias rotation cadence.
     var shazamTimeSigOverride: String?
+    /// Shazam-verified party score (0-100, 100 = party vibe).
+    /// AcousticBrainz `mood_party` classifier. Adds to the intensity
+    /// blend alongside danceability + aggressiveness.
+    var shazamPartyOverride: Float?
+    /// Shazam-verified relaxed score (0-100, 100 = relaxed).
+    /// AcousticBrainz `mood_relaxed` classifier. INVERTED in the
+    /// intensity blend (high relaxed → low intensity contribution).
+    var shazamRelaxedOverride: Float?
     /// Generation counter for `shazamBpmOverride` lookups. Incremented
     /// every time a new Shazam match arrives. The Task that fetches
     /// the BPM captures its generation; on completion it only writes
@@ -620,6 +628,8 @@ class AppModel {
         shazamVoiceVocalOverride = nil
         shazamTimbreBrightnessOverride = nil
         shazamTimeSigOverride = nil
+        shazamPartyOverride = nil
+        shazamRelaxedOverride = nil
         bpmLookupGeneration += 1
         let myGeneration = bpmLookupGeneration
         Task { @MainActor in
@@ -634,6 +644,8 @@ class AppModel {
                 self.shazamVoiceVocalOverride = result.voiceVocal
                 self.shazamTimbreBrightnessOverride = result.timbreBrightness
                 self.shazamTimeSigOverride = result.timeSig
+                self.shazamPartyOverride = result.party
+                self.shazamRelaxedOverride = result.relaxed
             }
         }
 

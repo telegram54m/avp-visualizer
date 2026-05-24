@@ -91,6 +91,14 @@ enum TunebatBpmFetcher {
         /// "6/8"). NOT exposed by AcousticBrainz. Optional; some
         /// tracks have it as "" or null.
         let timeSig: String?
+        /// 0-100. Derived from AcousticBrainz's binary `mood_party`
+        /// classifier. 100 = party (energetic celebration vibe).
+        /// Folds into intensity alongside danceability + aggressiveness.
+        let party: Float?
+        /// 0-100. Derived from AcousticBrainz's binary `mood_relaxed`
+        /// classifier. 100 = relaxed. Visualizers INVERT this for
+        /// intensity blending: high relaxed → low intensity contribution.
+        let relaxed: Float?
         let key: Key?
         let canonicalTitle: String
         let canonicalArtist: String
@@ -187,6 +195,8 @@ enum TunebatBpmFetcher {
             voiceVocal: mb?.voiceVocal,              // AB-only
             timbreBrightness: mb?.timbreBrightness,  // AB-only
             timeSig: gsbpm?.timeSig,                 // GSBPM-only
+            party: mb?.party,                        // AB-only
+            relaxed: mb?.relaxed,                    // AB-only
             key: gsbpm?.key ?? mb?.key,
             canonicalTitle: gsbpm?.canonicalTitle
                 ?? mb?.canonicalTitle ?? queryTitle,
@@ -206,6 +216,8 @@ enum TunebatBpmFetcher {
         if let h = r.happiness { parts.append("\(Int(h.rounded())) happy") }
         if let v = r.voiceVocal { parts.append("\(Int(v.rounded())) voc") }
         if let t = r.timbreBrightness { parts.append("\(Int(t.rounded())) brt") }
+        if let p = r.party { parts.append("\(Int(p.rounded())) party") }
+        if let rl = r.relaxed { parts.append("\(Int(rl.rounded())) relax") }
         if let ts = r.timeSig { parts.append(ts) }
         if let k = r.key { parts.append(k.name) }
         var s = parts.joined(separator: ", ")
@@ -421,6 +433,8 @@ enum TunebatBpmFetcher {
             voiceVocal: nil,
             timbreBrightness: nil,
             timeSig: timeSig,
+            party: nil,
+            relaxed: nil,
             key: key,
             canonicalTitle: canonicalTitle,
             canonicalArtist: canonicalArtist
@@ -491,11 +505,9 @@ enum TunebatBpmFetcher {
 
     // MARK: - Caching
 
-    // Bumped to v8 when voiceVocal / timbreBrightness / timeSig were
-    // added AND when the always-fetch-both architecture landed
-    // (previously cached entries were source-specific; now we cache
-    // merged results so the schema is meaningfully different).
-    private static let cachePrefix = "HighVidelity.GetSongBPM.v8."
+    // Bumped to v9 when mood_party + mood_relaxed were added to
+    // Result. Re-fetch populates them on cached songs.
+    private static let cachePrefix = "HighVidelity.GetSongBPM.v9."
 
     private static func makeCacheKey(title: String, artist: String) -> String {
         cachePrefix + normalize("\(title)|\(artist)")
@@ -514,6 +526,8 @@ enum TunebatBpmFetcher {
         let voiceVocal: Float? = (dict["voiceVocal"] as? Double).map(Float.init)
         let timbreBrightness: Float? = (dict["timbreBrightness"] as? Double).map(Float.init)
         let timeSig: String? = dict["timeSig"] as? String
+        let party: Float? = (dict["party"] as? Double).map(Float.init)
+        let relaxed: Float? = (dict["relaxed"] as? Double).map(Float.init)
         // Key stored as the original raw string (e.g. "Em") and
         // re-parsed on read — keeps the on-disk schema simple and
         // means parser improvements automatically apply to cached
@@ -531,6 +545,8 @@ enum TunebatBpmFetcher {
             voiceVocal: voiceVocal,
             timbreBrightness: timbreBrightness,
             timeSig: timeSig,
+            party: party,
+            relaxed: relaxed,
             key: key,
             canonicalTitle: (dict["title"] as? String) ?? "",
             canonicalArtist: (dict["artist"] as? String) ?? ""
@@ -563,6 +579,12 @@ enum TunebatBpmFetcher {
         }
         if let ts = result.timeSig {
             dict["timeSig"] = ts
+        }
+        if let p = result.party {
+            dict["party"] = Double(p)
+        }
+        if let r = result.relaxed {
+            dict["relaxed"] = Double(r)
         }
         if let k = result.key {
             // Store as a stable key string we can re-parse.

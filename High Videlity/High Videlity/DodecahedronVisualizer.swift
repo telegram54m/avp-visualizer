@@ -1043,6 +1043,8 @@ enum DodecahedronVisualizer {
         voiceVocalOverride: Float? = nil,
         timbreBrightnessOverride: Float? = nil,
         timeSigOverride: String? = nil,
+        partyOverride: Float? = nil,
+        relaxedOverride: Float? = nil,
         keyOverride: Key? = nil
     ) {
         guard var state = root.components[DodecahedronRootComponent.self] else { return }
@@ -1290,23 +1292,30 @@ enum DodecahedronVisualizer {
         // weighting (Shazam ID + DB lookup is high-confidence).
         //
         // When ANY additional character signals are set, blend them
-        // into a 4-axis "intensity character" tempoT:
+        // into a **6-axis** "intensity character" tempoT:
         //   - bpmT          (0-1) — tempo position in slow→fast range
-        //   - danceT        (0-1) — danceability (energy / groove)
+        //   - danceT        (0-1) — danceability (groove)
         //   - aggressiveT   (0-1) — punching / driving feel
         //   - electronicT   (0-1) — inverse of acousticness; high
         //                          for electronic, low for acoustic
-        // Missing signals default to 0.5 (neutral) so a song with only
-        // a BPM lookup behaves predictably. Weights chosen so tempo +
-        // danceability dominate (most reliable signals), with
-        // aggression + electronic-vs-acoustic refining the character:
-        //   bpm 0.30 + dance 0.30 + aggressive 0.25 + electronic 0.15
+        //   - partyT        (0-1) — celebration-energy vibe
+        //   - inverseRelaxedT (0-1) — INVERSE of mood_relaxed; high
+        //                          for tense, low for calm
         //
-        // Concrete cases this fixes:
-        //   - 90 BPM aggressive metal: now medium-high intensity instead
-        //     of being treated like a slow ballad
-        //   - 130 BPM acoustic singer-songwriter: now medium intensity
-        //     instead of being treated like full-disco
+        // Missing signals default to 0.5 (neutral) — keeps the math
+        // stable when only BPM is known. Weights chosen so tempo +
+        // dance still dominate (most reliable signals), and the four
+        // character axes refine without diluting:
+        //   bpm 0.25 + dance 0.25 + aggressive 0.15 + electronic 0.10
+        //   + party 0.15 + (1-relaxed) 0.10 = 1.00
+        //
+        // Concrete cases:
+        //   - 90 BPM aggressive metal: medium-high (not slow-ballad)
+        //   - 130 BPM acoustic singer-songwriter: medium (not disco)
+        //   - 100 BPM relaxed jazz: even softer than 100 BPM alone
+        //     would imply, because relaxed dampens
+        //   - 110 BPM party-pop: medium-high even at modest tempo,
+        //     because party + dance compound
         //
         // Falls through to the BeatTracker path when bpm override is nil.
         let blendedTempoT: Float
@@ -1322,17 +1331,25 @@ enum DodecahedronVisualizer {
                 min(1.0, max(0.0, $0 / 100.0))
             } ?? 0.5
             // Acousticness is INVERTED — high acoustic should DAMPEN
-            // intensity (an acoustic song is calmer); high electronic
-            // should BOOST it (an electronic song is more synthetic
-            // and punchy).
+            // intensity; high electronic should BOOST it.
             let electronicT: Float = acousticnessOverride.map {
                 1.0 - min(1.0, max(0.0, $0 / 100.0))
             } ?? 0.5
+            let partyT: Float = partyOverride.map {
+                min(1.0, max(0.0, $0 / 100.0))
+            } ?? 0.5
+            // Relaxed is INVERTED in the intensity blend — high
+            // relaxed should DAMPEN intensity.
+            let inverseRelaxedT: Float = relaxedOverride.map {
+                1.0 - min(1.0, max(0.0, $0 / 100.0))
+            } ?? 0.5
             blendedTempoT =
-                bpmT        * 0.30 +
-                danceT      * 0.30 +
-                aggressiveT * 0.25 +
-                electronicT * 0.15
+                bpmT             * 0.25 +
+                danceT           * 0.25 +
+                aggressiveT      * 0.15 +
+                electronicT      * 0.10 +
+                partyT           * 0.15 +
+                inverseRelaxedT  * 0.10
         } else {
             let foldedBpm = octaveFoldBpm(f.beat.bpm)
             hasBeat = f.beat.confidence >= beatConfidenceFloor && foldedBpm > 0

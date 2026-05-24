@@ -147,6 +147,8 @@ struct ImmersiveView: View {
                         voiceVocalOverride: appModel.shazamVoiceVocalOverride,
                         timbreBrightnessOverride: appModel.shazamTimbreBrightnessOverride,
                         timeSigOverride: appModel.shazamTimeSigOverride,
+                        partyOverride: appModel.shazamPartyOverride,
+                        relaxedOverride: appModel.shazamRelaxedOverride,
                         keyOverride: appModel.shazamKeyOverride
                     )
                 }
