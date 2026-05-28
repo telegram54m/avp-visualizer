@@ -13,8 +13,31 @@ struct ContentView: View {
 
     @Environment(AppModel.self) private var appModel
     @State private var showFilePicker = false
+    #if os(macOS)
+    @State private var showLibraryBrowser = false
+    #endif
     @State private var searchText = ""
     @State private var searchTask: Task<Void, Never>?
+    /// iOS-only: drives the fullScreenCover presentation of the
+    /// visualizer. NavigationLink-based push fights iPhone's Dynamic
+    /// Island safe-area insets in landscape (the visualizer ends up
+    /// confined to the right portion of the screen because the safe
+    /// area inset is preserved by NavigationStack even with
+    /// .ignoresSafeArea + .toolbar(.hidden)). fullScreenCover escapes
+    /// the NavigationStack entirely, giving us a genuinely full-bleed
+    /// canvas.
+    #if os(iOS)
+    @State private var showVisualizer = false
+    #endif
+    /// macOS now-playing inspector visibility. Toggled via the toolbar
+    /// button + the small icon next to the now-playing label. Default
+    /// is closed so the user can finish setup steps without the panel
+    /// stealing screen width on first launch.
+    #if os(macOS)
+    @State private var showNowPlayingInspector = false
+    @State private var showAppleMusicLibrary = false
+    @State private var showBrowse = false
+    #endif
 
     var body: some View {
         // iPhone has a hard vertical constraint. With the search field +
@@ -29,6 +52,26 @@ struct ContentView: View {
                 .padding(30)
                 .frame(maxWidth: .infinity)
         }
+        #if os(macOS)
+        // Inspector panel — slides in from the right of the NavigationStack
+        // hosting this view, doesn't dim the main content. Width is
+        // user-resizable in the standard SwiftUI way.
+        .inspector(isPresented: $showNowPlayingInspector) {
+            NowPlayingView()
+                .environment(appModel)
+                .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    showNowPlayingInspector.toggle()
+                } label: {
+                    Label("Now Playing", systemImage: showNowPlayingInspector ? "sidebar.right" : "music.note")
+                }
+                .help(showNowPlayingInspector ? "Hide Now Playing panel" : "Show Now Playing panel")
+            }
+        }
+        #endif
     }
 
     @ViewBuilder
@@ -43,6 +86,14 @@ struct ContentView: View {
             Divider().frame(maxWidth: 360)
 
             // --- Now-playing + mode + immersive -----------------------------
+            //
+            // Originally this whole block was gated on `hasAudioSource`, which
+            // worked when the app auto-loaded a demo song on launch (Clair de
+            // Lune). Without the auto-load there's no source at startup, and
+            // hiding the input toggles + mode picker created a chicken-and-egg:
+            // the controls that START a source were themselves hidden until a
+            // source existed. Now we show controls unconditionally; the
+            // "Analyzing…" indicator and now-playing label remain conditional.
             if appModel.isLoadingSong {
                 ProgressView()
                 Text("Analyzing preview…")
@@ -51,7 +102,9 @@ struct ContentView: View {
                 Text(nowPlayingLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
 
+            Group {
                 Picker("Mode", selection: Binding(
                     get: { appModel.mode },
                     set: { appModel.mode = $0 }
@@ -88,6 +141,30 @@ struct ContentView: View {
                     .pickerStyle(.segmented)
                     .frame(maxWidth: 320)
                 }
+
+                #if os(iOS)
+                // iOS-recommended path: observe Music.app's now-playing
+                // metadata + playhead. No mic capture (which fights iOS's
+                // audio routing — see ios-audio-session.md). Visualizer
+                // tracks song position via MPMusicPlayerController.
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Follow Music app (recommended)", isOn: Binding(
+                        get: { appModel.useSystemMusic },
+                        set: { appModel.useSystemMusic = $0 }
+                    ))
+                    if appModel.useSystemMusic, !appModel.systemMusic.title.isEmpty {
+                        Text("▶ \(appModel.systemMusic.title) — \(appModel.systemMusic.artist)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else if appModel.useSystemMusic {
+                        Text("No track playing in Music app.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: 320)
+                #endif
 
                 Toggle("Listen with mic (external speakers)", isOn: Binding(
                     get: { appModel.useMic },
@@ -129,6 +206,14 @@ struct ContentView: View {
 
                 #if os(visionOS)
                 ToggleImmersiveSpaceButton()
+                #elseif os(iOS)
+                // fullScreenCover avoids NavigationStack's Dynamic
+                // Island safe-area constraints on iPhone landscape.
+                // See the showVisualizer @State comment.
+                Button("Open Visualizer") {
+                    showVisualizer = true
+                }
+                .buttonStyle(.borderedProminent)
                 #else
                 NavigationLink("Open Visualizer") {
                     VisualizerView()
@@ -137,9 +222,6 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 #endif
-            } else {
-                Text("No song loaded")
-                    .foregroundStyle(.secondary)
             }
 
             // --- Secondary: local file import ------------------------------
@@ -150,16 +232,18 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
             #endif
+
+            // --- macOS-only: scan a music library folder + batch cache -----
+            #if os(macOS)
+            Button("Browse Audio Library…") { showLibraryBrowser = true }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            #endif
         }
         // padding moved to the outer ScrollView wrapper in `body`.
-        .task {
-            // Initial demo preview so the user has something immediately if
-            // they haven't picked an Apple Music song yet. Clair de Lune
-            // gives Crystal mode its strongest reference look — slow tempo,
-            // sparse onsets, and a chromagram that walks across the hue
-            // wheel as the harmony moves.
-            await appModel.loadSong("Clair de Lune Debussy")
-        }
+        // No auto-load on launch — the user picks a song via Library /
+        // Import / Music.app / Apple Music / system audio. VisualizerView
+        // shows a "pick a song" empty state when frames is empty.
         #if !os(tvOS)
         .fileImporter(
             isPresented: $showFilePicker,
@@ -168,6 +252,24 @@ struct ContentView: View {
         ) { result in
             guard case .success(let urls) = result, let url = urls.first else { return }
             Task { await appModel.loadSong(from: url) }
+        }
+        #endif
+        #if os(macOS)
+        .sheet(isPresented: $showLibraryBrowser) {
+            LibraryBrowserView()
+                .environment(appModel)
+        }
+        #endif
+        #if os(iOS)
+        .fullScreenCover(isPresented: $showVisualizer) {
+            VisualizerView()
+                .environment(appModel)
+                .ignoresSafeArea(.all)
+                // fullScreenCover on iOS 16+ defaults to the system
+                // background color around content that doesn't fill —
+                // belt-and-suspenders by setting our own black
+                // background and ignoring safe area on it too.
+                .background(Color.black.ignoresSafeArea(.all))
         }
         #endif
     }
@@ -190,39 +292,40 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             } else {
-                HStack(spacing: 8) {
-                    // tvOS doesn't support .roundedBorder text-field style.
-                    #if os(tvOS)
-                    TextField("Search songs…", text: $searchText)
-                        .frame(maxWidth: 280)
-                        .onSubmit { runSearch() }
-                    #else
-                    TextField("Search songs…", text: $searchText)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 280)
-                        .onSubmit { runSearch() }
-                    #endif
-                    Button("Search") { runSearch() }
-                        .disabled(searchText.trimmingCharacters(in: .whitespaces).isEmpty)
-                }
+                #if !os(visionOS)
+                // SearchResultsView owns the search field, scope
+                // picker, and result row rendering for Songs / Albums /
+                // Artists / Playlists. Drill-down NavigationLinks push
+                // AlbumDetailView / ArtistDetailView / PlaylistDetailView.
+                SearchResultsView()
+                #else
+                // visionOS has no NavigationStack in this scene — keep
+                // the legacy songs-only search until Phase 7 reshapes
+                // the visionOS shell.
+                legacySearchSection
+                #endif
 
-                if mk.isSearching {
-                    ProgressView().controlSize(.small)
-                } else if !mk.searchResults.isEmpty {
-                    // Inline VStack instead of nested ScrollView — the
-                    // outer body-level ScrollView already lets the UI
-                    // scroll when content overflows on small screens. A
-                    // nested ScrollView here collapses to 0 height inside
-                    // a flex-vstack on iPhone (the bug that was hiding
-                    // results). Bound width so result rows don't stretch
-                    // across the whole window on macOS / iPad.
-                    VStack(spacing: 6) {
-                        ForEach(mk.searchResults, id: \.id) { song in
-                            searchResultRow(song)
-                        }
+                #if os(macOS)
+                // Entry points into the user's Apple Music library
+                // and Apple's curated browse (For You / Charts).
+                // Phase 7 will rehome both into the sidebar; for now
+                // they're sheets so they don't compete with the
+                // search results for screen real estate.
+                HStack(spacing: 8) {
+                    Button {
+                        showAppleMusicLibrary = true
+                    } label: {
+                        Label("My Library", systemImage: "music.note.house")
                     }
-                    .frame(maxWidth: 380)
+                    .buttonStyle(.bordered)
+                    Button {
+                        showBrowse = true
+                    } label: {
+                        Label("Browse", systemImage: "rectangle.grid.2x2")
+                    }
+                    .buttonStyle(.bordered)
                 }
+                #endif
 
                 if let np = mk.nowPlaying {
                     Text("▶ \(np.title) — \(np.artistName)")
@@ -230,9 +333,51 @@ struct ContentView: View {
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                 }
+
+                // Up Next — auto-hides itself when the queue has
+                // nothing past the current track. Lives under the
+                // now-playing label so it reads top-to-bottom as
+                // "currently playing → coming next."
+                UpNextView(appModel: appModel)
             }
         }
+        #if os(macOS)
+        .sheet(isPresented: $showAppleMusicLibrary) {
+            AppleMusicLibraryView(appModel: appModel)
+        }
+        .sheet(isPresented: $showBrowse) {
+            BrowseView(appModel: appModel)
+        }
+        #endif
     }
+
+    #if os(visionOS)
+    /// Legacy songs-only search used on visionOS until Phase 7
+    /// reshapes the shell to host NavigationStack-driven drill-downs
+    /// in the immersive context.
+    @ViewBuilder
+    private var legacySearchSection: some View {
+        let mk = appModel.musicKit
+        HStack(spacing: 8) {
+            TextField("Search songs…", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 280)
+                .onSubmit { runSearch() }
+            Button("Search") { runSearch() }
+                .disabled(searchText.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+        if mk.isSearching {
+            ProgressView().controlSize(.small)
+        } else if !mk.searchResults.isEmpty {
+            VStack(spacing: 6) {
+                ForEach(mk.searchResults, id: \.id) { song in
+                    searchResultRow(song)
+                }
+            }
+            .frame(maxWidth: 380)
+        }
+    }
+    #endif
 
     private func searchResultRow(_ song: Song) -> some View {
         Button {
@@ -254,6 +399,20 @@ struct ContentView: View {
         }
         .buttonStyle(.bordered)
         .frame(maxWidth: .infinity)
+        // Right-click (macOS) / long-press (iOS) for queue actions.
+        // Keeps the row's primary tap target as "play now" — the most
+        // common case — while making queue management discoverable.
+        .contextMenu {
+            Button {
+                Task { await appModel.playAppleMusicSong(song) }
+            } label: { Label("Play Now", systemImage: "play.fill") }
+            Button {
+                Task { await appModel.musicKit.queueNext(song) }
+            } label: { Label("Play Next", systemImage: "text.insert") }
+            Button {
+                Task { await appModel.musicKit.queueLast(song) }
+            } label: { Label("Add to Queue", systemImage: "text.append") }
+        }
     }
 
     private func runSearch() {
@@ -299,6 +458,15 @@ struct ContentView: View {
                 return "Live: \(np.title) — \(np.artistName) (\(appModel.framesCount) frames captured)"
             }
             return "Live system audio — \(appModel.framesCount) frames captured"
+        }
+        #endif
+        #if os(iOS)
+        if appModel.useSystemMusic {
+            if !appModel.systemMusic.title.isEmpty {
+                let pos = Int(appModel.systemMusic.currentPlaybackTime.rounded())
+                return "Following Music app: \(appModel.systemMusic.title) @ \(pos)s"
+            }
+            return "Following Music app — waiting for playback"
         }
         #endif
         if let np = appModel.musicKit.nowPlaying {
@@ -372,12 +540,23 @@ struct ContentView: View {
     private var systemAudioSourceLabel: String {
         if let now = appModel.systemAudio.tappedProcessName,
            appModel.systemAudio.isActive {
-            return now
+            return Self.friendlyAudioSourceName(now)
         }
         if let pref = appModel.preferredSystemAudioProcessName {
-            return pref
+            return Self.friendlyAudioSourceName(pref)
         }
         return "Auto"
+    }
+
+    /// Map opaque macOS process names to user-friendly labels.
+    /// `RemotePlayerService` is the helper process Apple Music uses
+    /// to render audio for ApplicationMusicPlayer — display it as
+    /// "Apple Music" so the UI matches the user's mental model.
+    private static func friendlyAudioSourceName(_ raw: String) -> String {
+        switch raw {
+        case "RemotePlayerService": return "Apple Music"
+        default: return raw
+        }
     }
     #endif
 }
