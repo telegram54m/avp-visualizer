@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// A song found via the iTunes Search API, with a link to its preview clip.
@@ -60,22 +61,48 @@ public enum PreviewFetcher {
         }
     }
 
-    /// Downloads a preview clip to a temporary file and returns its location.
+    /// Returns the deterministic local cache path for a given preview
+    /// URL. Hash of the URL string keeps filename uniqueness without
+    /// embedding the iTunes path structure (which can be long + ugly).
+    private static func cachedPath(for url: URL) -> URL {
+        let cacheDir = FileManager.default.urls(
+            for: .cachesDirectory, in: .userDomainMask
+        ).first!.appendingPathComponent("HighVidelity/previews", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: cacheDir, withIntermediateDirectories: true)
+        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+        let hexName = digest.map { String(format: "%02x", $0) }.joined()
+        return cacheDir.appendingPathComponent(hexName).appendingPathExtension("m4a")
+    }
+
+    /// Downloads a preview clip and returns its on-disk location.
+    /// Local cache check first — if a previous download for the same
+    /// URL is still present in the user's cache directory, skip the
+    /// network round-trip. Cache lives under
+    /// `~/Library/Caches/HighVidelity/previews/<sha256>.m4a` so it's
+    /// macOS-purgeable but stable across app launches.
     ///
-    /// The caller is responsible for deleting the returned file when done.
+    /// Returned URLs from cache hits SHOULD NOT be deleted by the
+    /// caller — they're shared. (Originally callers were responsible
+    /// for cleanup; that contract still works since the OS will
+    /// reclaim ~/Library/Caches under pressure.)
     public static func downloadPreview(from url: URL) async throws -> URL {
+        let cached = cachedPath(for: url)
+        if FileManager.default.fileExists(atPath: cached.path) {
+            return cached
+        }
         let (tempURL, response) = try await URLSession.shared.download(from: url)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw FetchError.downloadFailed
         }
-
-        // URLSession's temp file has no extension; AVAudioFile needs one to
-        // recognize the format. Move it to a path ending in .m4a.
-        let destination = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("m4a")
-        try FileManager.default.moveItem(at: tempURL, to: destination)
-        return destination
+        // Move the freshly-downloaded file into the deterministic
+        // cache slot. If another concurrent download for the same URL
+        // raced us to the destination, prefer the existing file —
+        // FileManager.moveItem throws on collision so we explicitly
+        // remove first.
+        try? FileManager.default.removeItem(at: cached)
+        try FileManager.default.moveItem(at: tempURL, to: cached)
+        return cached
     }
 
     /// Searches for a song, downloads its first matching preview, and decodes it.
@@ -88,8 +115,10 @@ public enum PreviewFetcher {
         guard let first = results.first else { throw FetchError.noResults }
 
         let fileURL = try await downloadPreview(from: first.previewURL)
-        defer { try? FileManager.default.removeItem(at: fileURL) }
-
+        // No defer-delete here — downloadPreview now caches; the file
+        // stays in ~/Library/Caches/HighVidelity/previews/ and gets
+        // reused on the next call for this URL. macOS purges the
+        // caches directory under disk pressure.
         let audio = try AudioFileDecoder.decode(contentsOf: fileURL)
         return (first, audio)
     }

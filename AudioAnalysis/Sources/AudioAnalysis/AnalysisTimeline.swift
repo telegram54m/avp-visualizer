@@ -1,7 +1,7 @@
 import Foundation
 
 /// A snapshot of the visual-relevant audio features at one moment in time.
-public struct FeatureFrame: Sendable {
+public struct FeatureFrame: Sendable, Codable {
     public let time: Double
     public let color: TonalColor
     public let timbreBrightness: Float

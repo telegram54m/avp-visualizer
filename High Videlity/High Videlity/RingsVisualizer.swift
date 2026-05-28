@@ -42,19 +42,58 @@ import UIKit
 import AppKit
 #endif
 
+/// What each ring represents musically. The 16-ring cluster is split:
+/// inner 12 = pitch classes (one ring per chromagram bin, in
+/// circle-of-fifths order); outer 4 = frequency bands (sub at the
+/// innermost outer ring, brilliance at the outermost).
+enum RingKind: Equatable {
+    /// Ring is one of the 12 pitch classes. `pitchClass` is 0..11
+    /// indexing into `PitchClass.allCases` / chromagram bins.
+    case pitch(pitchClass: Int)
+    /// Ring is one of the 4 frequency bands. `bandIndex` is 0..3
+    /// indexing into `FrequencyBand` (sub / lowMid / highMid / brilliance).
+    case band(bandIndex: Int)
+}
+
 /// Per-ring animation state. Stored on each ring entity.
 struct RingComponent: Component {
     let index: Int
     let baseR: Float
+    let kind: RingKind
     var intensity: Float = 0
     var rotation: Float = 0
 }
 
+/// One ripple wavefront. Direction determines whether the wave
+/// expands outward from the center (sub-band kicks) or contracts
+/// inward from the outer edge (brilliance-band hats/cymbals). Same
+/// 1.6s lifetime + speed-12 propagation as the original ripples;
+/// just gain a `direction` so the same code can drive both.
+struct Ripple: Equatable {
+    enum Direction: Equatable { case outward, inward }
+    let bornTime: Double
+    let direction: Direction
+}
+
 /// Cluster-level state. Stored on the root entity.
 struct RingsRootComponent: Component {
-    /// Onset-triggered ripples — clock times at which they were born. Pruned
-    /// when older than 1.6s.
-    var ripples: [Double] = []
+    /// Onset-triggered ripples — born times + direction. Pruned when
+    /// older than 1.6s. See `Ripple.Direction` for the two flavors.
+    var ripples: [Ripple] = []
+    /// Smoothed chromagram — per-pitch-class intensity, drives the
+    /// inner 12 rings' brightness. Lerped at ~6 Hz so brief chord
+    /// changes register clearly but isolated transients don't strobe
+    /// individual rings. Length-12; index = pitch class.
+    var smoothedChromagram: [Float] = Array(repeating: 0, count: 12)
+    /// Smoothed per-band loudness — drives the outer 4 rings'
+    /// brightness. Lerped at ~4 Hz (matches eLoudSmoothed). Length-4;
+    /// index matches `FrequencyBand.rawValue` (sub/lowMid/highMid/brilliance).
+    var smoothedBandLoudness: [Float] = Array(repeating: 0, count: 4)
+    /// First-tick sentinel for snapping smoothedChromagram +
+    /// smoothedBandLoudness to the current frame's values instead of
+    /// lerping in from zero (avoids a "rings dark for a second on
+    /// scene load" beat).
+    var firstAnimateTick: Bool = true
     /// Last frame index we scanned for onsets, so we don't re-trigger ripples
     /// from frames we already processed.
     var lastFrameIndex: Int = -1
@@ -88,9 +127,7 @@ struct RingsRootComponent: Component {
     /// blue → purple → red → purple in <200ms, which reads as "color
     /// strobing." Smoothing via circular lerp keeps the hue moving
     /// continuously around the color wheel.
-    var hueSmoothed: Float = 0
-    var hueSmoothedInitialized: Bool = false
-    /// `appModel.liveModeResetCounter` value at the most-recent animate
+/// `appModel.liveModeResetCounter` value at the most-recent animate
     /// tick. When AppModel bumps it (Shazam track-change reset),
     /// `animate` clears ripples + drops per-song frame-index state +
     /// re-initializes hue smoothing so the new song's first hue isn't
@@ -152,6 +189,15 @@ enum RingsVisualizer {
         for k in 0..<ringCount {
             let baseR = baseRadiusStart + Float(k) * baseRadiusStep
 
+            // Ring kind: inner 12 = pitch classes (one per chromagram
+            // bin), outer 4 = frequency bands (sub innermost-outer,
+            // brilliance outermost). The numerical 16 = 12+4 happens
+            // to land cleanly so we can give every ring meaning
+            // instead of having 4 "extra" rings doing nothing.
+            let kind: RingKind = k < 12
+                ? .pitch(pitchClass: k)
+                : .band(bandIndex: k - 12)
+
             // Per-ring material — UnlitMaterial with the glow texture and a
             // white tint initially. Updated per frame in animate() with the
             // current HSB tint reflecting hue / saturation / brightness*intensity.
@@ -167,7 +213,7 @@ enum RingsVisualizer {
             material.writesDepth = false
 
             let ringEnt = ModelEntity(mesh: quadMesh, materials: [material])
-            ringEnt.components.set(RingComponent(index: k, baseR: baseR))
+            ringEnt.components.set(RingComponent(index: k, baseR: baseR, kind: kind))
 
             // Set up the 200 instances for this ring's particles.
             var instancesComp = MeshInstancesComponent()
@@ -212,7 +258,10 @@ enum RingsVisualizer {
         clock: Double,
         frames: [FeatureFrame],
         deltaTime: Double,
-        appResetCounter: Int = -1
+        appResetCounter: Int = -1,
+        bpmOverride: Float? = nil,
+        happinessOverride: Float? = nil,
+        keyOverride: Key? = nil
     ) {
         guard !frames.isEmpty,
               var rootState = rings.components[RingsRootComponent.self]
@@ -234,7 +283,9 @@ enum RingsVisualizer {
         if appResetCounter >= 0 && appResetCounter != rootState.lastSeenResetCounter {
             rootState.lastFrameIndex = max(-1, frames.count - 1)
             rootState.ripples.removeAll()
-            rootState.hueSmoothedInitialized = false
+            rootState.smoothedChromagram = .init(repeating: 0, count: 12)
+            rootState.smoothedBandLoudness = .init(repeating: 0, count: 4)
+            rootState.firstAnimateTick = true
             rootState.lastSeenResetCounter = appResetCounter
         }
 
@@ -252,55 +303,110 @@ enum RingsVisualizer {
         rootState.eLoudSmoothed   += (Float(f.loudness)          - rootState.eLoudSmoothed)   * lerp
         rootState.eTimbreSmoothed += (Float(f.color.saturation)  - rootState.eTimbreSmoothed) * lerp
 
-        // Hue smoothing — CIRCULAR lerp because hue wraps at 1.0. A burst
-        // capture during testing showed the raw chromagram hue jumping
-        // by 0.2–0.3 between adjacent frames (blue → purple → red → blue)
-        // when chord-rich songs play; that reads as harsh color strobing.
-        // We take the shorter way around the wheel: if the diff exceeds
-        // 0.5, wrap it (going forward 0.7 means going backward 0.3 is
-        // shorter, etc.) so the lerp travels the correct arc.
-        let targetHue = Float(f.color.hue)
-        if !rootState.hueSmoothedInitialized {
-            rootState.hueSmoothed = targetHue
-            rootState.hueSmoothedInitialized = true
-        } else {
-            var diff = targetHue - rootState.hueSmoothed
-            if diff > 0.5 { diff -= 1.0 }
-            else if diff < -0.5 { diff += 1.0 }
-            // Slower lerp on hue than loudness — color changes feel
-            // intrusive even at 4 Hz, where loudness reactivity at 4 Hz
-            // feels appropriately responsive. 2 Hz keeps color drift
-            // visible and music-driven without strobing.
-            let hueLerp = Float(min(1.0, deltaTime * 2))
-            var next = rootState.hueSmoothed + diff * hueLerp
-            if next < 0 { next += 1 }
-            if next >= 1 { next -= 1 }
-            rootState.hueSmoothed = next
+        // First-tick snap: initialize per-pitch chromagram + per-band
+        // loudness from the current frame so rings don't fade in from
+        // black on scene load.
+        if rootState.firstAnimateTick {
+            let chromaMax = max(0.001, f.chromagram.max() ?? 0.001)
+            for k in 0..<12 {
+                rootState.smoothedChromagram[k] = f.chromagram[k] / chromaMax
+            }
+            for k in 0..<4 {
+                rootState.smoothedBandLoudness[k] = f.bandLoudness[k]
+            }
+            rootState.firstAnimateTick = false
         }
 
-        let eLoud    = Double(rootState.eLoudSmoothed)
-        let eComplex = Double(f.harmonicComplexity)
-        let eTimbre  = Double(rootState.eTimbreSmoothed)
-        let hue      = CGFloat(rootState.hueSmoothed)
+        // Per-pitch normalized chromagram smoothing at ~6 Hz so chord
+        // changes register clearly without per-frame strobing. Max-bin
+        // normalization (same trick dodec uses) keeps the dominant
+        // pitch always at 1.0 regardless of song loudness.
+        let chromaLerp = Float(min(1.0, deltaTime * 6.0))
+        let chromaMax = max(0.001, f.chromagram.max() ?? 0.001)
+        for k in 0..<12 {
+            let normalized = f.chromagram[k] / chromaMax
+            rootState.smoothedChromagram[k] +=
+                (normalized - rootState.smoothedChromagram[k]) * chromaLerp
+        }
+        // Per-band loudness smoothing at ~4 Hz (matches eLoud cadence).
+        let bandLerp = Float(min(1.0, deltaTime * 4.0))
+        for k in 0..<4 {
+            rootState.smoothedBandLoudness[k] +=
+                (f.bandLoudness[k] - rootState.smoothedBandLoudness[k]) * bandLerp
+        }
 
-        // Detect new onsets since last scan. Each new onset pushes a ripple.
+        // Tempo system — same canonical-fold + slow/fast endpoints the
+        // dodec uses. `tempoT` ∈ [0, 1] where 0 = slow ballad, 1 = fast
+        // disco. Drives rotation rate; could later drive other params.
+        let foldedBpm = BeatHelpers.octaveFoldBpm(bpmOverride ?? f.beat.bpm)
+        let tempoT: Float = {
+            let slow: Float = 80, fast: Float = 130
+            let raw = (foldedBpm - slow) / (fast - slow)
+            return min(1.0, max(0.0, raw))
+        }()
+
+        // Global single-hue smoothing (and the harmonicComplexity-based
+        // activeRings count) are GONE — each ring owns its color and
+        // brightness via its `kind` + smoothedChromagram /
+        // smoothedBandLoudness. The old `hueSmoothed` state field was
+        // removed from `RingsRootComponent`. eLoud + eTimbre remain
+        // for global saturation/brightness floors.
+        let eLoud   = Double(rootState.eLoudSmoothed)
+        let eTimbre = Double(rootState.eTimbreSmoothed)
+
+        // Detect new band onsets since last scan. Band routing:
+        //   sub kicks   → ripple expands OUTWARD from center
+        //   brilliance  → ripple contracts INWARD from outer edge
+        // The two collide visually in the mid rings on a tight kick+hat
+        // pattern. lowMid + highMid onsets are intentionally NOT
+        // mapped to ripples — they're carried by the per-band ring
+        // brightness instead, leaving the kinetic ripple layer clean
+        // for the rhythmic extremes.
+        let subIdx = FrequencyBand.sub.rawValue
+        let brilIdx = FrequencyBand.brilliance.rawValue
         if rootState.lastFrameIndex < i {
             let start = max(0, rootState.lastFrameIndex + 1)
-            for k in start...i where frames[k].onset {
-                rootState.ripples.append(t)
+            for k in start...i {
+                if frames[k].bandOnset[subIdx] {
+                    rootState.ripples.append(Ripple(bornTime: t, direction: .outward))
+                }
+                if frames[k].bandOnset[brilIdx] {
+                    rootState.ripples.append(Ripple(bornTime: t, direction: .inward))
+                }
             }
         }
         rootState.lastFrameIndex = i
         // Prune ripples older than 1.6s (the HTML lifetime).
-        rootState.ripples.removeAll { t - $0 >= 1.6 }
+        rootState.ripples.removeAll { t - $0.bornTime >= 1.6 }
 
-        // HTML-faithful audio-driven globals.
+        // Globals shared across rings (saturation floor + brightness
+        // floor still come from loudness + timbre as before; the
+        // per-pitch / per-band intensity REPLACES the old
+        // harmonicComplexity activeRings mechanism).
         let sat   = Float(min(1.0, 0.32 + eLoud * 2.2))
         let baseV = Float(min(1.0, 0.45 + eTimbre * 1.4))
-        let activeRings = 4 + Int((eComplex * Double(ringCount - 4)).rounded())
         // Breath = energy-driven gentle scale modulation (HTML uses *0.04).
         let breath: Float = 1.0 + Float(eLoud) * 0.04
         rings.scale = SIMD3<Float>(repeating: breath)
+        // Outermost ring's baseR — needed for the inward-ripple math
+        // (wavefront starts at this radius and contracts to center).
+        let maxBaseR = baseRadiusStart + Float(ringCount - 1) * baseRadiusStep
+        // Tonic pitch class (0..11), or nil when key is unknown. Used
+        // for the per-pitch heartbeat boost on the matching ring.
+        let tonicIndex: Int? = keyOverride?.tonic.rawValue
+        // Slow sin heartbeat — 0.5 Hz so the tonic ring breathes
+        // independently of the song's tempo. Same pattern dodec uses.
+        let tonicHeartbeat: Float = 1.0
+            + sin(Float(t) * 0.5 * 2 * .pi) * 0.20
+        // Mood-driven background hue shift. Cool (sad) ↔ warm (happy).
+        // Applied as a small additive offset on each ring's hue — the
+        // ring KEEPS its pitch/band identity but takes on a tint.
+        let moodHueOffset: CGFloat = {
+            guard let h = happinessOverride else { return 0 }
+            let t01 = CGFloat(max(0, min(100, h)) / 100.0)
+            // Sad → +0.05 (toward cool blue); happy → -0.03 (toward warm gold).
+            return 0.05 + (-0.08) * t01
+        }()
 
         // Capture base transform lazily on first animate() call —
         // whatever the host set up (VisualizerView's tilt + Z, or
@@ -354,21 +460,55 @@ enum RingsVisualizer {
             else { continue }
 
             let k = rc.index
-            // Smooth intensity toward target (active or not). HTML uses dt*3.
-            let target: Float = k < activeRings ? 1.0 : 0.0
+            // Per-ring target intensity — kind-driven instead of the
+            // old "first N rings are bright, rest are dark" approach.
+            // Pitch rings get their chromagram bin's normalized energy
+            // (max-bin is always 1.0); band rings get a stretched
+            // version of their band's loudness so quiet sections
+            // still show some baseline.
+            var ringHue: CGFloat = 0
+            var target: Float = 0
+            switch rc.kind {
+            case .pitch(let pitchClass):
+                let pc = PitchClass(rawValue: pitchClass) ?? .c
+                ringHue = CGFloat(pc.circleOfFifthsHue)
+                target = rootState.smoothedChromagram[pitchClass]
+                // Tonic gets a slow sin-wave bonus so it always
+                // breathes brighter than the surrounding pitches.
+                if pitchClass == tonicIndex {
+                    target = min(1.0, target * tonicHeartbeat + 0.15)
+                }
+            case .band(let bandIndex):
+                // Per-band characteristic hue — sub through brilliance
+                // walks warm-to-cool (red → orange → cyan → violet).
+                let bandHues: [CGFloat] = [0.05, 0.10, 0.55, 0.80]
+                ringHue = bandHues[bandIndex]
+                // Stretched band loudness — typical band amplitudes
+                // sit at 0.05..0.20; ×4 lifts them into the 0..1
+                // visible range with a floor so they never go dark.
+                target = min(1.0, max(0.15, rootState.smoothedBandLoudness[bandIndex] * 4))
+            }
             rc.intensity += (target - rc.intensity) * Float(min(1.0, deltaTime * 3))
-            // Rotation: alternating direction; outer rings spin slightly faster.
+            // Rotation: alternating direction; outer rings spin slightly
+            // faster. Tempo-modulated: slow songs hold near the baseline
+            // rate, fast songs spin 2× faster, both still scaled by loudness.
             let dir: Float = (k % 2 == 0) ? 1 : -1
+            let tempoMult: Float = 0.7 + 1.3 * tempoT  // 0.7 slow → 2.0 fast
             rc.rotation += Float(deltaTime) * dir
-                * Float(0.15 + eLoud * 1.4) * (0.5 + Float(k) * 0.05)
+                * Float(0.15 + eLoud * 1.4) * (0.5 + Float(k) * 0.05) * tempoMult
 
-            // Material color — one update per ring per frame (16 total),
-            // not 3200. Brightness baked into the tint via HSB; opacity stays
-            // 1.0 because the texture's alpha provides the soft falloff and
-            // ring intensity * baseV is folded into brightness here.
+            // Material color — one update per ring per frame (16 total).
+            // Hue now comes from the ring's kind (pitch or band) plus
+            // a small mood-driven offset; saturation + brightness come
+            // from the existing loudness/timbre + per-ring intensity
+            // pipeline. The global `hueSmoothed` is gone — each ring
+            // owns its color identity.
+            var finalHue = ringHue + moodHueOffset
+            if finalHue < 0 { finalHue += 1 }
+            if finalHue >= 1 { finalHue -= 1 }
             let v = baseV * rc.intensity
             let color = PlatformColor(
-                hue: hue,
+                hue: finalHue,
                 saturation: CGFloat(sat),
                 brightness: CGFloat(max(0, min(1, v))),
                 alpha: 1.0
@@ -380,28 +520,23 @@ enum RingsVisualizer {
                 ringEnt.components.set(modelComp)
             }
 
-            // Ripple contribution to the effective radius. HTML formula:
-            //   d = (baseR - age*12) / 2.2
-            //   ripple += 1.1 * exp(-d*d) * (1 - age/1.6)
-            // The wavefront travels outward at speed 12 in the cluster's
-            // units. We use Float math throughout for the per-instance loop.
-            //
-            // **Attack envelope (added 2026-05-21):** the HTML formula has
-            // no fade-in — at age=0, the wavefront sits at radius 0, very
-            // close to the inner rings' baseR. So d ≈ baseR/2.2 (small),
-            // exp(-d²) ≈ 1, and the inner ring's ripple contribution
-            // SNAPS to its full amplitude on the onset frame, then decays.
-            // Visually the center ring jumps to a larger aperture instead
-            // of growing/contracting. A 120ms linear attack on the envelope
-            // ramps the ripple in smoothly for the center ring without
-            // meaningfully delaying the outer rings (their wavefront-pass
-            // happens at age = baseR/12, which is well past the attack
-            // window for any ring whose baseR > ~1.5 units).
+            // Ripple contribution to the effective radius — now
+            // direction-aware. Outward (sub kicks): wavefront starts
+            // at radius 0 and expands at speed 12. Inward (brilliance
+            // hats): wavefront starts at maxBaseR and contracts at
+            // speed 12. The gaussian distance kernel + 120ms attack
+            // envelope + 1.6s decay are unchanged from the original
+            // outward-only ripple.
             var ripple: Float = 0
             let attack: Float = 0.12
-            for born in rootState.ripples {
-                let age = Float(t - born)
-                let d = (rc.baseR - age * 12) / 2.2
+            for rip in rootState.ripples {
+                let age = Float(t - rip.bornTime)
+                let wavefrontRadius: Float
+                switch rip.direction {
+                case .outward: wavefrontRadius = age * 12
+                case .inward:  wavefrontRadius = maxBaseR - age * 12
+                }
+                let d = (rc.baseR - wavefrontRadius) / 2.2
                 let attackEnv: Float = age < attack ? age / attack : 1.0
                 let decayEnv: Float = max(0, 1 - age / 1.6)
                 ripple += 1.1 * exp(-d * d) * attackEnv * decayEnv

@@ -6,7 +6,12 @@ import AudioAnalysis
 /// visualization with a song switcher.
 ///
 /// Usage:  swift run visualize "Song One Artist" "Song Two Artist" ...
-///         swift run visualize            (uses a built-in default set)
+///
+/// Was used during early prototyping to iterate on the analysis +
+/// browser-Three.js mapping without a native app target. The native
+/// macOS / iOS / visionOS app is the real product now; this CLI lives
+/// on for ad-hoc DSP experiments. No default song set — pass terms
+/// explicitly or the tool exits.
 @main
 struct Visualize {
 
@@ -32,19 +37,14 @@ struct Visualize {
         let frames: [ExportFrame]
     }
 
-    static let defaultSongs = [
-        "Get Lucky Daft Punk",
-        "Bohemian Rhapsody Queen",
-        "Smells Like Teen Spirit Nirvana",
-        "Billie Jean Michael Jackson",
-        "Clair de Lune Debussy",
-        "Shadowplay Joy Division",
-        "Comfortably Numb Pink Floyd",
-    ]
-
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
-        let searchTerms = args.isEmpty ? defaultSongs : args
+        guard !args.isEmpty else {
+            print("Usage: swift run visualize \"Song Artist\" [\"Song Artist\" ...]")
+            print("Example: swift run visualize \"Bohemian Rhapsody Queen\"")
+            exit(2)
+        }
+        let searchTerms = args
 
         var songs: [SongExport] = []
         for term in searchTerms {

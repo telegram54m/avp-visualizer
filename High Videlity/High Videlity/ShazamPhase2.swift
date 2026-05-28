@@ -85,9 +85,13 @@ extension ShazamController {
         // Phase 3 both fired and we derived the offset), Phase 3 alone
         // can synthesize alignment going forward — Phase 2's finicky
         // single-signature catalog match doesn't need to fire.
+        //
+        // The lookup is a local UserDefaults read first; on local miss
+        // we opportunistically ask CloudKit (might have been calibrated
+        // on the user's other Apple device — see [[CloudCacheSync]]).
         let cacheKey = Self.cacheKey(title: title, artist: artist)
         self.currentSongCacheKey = cacheKey
-        if let cached = Self.cachedPreviewStartInSong(for: cacheKey) {
+        if let cached = await Self.cachedPreviewStartInSong(for: cacheKey) {
             self.currentSongPreviewStartInSong = cached
             alignLog.info("HV-ALIGN cache HIT for \(title, privacy: .public): previewStartInSong=\(cached, privacy: .public)s — Phase 3 will synthesize")
         } else {
@@ -117,6 +121,61 @@ extension ShazamController {
             alignLog.info("HV-ALIGN registered \(title, privacy: .public) — \(artist, privacy: .public) (custom catalog ready)")
         } catch {
             alignLog.error("HV-ALIGN signature generation failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    // MARK: - Public-catalog signature lookup (iOS cross-user stems)
+
+    /// Submit a preview file's signature to Shazam's PUBLIC catalog and
+    /// return the matched recording's `shazamID` (or nil on no match).
+    /// Used on iOS to derive a cross-device cache key for the currently-
+    /// playing Apple Music track WITHOUT needing the mic on — the
+    /// preview audio we already downloaded for tonal analysis IS the
+    /// reference Shazam needs.
+    ///
+    /// Why this is necessary on iOS: the cross-user stem cache in
+    /// [[CloudCacheSync]] is keyed on `shazamID`. On macOS that key
+    /// arrives via mic / system-tap → public-catalog Shazam streaming
+    /// match. On iOS streaming-AM, no mic loop runs, so the only way
+    /// to get a shazamID for the playing track is to identify it from
+    /// audio we already hold — i.e. the iTunes preview clip.
+    ///
+    /// One-shot, not streaming. Cost: ~500–1500ms (signature gen +
+    /// network round-trip to Shazam's catalog service). Result is the
+    /// canonical shazamID for the recording; downstream callers cache
+    /// it and reuse on subsequent plays.
+    ///
+    /// Nil on: no match (preview doesn't index in Shazam's catalog —
+    /// rare for major-label tracks but possible for indie / obscure
+    /// catalog), signature generation failure, network failure.
+    static func lookupShazamIDFromPreview(audioURL: URL) async -> String? {
+        do {
+            let signature = try await generateSignature(forFileAt: audioURL)
+            // Default SHSession() targets Shazam's public catalog. Async
+            // `result(from:)` (iOS 17+ / macOS 14+) wraps the delegate-
+            // based match path; we're past that floor on deployment.
+            let session = SHSession()
+            let result = try await session.result(from: signature)
+            switch result {
+            case .match(let match):
+                guard let item = match.mediaItems.first,
+                      let id = item.shazamID, !id.isEmpty
+                else {
+                    alignLog.notice("HV-ALIGN public-catalog match but no shazamID")
+                    return nil
+                }
+                alignLog.info("HV-ALIGN public-catalog HIT shazamID=\(id, privacy: .public) (\(item.title ?? "?", privacy: .public))")
+                return id
+            case .noMatch:
+                alignLog.info("HV-ALIGN public-catalog noMatch from preview signature")
+                return nil
+            case .error(let err, _):
+                alignLog.notice("HV-ALIGN public-catalog error: \(String(describing: err), privacy: .public)")
+                return nil
+            }
+        } catch {
+            alignLog.notice("HV-ALIGN signature/match err: \(String(describing: error), privacy: .public)")
+            return nil
         }
     }
 
@@ -170,28 +229,47 @@ extension ShazamController {
             let sourceFormat = file.processingFormat
             let fileLength = AVAudioFrameCount(file.length)
 
-            // Different approach: instead of trying to match an arbitrary
-            // target format (which kept producing "Audio format mismatch"
-            // crashes against the live mic stream), pre-read the mic's
-            // ACTUAL format from AVAudioEngine.inputNode and convert the
-            // preview to exactly that. SHSession's internal format check
-            // appears to be flag-strict — even when our target's numeric
-            // values match the mic, subtle differences in AVAudioConverter's
-            // output flags (interleaved vs not, channel layout tag) make
-            // Shazam crash. Sourcing the format from the engine directly
-            // sidesteps the guesswork.
+            // Target format selection:
+            //   • macOS: mic input format varies by interface (USB,
+            //     built-in, aggregate device etc.), so we have to ask
+            //     AVAudioEngine.inputNode at runtime. SHSession's
+            //     internal format check is flag-strict — even when our
+            //     target's numeric values match the mic, subtle
+            //     AVAudioConverter output flag differences make Shazam
+            //     crash. Sourcing format from the engine sidesteps that.
+            //   • iOS / iPadOS / visionOS / tvOS: hardware mic format is
+            //     consistent (48 kHz Float32 mono non-interleaved). And
+            //     CRUCIALLY, just *creating* AVAudioEngine() and reading
+            //     inputNode here implicitly activates the audio session
+            //     for input — which interrupts Apple Music playback
+            //     (visible as "AM plays for 3 seconds then pauses").
+            //     Hard-code the canonical iOS mic format instead.
+            #if os(macOS)
             let engine = AVAudioEngine()
             let micFormat = engine.inputNode.outputFormat(forBus: 0)
-            // micFormat might have channels=2 (some interfaces); force
-            // mono since we don't have a stereo path on the wire.
             guard let targetFormat = AVAudioFormat(
                 commonFormat: micFormat.commonFormat,
                 sampleRate: micFormat.sampleRate,
                 channels: 1,
                 interleaved: micFormat.isInterleaved
-            ), let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+            ) else {
                 throw NSError(domain: "ShazamPhase2", code: -2,
                               userInfo: [NSLocalizedDescriptionKey: "Format converter setup failed"])
+            }
+            #else
+            guard let targetFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: 48000,
+                channels: 1,
+                interleaved: false
+            ) else {
+                throw NSError(domain: "ShazamPhase2", code: -2,
+                              userInfo: [NSLocalizedDescriptionKey: "Format converter setup failed"])
+            }
+            #endif
+            guard let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+                throw NSError(domain: "ShazamPhase2", code: -2,
+                              userInfo: [NSLocalizedDescriptionKey: "AVAudioConverter alloc failed"])
             }
 
             // Single-pass conversion. The 30s preview is small (≤ ~5 MB
@@ -354,20 +432,84 @@ extension ShazamController {
         alignLog.info("HV-ALIGN synthesized via Phase-3 cache: pcmo=\(pcmo, privacy: .public)s previewTime=\(previewTime, privacy: .public)s")
     }
 
+    // MARK: - External calibration entry point
+
+    /// Apply a `previewStartInSong` value derived from a path OTHER
+    /// than live mic-Shazam matching. Used by [[LocalCalibration]]
+    /// on iOS: when a song starts and we have the `MPMediaItem.
+    /// assetURL` but no cached alignment, we decode the song locally
+    /// and match it against the preview signature, then call this
+    /// method with the result.
+    ///
+    /// Effects:
+    ///   1. Persist to the alignment cache (which auto-pushes to
+    ///      CloudKit via [[cloudkit-cache-sync]], so other devices
+    ///      benefit on their next bootstrap).
+    ///   2. Update `currentSongPreviewStartInSong` so Phase 3's
+    ///      next public-catalog match synthesizes alignment using
+    ///      this value (or so the iOS `playbackTime` branch can
+    ///      consume it directly).
+    ///
+    /// Idempotent: if the value already matches the current cache,
+    /// the save is a no-op (UserDefaults handles deduplication).
+    @MainActor
+    func applyExternalAlignmentCalibration(
+        previewStartInSong: TimeInterval,
+        title: String, artist: String
+    ) {
+        let key = Self.cacheKey(title: title, artist: artist)
+        // Only apply if the song this controller is registered against
+        // is still the same one calibration ran for — track changes
+        // between kickoff and completion are possible.
+        guard self.currentSongCacheKey == key else {
+            alignLog.info("HV-ALIGN external calibration discarded (song changed): \(title, privacy: .public)")
+            return
+        }
+        Self.savePreviewStartInSong(previewStartInSong, for: key)
+        self.currentSongPreviewStartInSong = previewStartInSong
+        alignLog.info("HV-ALIGN external calibration applied: previewStartInSong=\(previewStartInSong, privacy: .public)s for \(title, privacy: .public)")
+    }
+
     // MARK: - UserDefaults-backed cache
 
     /// Look up cached previewStartInSong for a (title, artist) key.
     /// Returns nil if the song has never been calibrated.
-    fileprivate static func cachedPreviewStartInSong(for key: String) -> TimeInterval? {
+    ///
+    /// Local-first: UserDefaults is consulted synchronously. If that
+    /// misses, we await a single-record CloudKit fetch (bounded by
+    /// CloudKit's own internal timeout — typically <1s on a healthy
+    /// network, instant if iCloud is unavailable since we short-
+    /// circuit). On CloudKit hit we mirror the value into UserDefaults
+    /// so subsequent reads are instant and offline-safe.
+    fileprivate static func cachedPreviewStartInSong(for key: String) async -> TimeInterval? {
         let dict = UserDefaults.standard.dictionary(forKey: previewOffsetCacheKey) ?? [:]
-        return dict[key] as? TimeInterval
+        if let local = dict[key] as? TimeInterval {
+            return local
+        }
+        // Local miss → ask CloudKit. Won't block in any meaningful way
+        // if iCloud is unavailable (CloudCacheSync flips its internal
+        // availability flag on the first auth error).
+        if let remote = await CloudCacheSync.shared.fetchPreviewOffset(key: key) {
+            // Mirror into UserDefaults so the next read hits locally.
+            var updated = UserDefaults.standard.dictionary(forKey: previewOffsetCacheKey) ?? [:]
+            updated[key] = remote
+            UserDefaults.standard.set(updated, forKey: previewOffsetCacheKey)
+            return remote
+        }
+        return nil
     }
 
     /// Persist a calibrated previewStartInSong for future plays of this song.
+    /// Writes UserDefaults synchronously (consumers see the value on the
+    /// next read this session) and fires a background CloudKit push so
+    /// other devices see it on their next bootstrap.
     fileprivate static func savePreviewStartInSong(_ value: TimeInterval, for key: String) {
         var dict = UserDefaults.standard.dictionary(forKey: previewOffsetCacheKey) ?? [:]
         dict[key] = value
         UserDefaults.standard.set(dict, forKey: previewOffsetCacheKey)
+        Task.detached(priority: .background) {
+            await CloudCacheSync.shared.savePreviewOffset(value, for: key)
+        }
     }
 
     /// Build the cache key. Uses the normalized title plus the original

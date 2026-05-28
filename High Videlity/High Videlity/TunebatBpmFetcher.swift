@@ -102,6 +102,19 @@ enum TunebatBpmFetcher {
         let key: Key?
         let canonicalTitle: String
         let canonicalArtist: String
+        /// Full-song beat timestamps in seconds, from AcousticBrainz's
+        /// `rhythm.beats_position` array. Only populated when the
+        /// MusicBrainz → AcousticBrainz fallback path matched AND
+        /// AB returned a non-empty beats array (most pre-2018
+        /// catalog tracks do). Nil for GetSongBPM-only matches (the
+        /// GetSongBPM API doesn't expose beat positions) and for AB
+        /// matches that returned only `bpm` without `beats_position`.
+        ///
+        /// Drives Tier 2 frame synthesis — every entry is the
+        /// onset/beatTrigger time for that beat in the full song,
+        /// replacing Tier 3's BPM-extrapolated grid with the real
+        /// beat positions AB detected from the master recording.
+        let beatPositions: [Double]?
     }
 
     /// Look up a song's BPM. Returns nil if no match was found OR the
@@ -121,6 +134,22 @@ enum TunebatBpmFetcher {
         if let cached = readCache(cacheKey) {
             bpmLog.info("HV-BPM cache hit \(title, privacy: .public) → \(cached.bpm) BPM")
             return cached
+        }
+
+        // Local miss → check CloudKit before going to the network. A
+        // user listening to a song on iPhone for the first time may
+        // have already had it resolved on their Mac via this same
+        // sync layer. The cloud key is the normalized "title|artist"
+        // without the local UserDefaults prefix.
+        let cloudKey = makeCloudKey(title: title, artist: artist)
+        if let cloudDict = await CloudCacheSync.shared.fetchMetadata(key: cloudKey) {
+            // Mirror into local UserDefaults so future reads hit
+            // synchronously and offline.
+            UserDefaults.standard.set(cloudDict, forKey: cacheKey)
+            if let materialized = readCache(cacheKey) {
+                bpmLog.info("HV-BPM cloud hit \(title, privacy: .public) → \(materialized.bpm) BPM")
+                return materialized
+            }
         }
 
         // Run both sources CONCURRENTLY. The MB+AB chain (which makes
@@ -201,7 +230,8 @@ enum TunebatBpmFetcher {
             canonicalTitle: gsbpm?.canonicalTitle
                 ?? mb?.canonicalTitle ?? queryTitle,
             canonicalArtist: gsbpm?.canonicalArtist
-                ?? mb?.canonicalArtist ?? queryArtist
+                ?? mb?.canonicalArtist ?? queryArtist,
+            beatPositions: mb?.beatPositions          // AB-only
         )
     }
 
@@ -437,7 +467,8 @@ enum TunebatBpmFetcher {
             relaxed: nil,
             key: key,
             canonicalTitle: canonicalTitle,
-            canonicalArtist: canonicalArtist
+            canonicalArtist: canonicalArtist,
+            beatPositions: nil      // GetSongBPM doesn't expose beat positions
         )
     }
 
@@ -513,6 +544,13 @@ enum TunebatBpmFetcher {
         cachePrefix + normalize("\(title)|\(artist)")
     }
 
+    /// The normalized "title|artist" without the UserDefaults prefix.
+    /// CloudKit records key by this so the cloud row is shared across
+    /// schema bumps (we'd migrate fields, not the record identity).
+    private static func makeCloudKey(title: String, artist: String) -> String {
+        normalize("\(title)|\(artist)")
+    }
+
     private static func readCache(_ cacheKey: String) -> Result? {
         guard let dict = UserDefaults.standard.dictionary(forKey: cacheKey) else {
             return nil
@@ -536,6 +574,10 @@ enum TunebatBpmFetcher {
             guard let raw = dict["keyOf"] as? String, !raw.isEmpty else { return nil }
             return parseKey(raw)
         }()
+        // Beat positions: stored as [Double] under "beatPositions". Pre-
+        // Tier-2 cache entries won't have this key — those return nil
+        // and the next fresh fetch will populate it via writeCache.
+        let beatPositions: [Double]? = dict["beatPositions"] as? [Double]
         return Result(
             bpm: Float(bpm),
             danceability: danceability,
@@ -549,7 +591,8 @@ enum TunebatBpmFetcher {
             relaxed: relaxed,
             key: key,
             canonicalTitle: (dict["title"] as? String) ?? "",
-            canonicalArtist: (dict["artist"] as? String) ?? ""
+            canonicalArtist: (dict["artist"] as? String) ?? "",
+            beatPositions: beatPositions
         )
     }
 
@@ -591,10 +634,28 @@ enum TunebatBpmFetcher {
             let modeSuffix = k.mode == .minor ? "m" : ""
             dict["keyOf"] = "\(k.tonic.name)\(modeSuffix)"
         }
+        if let beats = result.beatPositions, !beats.isEmpty {
+            // Store the raw [Double] — UserDefaults handles primitive
+            // arrays directly. For a 4-min song at ~120 BPM this is
+            // ~480 doubles ≈ 4 KB, well under the per-key limit.
+            dict["beatPositions"] = beats
+        }
         UserDefaults.standard.set(dict, forKey: cacheKey)
+
+        // Mirror to CloudKit so other devices skip the API roundtrip.
+        // Strip the local prefix from the cache key — CloudKit uses
+        // the bare normalized "title|artist" as the record name.
+        let cloudKey = String(cacheKey.dropFirst(cachePrefix.count))
+        let payload = dict
+        Task.detached(priority: .background) {
+            await CloudCacheSync.shared.saveMetadata(payload, for: cloudKey)
+        }
     }
 
     private static func writeNegativeCache(_ key: String) {
+        // Negative caches stay local-only — they reflect this device's
+        // failed lookup (API key state, network) and shouldn't poison
+        // other devices that might succeed.
         UserDefaults.standard.set(["bpm": 0.0], forKey: key)
     }
 

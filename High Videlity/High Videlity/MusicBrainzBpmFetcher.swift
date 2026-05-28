@@ -69,7 +69,7 @@ enum MusicBrainzBpmFetcher {
                 // ONCE and extract everything from the same JSON to
                 // avoid two HTTP round-trips per song.
                 let classifiers = await fetchAcousticBrainzHighLevel(mbid: mbid)
-                mbLog.info("HV-MB hit \(mbid, privacy: .public) → \(analysis.bpm) BPM, key \(analysis.key?.name ?? "?", privacy: .public)")
+                mbLog.info("HV-MB hit \(mbid, privacy: .public) → \(analysis.bpm) BPM, key \(analysis.key?.name ?? "?", privacy: .public), \(analysis.beatPositions.count) beats")
                 return Result(
                     bpm: analysis.bpm,
                     danceability: classifiers?.danceability,
@@ -83,7 +83,10 @@ enum MusicBrainzBpmFetcher {
                     relaxed: classifiers?.relaxed,
                     key: analysis.key,
                     canonicalTitle: title,
-                    canonicalArtist: artist
+                    canonicalArtist: artist,
+                    beatPositions: analysis.beatPositions.isEmpty
+                        ? nil
+                        : analysis.beatPositions
                 )
             }
         }
@@ -110,7 +113,8 @@ enum MusicBrainzBpmFetcher {
         guard let url = components?.url else { return nil }
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        // MusicBrainz responds in <1s typically; 12s is generous.
+        request.timeoutInterval = 12
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
@@ -154,13 +158,23 @@ enum MusicBrainzBpmFetcher {
     private struct LowLevelAnalysis {
         let bpm: Float
         let key: Key?
+        /// Full-song beat timestamps in seconds (from `rhythm.beats_position`).
+        /// Empty when AB returned only `bpm` and no beat array — see the
+        /// comment in `fetchAcousticBrainzLowLevel`.
+        let beatPositions: [Double]
     }
 
     private static func fetchAcousticBrainzLowLevel(mbid: String) async -> LowLevelAnalysis? {
         guard let url = URL(string: "https://acousticbrainz.org/api/v1/\(mbid)/low-level")
         else { return nil }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        // AB is in maintenance mode since 2022 — its servers are slow
+        // and inconsistent. Empirically: successful 200 responses take
+        // 5-10s; many requests hang past 30s. 25s timeout strikes a
+        // balance between "give it a chance to respond" and "don't
+        // wait forever per MBID" (the lookup loop tries up to N MBIDs
+        // sequentially so total wait could be N × timeout).
+        request.timeoutInterval = 25
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         do {
@@ -190,7 +204,31 @@ enum MusicBrainzBpmFetcher {
                 // sharp/flat normalization behavior.
                 return TunebatBpmFetcher.parseKey("\(keyName)\(modeSuffix)")
             }()
-            return LowLevelAnalysis(bpm: bpm, key: key)
+
+            // Beat positions: `rhythm.beats_position` is an array of
+            // floats (seconds from song start). Drives Tier 2 frame
+            // synthesis. ~70-80% of AB entries include this; the rest
+            // returned only `bpm`. Filter for sane values (positive,
+            // monotonically-increasing within reason — AB has been
+            // observed to occasionally include duplicate or negative
+            // values from the underlying Essentia algorithm).
+            let beatPositions: [Double] = {
+                guard let raw = rhythm?["beats_position"] as? [NSNumber],
+                      !raw.isEmpty
+                else { return [] }
+                var clean: [Double] = []
+                clean.reserveCapacity(raw.count)
+                var lastT: Double = -1
+                for n in raw {
+                    let t = n.doubleValue
+                    if t > lastT, t.isFinite, t < 7200 {  // < 2 hours
+                        clean.append(t)
+                        lastT = t
+                    }
+                }
+                return clean
+            }()
+            return LowLevelAnalysis(bpm: bpm, key: key, beatPositions: beatPositions)
         } catch {
             mbLog.notice("HV-MB AB low-level err \(error.localizedDescription, privacy: .public)")
             return nil
@@ -238,7 +276,8 @@ enum MusicBrainzBpmFetcher {
         guard let url = URL(string: "https://acousticbrainz.org/api/v1/\(mbid)/high-level")
         else { return nil }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        // Same maintenance-mode concession as low-level. 25s ceiling.
+        request.timeoutInterval = 25
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         do {

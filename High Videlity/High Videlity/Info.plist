@@ -11,6 +11,15 @@
 	     Process Taps entirely. -->
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>High Videlity captures audio from whatever app you're playing music in (Apple Music, Spotify, browser, etc.) so the visualizer can react to it frame-accurately, with no third-party loopback driver required.</string>
+	<!-- iOS: required to read MPMediaItem metadata (title, artist, persistent
+	     ID, duration) from MPMusicPlayerController.systemMusicPlayer. Without
+	     this key, the OS terminates the app on first read of nowPlayingItem.
+	     SystemMusicNowPlaying.swift drives the visualizer's clock off the
+	     Music-app playhead — that's the iOS-correct alternative to mic capture
+	     (mic on iOS attenuates both directions of the audio path; see
+	     ios-audio-session.md). -->
+	<key>NSAppleMusicUsageDescription</key>
+	<string>High Videlity reads what's currently playing in the Music app so the visualizer can react to your song in sync — no microphone capture needed.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationPreferredDefaultSceneSessionRole</key>

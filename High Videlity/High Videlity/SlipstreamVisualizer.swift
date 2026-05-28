@@ -120,12 +120,73 @@ struct SlipstreamRootComponent: Component {
     /// 5/sec gives ~0.14s half-life: quick enough to feel like a
     /// percussion-driven shimmer, slow enough to be visible.
     var onsetPulse: Float = 0
+    /// Beat-kick envelope. Bumped on every `FeatureFrame.beat.beatTrigger`,
+    /// decayed at 4 Hz. Adds a transient acceleration to effectiveSpeed
+    /// so the corridor visibly LURCHES forward on each beat. Scaled by
+    /// aggressivenessOverride — aggressive tracks have punchier kicks.
+    /// Distinct from `onsetPulse` (which is a visual scale-pop, not a
+    /// motion change).
+    var beatKickEnergy: Float = 0
+    /// Index into `frames` we've already scanned for beat triggers.
+    /// Avoids re-firing on already-seen frames every render tick.
+    var lastScannedBeatIndex: Int = -1
+    /// Smoothed vocals.loudness from stems. Drives the vocal-source
+    /// glow's scale + brightness at the corridor horizon. EMA lerped
+    /// at vocalGlowSmoothRate Hz so the glow swells with phrasing
+    /// rather than reacting per-consonant. Stays at 0 when no vocals
+    /// stem available (instrumental songs or pre-stem-load).
+    var smoothedVocals: Float = 0
+    /// Vocal attack envelope. Bumped to 1.0 on every vocals.onset
+    /// (consonant attacks, phrase entries); decays at vocalAttackDecay
+    /// Hz. Drives a brief scale POP + brightness flash on the orb so
+    /// the start of each sung phrase is articulated discretely.
+    var vocalAttackEnergy: Float = 0
+    /// Last vocals.onset index scanned. Prevents re-firing on already-
+    /// seen frames (render runs faster than playback).
+    var lastScannedVocalIndex: Int = -1
+    /// Smoothed pitch-derived Y offset for the orb. Derived from
+    /// argmax(vocals.chromagram) → normalized 0..1 → mapped to ±vocalPitchYRange/2.
+    /// EMA at vocalPitchSmoothRate so the orb moves with melodic phrasing
+    /// (legato), not per-frame chromagram noise.
+    var smoothedVocalPitchY: Float = 0
+    /// Smoothed pitch-driven hue for the vocal-source glow, in
+    /// [0, 1] hue space. Updated each tick from the chromagram
+    /// argmax via circular lerp at vocalGlowPitchHueSmoothRate Hz.
+    /// Singer's melodic line becomes the orb's color: high pitches
+    /// → warm, low pitches → cool (or however the chromatic-to-hue
+    /// mapping shakes out). NaN sentinel = uninitialized; first
+    /// update snaps directly to target.
+    var smoothedVocalPitchHue: Float = .nan
+    /// Last-applied HDR boost on the orb's UnlitMaterial. The
+    /// per-tick orb update skips the material rebuild when the next
+    /// computed HDR would differ by less than `orbMaterialDelta` —
+    /// avoids GPU material upload churn at 60Hz when the value isn't
+    /// changing meaningfully. NaN sentinel forces first-update.
+    /// Scale on the orb still updates every frame (transform-only,
+    /// cheap) so visual continuity stays smooth.
+    var lastAppliedOrbHDR: CGFloat = .nan
+    /// Last-applied hue on the orb's material. Material rebuild
+    /// triggers when either HDR delta OR hue delta exceeds threshold.
+    var lastAppliedOrbHue: Float = .nan
+    /// Same throttle pattern for the fog material's brightness term.
+    /// Hue smoothing already runs in continuous space; only material
+    /// rebuild needs gating.
+    var lastAppliedFogBrightness: CGFloat = .nan
+    var lastAppliedFogHue: Float = .nan
 }
 
 /// Tag for the fog backdrop entity so `animate` can find and update it
 /// each tick. Identical pattern to Crystal's BeamRole / Architecture's
 /// ArchRingComponent for tagged-entity lookups.
 struct SlipstreamFogComponent: Component {}
+
+/// Tag for the vocal-source glow at the corridor horizon. The vocalist
+/// is rendered conceptually as a point of light at the vanishing point —
+/// gates appear to spawn FROM this source and flow toward the viewer.
+/// Glow brightness + scale track `vocals.loudness` (from stems) when
+/// available; falls back to a small steady baseline otherwise. Always
+/// present so the corridor has a clear visual horizon.
+struct SlipstreamVocalGlowComponent: Component {}
 
 enum SlipstreamVisualizer {
 
@@ -215,6 +276,111 @@ enum SlipstreamVisualizer {
     /// elements rather than competing with the backdrop.
     static let fogAlpha: CGFloat = 0.55
 
+    // MARK: - Vocal-source glow constants
+
+    /// Z position of the vocal-source glow, in cluster-local space.
+    /// Placed BEYOND the gate spawn frontier (-12) so gates appear to
+    /// spawn FROM the glow and travel toward the viewer. Visible as a
+    /// distant point of light at the vanishing point of the corridor.
+    static let vocalGlowZ: Float = -18.0
+    /// Edge length of the billboarded glow quad. Small base size; the
+    /// per-tick scale multiplier in animate grows it with vocals.
+    static let vocalGlowBaseSize: Float = 1.4
+    /// Scale multiplier at peak smoothed vocals.loudness. Glow grows
+    /// from 1.0× base (silent / no vocals) to this on a wailing chorus.
+    static let vocalGlowMaxScale: Float = 3.0
+    /// HDR brightness floor — small steady glow always visible so the
+    /// corridor has a clear horizon anchor.
+    static let vocalGlowBaseHDR: CGFloat = 1.2
+    /// HDR brightness at peak vocals. Adds to baseHDR — peak glow
+    /// is bright enough to noticeably warm the deep end of the corridor.
+    static let vocalGlowPeakHDR: CGFloat = 4.0
+    /// Smoothing rate for vocals.loudness (Hz). Originally 2.5 Hz
+    /// (400ms time constant) but that introduced visible lag —
+    /// orb growth trailed audible vocals by ~third of a second.
+    /// Bumped to 6 Hz (170ms) which is fast enough to feel responsive
+    /// without strobing on consonant transients.
+    static let vocalGlowSmoothRate: Float = 6.0
+    /// Fallback hue for the glow when no vocal pitch is detected
+    /// (vocals silent / instrumental section / pre-stem-load). When
+    /// vocals are present, the chromagram-argmax pitch drives the
+    /// hue instead (see vocalGlowPitchHueSmoothRate).
+    static let vocalGlowHue: CGFloat = 0.10  // gold-amber
+    /// Saturation for the orb tint. Modest so the orb still reads as
+    /// "light source" rather than "neon pucker" even with strong
+    /// pitch-driven hue.
+    static let vocalGlowSaturation: CGFloat = 0.55
+    /// Smoothing rate for the pitch-driven hue (Hz). 3 Hz tracks
+    /// melodic phrasing without strobing on consonants / chromagram
+    /// frame-to-frame jitter. Same rate as fog hue smoothing.
+    static let vocalGlowPitchHueSmoothRate: Float = 3.0
+    /// Threshold for triggering material rebuild on hue change (in
+    /// normalized hue [0, 1] units, accounting for wrap-around).
+    static let orbHueDelta: Float = 0.015
+
+    /// Vocal-attack envelope decay (Hz). Each vocals.onset bumps the
+    /// envelope to 1.0; this controls how quickly it fades. 8 Hz =
+    /// ~125ms half-life, matches the percussive "tt" / "pp" feel of
+    /// consonants and phrase entries. Faster than the loudness smoothing
+    /// so attacks read as discrete events, not blurred into the sustain.
+    static let vocalAttackDecay: Float = 8.0
+    /// Scale boost on peak attack (added to baseline scale). 0.5 means
+    /// orb pops to 1.5× current size on a fresh attack.
+    static let vocalAttackScaleBoost: Float = 0.5
+    /// HDR brightness boost added on peak attack. Stacks on top of the
+    /// sustain HDR — phrase entry "flashes" the orb.
+    static let vocalAttackHDRBoost: CGFloat = 2.0
+    /// Range of Y motion driven by vocal pitch. Orb bobs ±vocalPitchYRange/2
+    /// around the centerline. 1.6m total = a clearly visible melodic
+    /// gesture without feeling cartoonish.
+    static let vocalPitchYRange: Float = 1.6
+    /// Smoothing rate for pitch-driven Y motion (Hz). Originally 3 Hz
+    /// but melodic motion lagged the audible pitch by ~330ms.
+    /// Bumped to 7 Hz (~145ms time constant) — still smooth enough
+    /// that single-frame chromagram noise on consonant transients
+    /// doesn't strobe, but the orb tracks vocal phrasing tightly.
+    static let vocalPitchSmoothRate: Float = 7.0
+    /// Idle "breath" rate when not singing (Hz). 0.4 Hz = a slow,
+    /// human-like resting bob.
+    static let vocalBreathRate: Float = 0.4
+    /// Breath bob amplitude (meters). Tiny — implies the singer is
+    /// "still there" without being a distinct visual gesture.
+    static let vocalBreathAmplitude: Float = 0.10
+    /// Loudness threshold above which the breath idle is suppressed
+    /// (the orb is "singing" so it shouldn't also "breathe").
+    static let vocalBreathSuppressThreshold: Float = 0.08
+
+    /// Additional frame-count compensation applied on top of
+    /// `appModel.stemFrameOffset` when indexing stem arrays. Pulls
+    /// stem readouts FORWARD in song time to compensate for cumulative
+    /// pipeline latency:
+    ///   • Streaming analyzer's 8192-sample window (~170ms at 48kHz)
+    ///   • Music.app's `player position` reporting lag (varies)
+    ///   • Per-tick smoothing EMAs (165ms phase shift at 6 Hz)
+    /// Empirically tuned.
+    ///
+    /// **Zeroed 2026-05-26 with the v3 sidecar refactor** — the old
+    /// non-zero value (6 frames = 200ms) was compensating for the v2
+    /// chunked-librosa padding drift that's now structurally fixed
+    /// (concat-then-feature emits stems aligned to within ±0.03s of
+    /// the mix timeline). Any residual lag now should be driven by
+    /// live-pipeline latency only (irrelevant for local-file playback,
+    /// already-corrected for streaming via stemFrameOffset). Tune up
+    /// only if real-world testing exposes a new lag source.
+    static let stemSyncCompensationFrames: Int = 0
+
+    /// Threshold for skipping the per-tick orb material rebuild.
+    /// HDR deltas smaller than this aren't visually perceptible but
+    /// still trigger a GPU material upload — gating saves ~60 uploads
+    /// per second on typical content where smoothedVocals only moves
+    /// in small increments. Tune down if visible step changes appear.
+    static let orbMaterialDelta: CGFloat = 0.08
+    /// Same threshold for the fog material's brightness term.
+    static let fogBrightnessDelta: CGFloat = 0.015
+    /// Same for fog hue (in normalized [0, 1] units, accounting for
+    /// wrap-around).
+    static let fogHueDelta: Float = 0.015
+
     // MARK: - Cached resources
 
     /// Shared glow texture, built once. The same alpha-gradient texture
@@ -270,6 +436,36 @@ enum SlipstreamVisualizer {
         return entity
     }
 
+    /// Build the vocal-source glow entity. A billboarded glow quad
+    /// using the same shared radial-gradient texture gates use, sized
+    /// at vocalGlowBaseSize and positioned at vocalGlowZ (deep into
+    /// the corridor, beyond the gate spawn frontier). animate() reads
+    /// the per-tick smoothedVocals and updates this entity's scale +
+    /// material HDR boost so the glow swells when the singer is
+    /// present. Faces +Z (toward the viewer) — no per-tick billboard
+    /// reorientation needed since the camera doesn't move.
+    private static func makeVocalGlow() -> ModelEntity {
+        let mesh = makeQuadMesh(size: vocalGlowBaseSize)
+        let glow = sharedGlowTexture()
+        var material = UnlitMaterial()
+        let tint = PlatformColor.hdrColor(
+            hue: vocalGlowHue,
+            saturation: vocalGlowSaturation,
+            brightness: 1.0,
+            hdrBoost: vocalGlowBaseHDR
+        )
+        material.color = .init(tint: tint, texture: .init(glow))
+        // Additive-ish blending: alpha cuts the quad to circular shape
+        // via the radial-gradient texture's alpha falloff. writesDepth
+        // off so gates render in front when they pass over the glow.
+        material.blending = .transparent(opacity: .init(floatLiteral: 1.0))
+        material.writesDepth = false
+        let entity = ModelEntity(mesh: mesh, materials: [material])
+        entity.position = [0, 0, vocalGlowZ]
+        entity.components.set(SlipstreamVocalGlowComponent())
+        return entity
+    }
+
     // MARK: - Build (preview path)
 
     /// Pre-build a corridor of gates from a fully-analyzed frame list.
@@ -295,6 +491,8 @@ enum SlipstreamVisualizer {
         // moves with the cluster's host transform (root.position) on
         // both visionOS and windowed paths.
         root.addChild(makeFogSphere())
+        // Vocal-source glow at the deep end of the corridor.
+        root.addChild(makeVocalGlow())
 
         let glow = sharedGlowTexture()
 
@@ -341,6 +539,7 @@ enum SlipstreamVisualizer {
         // Same fog backdrop as the preview path — animate() drives it
         // from `frames[playbackIndex]` each tick.
         root.addChild(makeFogSphere())
+        root.addChild(makeVocalGlow())
         return root
     }
 
@@ -357,8 +556,34 @@ enum SlipstreamVisualizer {
     /// the next tick only walks genuinely-new frames. Mirrors
     /// `CrystalVisualizerV2.scanForNewOnsets`.
     @MainActor
-    static func scanForNewOnsets(_ root: Entity, frames: [FeatureFrame], appResetCounter: Int) {
+    static func scanForNewOnsets(
+        _ root: Entity,
+        frames: [FeatureFrame],
+        appResetCounter: Int,
+        stemFeatures: StemSeparationResult? = nil,
+        stemFrameOffset: Int = 0,
+        playbackUpperBoundFrame: Int? = nil
+    ) {
+        // `playbackUpperBoundFrame` caps the spawn-loop's upper bound
+        // for the LOCAL-FILE playback case. Without it, `frames.count`
+        // is used (correct for live-streaming where frames grows over
+        // time, wrong for local files where frames is pre-populated
+        // with the full song's timeline — the first tick would spawn
+        // ALL gates at once). When set, we walk only up to
+        // `min(frames.count, playbackUpperBoundFrame)`. The caller
+        // (VisualizerView) typically adds a small lookahead window
+        // (~2 sec) so gates have time to flow from the spawn frontier
+        // forward to the camera before the actual audio onset.
         guard var state = root.components[SlipstreamRootComponent.self] else { return }
+
+        // Prefer drum-isolated onsets when stems are available — full-mix
+        // `frame.onset` fires on any energy spike (guitar strums, sustained
+        // loud passages) which produces a wall of gates with no rhythmic
+        // grid. Drum-isolated onsets fire only on actual percussive events.
+        // Same pattern dodec uses for its disco-ball flash trigger.
+        // Falls back to frame.onset when stems aren't loaded yet (first
+        // 30-60s of a never-heard song).
+        let drumsOnset: [Bool]? = stemFeatures?.stems["drums"]?.onset
 
         if state.lastSeenResetCounter != appResetCounter {
             // Only wipe gates — keep the fog sphere so the backdrop
@@ -374,7 +599,12 @@ enum SlipstreamVisualizer {
             state.lastSeenResetCounter = appResetCounter
         }
 
-        let upper = frames.count
+        let upper: Int
+        if let bound = playbackUpperBoundFrame {
+            upper = min(frames.count, max(0, bound))
+        } else {
+            upper = frames.count
+        }
         guard upper > state.lastSeenFrameIndex else {
             root.components.set(state)
             return
@@ -383,7 +613,21 @@ enum SlipstreamVisualizer {
         let glow = sharedGlowTexture()
         var spawnedThisTick = 0
         for k in state.lastSeenFrameIndex..<upper {
-            if frames[k].onset {
+            // Drum-isolated onset preferred; fallback to full-mix when
+            // stems aren't available or this frame is out of stem range.
+            // STEM TIME ALIGNMENT: stem arrays are indexed by SONG TIME
+            // (sidecar processed the full song file), but `k` is a LIVE
+            // FRAME INDEX (frames captured since system audio turned on).
+            // Add stemFrameOffset to translate. See appModel.stemFrameOffset
+            // docs for the math.
+            let stemIdx = k + stemFrameOffset + stemSyncCompensationFrames
+            let triggered: Bool
+            if let drumsOnset, stemIdx >= 0, stemIdx < drumsOnset.count {
+                triggered = drumsOnset[stemIdx]
+            } else {
+                triggered = frames[k].onset
+            }
+            if triggered {
                 // Live spawn — record current corridor odometer so this
                 // gate's Z starts at -spawnDistance regardless of how
                 // far the corridor has already flowed.
@@ -552,7 +796,14 @@ enum SlipstreamVisualizer {
         clock: Double,
         frames: [FeatureFrame],
         deltaTime: Double,
-        appResetCounter: Int = -1
+        appResetCounter: Int = -1,
+        bpmOverride: Float? = nil,
+        danceabilityOverride: Float? = nil,
+        aggressivenessOverride: Float? = nil,
+        happinessOverride: Float? = nil,
+        timbreBrightnessOverride: Float? = nil,
+        stemFeatures: StemSeparationResult? = nil,
+        stemFrameOffset: Int = 0
     ) {
         guard var state = root.components[SlipstreamRootComponent.self] else { return }
 
@@ -586,6 +837,23 @@ enum SlipstreamVisualizer {
             state.corridorOdometer = 0
             state.smoothedSpeedActivity = 0
             state.onsetPulse = 0
+            // Reset beat-kick state so a lingering kick from the prior
+            // song's last beat doesn't lurch the (newly reset) corridor.
+            state.beatKickEnergy = 0
+            state.lastScannedBeatIndex = -1
+            // Reset throttle anchors so new song's first frame
+            // unconditionally rebuilds materials.
+            state.lastAppliedOrbHDR = .nan
+            state.lastAppliedOrbHue = .nan
+            state.smoothedVocalPitchHue = .nan
+            state.lastAppliedFogBrightness = .nan
+            state.lastAppliedFogHue = .nan
+            // Reset vocal-source glow smoothing so it doesn't carry the
+            // previous song's vocal energy into the new song's silence.
+            state.smoothedVocals = 0
+            state.vocalAttackEnergy = 0
+            state.lastScannedVocalIndex = -1
+            state.smoothedVocalPitchY = 0
             // Force first-tick reinit on next call so the post-reset
             // odometer baseline aligns with the new clock.
             state.firstAnimateTick = true
@@ -606,6 +874,41 @@ enum SlipstreamVisualizer {
             state.firstAnimateTick = false
         }
 
+        // Per-song character overrides resolved once per tick.
+        // Tempo: octave-folded BPM scales the base forward speed. 100 BPM
+        // = neutral 1.0×; clamp to [0.6, 1.6] so slow songs don't stall
+        // and fast songs don't blur. Same pattern dodec uses.
+        let tempoMul: Float = {
+            guard let raw = bpmOverride else { return 1.0 }
+            let folded = BeatHelpers.octaveFoldBpm(raw)
+            return max(0.6, min(1.6, folded / 100.0))
+        }()
+        // Danceability scales the onsetPulse target — high-dance tracks
+        // make the corridor breathe harder on each onset.
+        let danceMul: Float = {
+            guard let d = danceabilityOverride else { return 1.0 }
+            return 0.6 + (d / 100.0) * 0.8  // 0.6–1.4
+        }()
+        // Aggressiveness scales the beat-kick amplitude — aggressive
+        // tracks have punchier on-beat acceleration.
+        let aggroMul: Float = {
+            guard let a = aggressivenessOverride else { return 1.0 }
+            return 0.6 + (a / 100.0) * 1.2  // 0.6–1.8
+        }()
+        // Happiness biases fog hue toward warm (gold ~0.10) for happy
+        // or cool (indigo ~0.72) for sad. Applied as a constant offset
+        // pull on fogHueSmoothed below.
+        let happyBias = clamp01(((happinessOverride ?? 50) - 50) / 50)  // -1..+1
+        let warmHue: Float = 0.10
+        let coolHue: Float = 0.72
+        let moodTargetHue: Float = happyBias >= 0 ? warmHue : coolHue
+        let moodHuePull: Float = abs(happyBias) * 0.25  // 0–0.25 strength
+        // Timbre brightness boosts fog brightness gain.
+        let timbreMul: Float = {
+            guard let t = timbreBrightnessOverride else { return 1.0 }
+            return 0.7 + (t / 100.0) * 0.6  // 0.7–1.3
+        }()
+
         // Compute current frame's energy for the speed-reactivity loop
         // (also reused below for the fog). Reading frames[i] once.
         let currentLoudness: Float
@@ -614,6 +917,169 @@ enum SlipstreamVisualizer {
             currentLoudness = Float(frames[i].loudness)
         } else {
             currentLoudness = 0
+        }
+
+        // Beat-trigger scan: walk new frames since lastScannedBeatIndex
+        // and bump beatKickEnergy on any beat trigger. Single envelope
+        // (most-recent beat wins). Decay at 4 Hz — slower than the
+        // onsetPulse (5 Hz) so the kick lingers a touch into the next
+        // beat for a more "pumping" feel.
+        //
+        // Amplitude: when stems are available, use drums.loudness at
+        // the beat frame instead of a flat 1.0 — quiet drums (verse,
+        // breakdown) give a subtle kick; loud drums (chorus, drop)
+        // give a punchy lurch. Falls back to 1.0 when no stems. Same
+        // clamp range (0.4-1.0) dodec uses so quiet kicks still
+        // register visibly.
+        let drumsLoudness: [Float]? = stemFeatures?.stems["drums"]?.loudness
+        if !frames.isEmpty {
+            let currentIdx = max(0, min(frames.count - 1, Int((clock * 30).rounded())))
+            let startIdx = max(0, min(currentIdx, state.lastScannedBeatIndex + 1))
+            if currentIdx >= startIdx {
+                for i in startIdx...currentIdx {
+                    if frames[i].beat.beatTrigger {
+                        let kickStrength: Float
+                        // Stem-time offset: i is live-frame index, stems
+                        // are song-time indexed. See appModel.stemFrameOffset.
+                        let stemI = i + stemFrameOffset + stemSyncCompensationFrames
+                        if let drumsLoudness, stemI >= 0, stemI < drumsLoudness.count {
+                            kickStrength = min(1.0,
+                                max(0.4, drumsLoudness[stemI] * 4.0))
+                        } else {
+                            kickStrength = 1.0
+                        }
+                        state.beatKickEnergy = max(state.beatKickEnergy, kickStrength)
+                    }
+                }
+            }
+            state.lastScannedBeatIndex = currentIdx
+        }
+        let beatDecayFactor = Float(exp(-Double(4.0) * deltaTime))
+        state.beatKickEnergy *= beatDecayFactor
+
+        // Vocal-source glow update. Read vocals.loudness at the current
+        // playback frame, smooth at vocalGlowSmoothRate Hz (slow enough
+        // that the glow swells with phrasing rather than strobing on
+        // consonants), and push to the glow entity's scale + material
+        // HDR boost. When no vocals stem available (instrumental song
+        // or pre-stem-load), smoothedVocals stays at 0 and the glow
+        // sits at its baseline size + HDR.
+        let vocalsLoudness: [Float]? = stemFeatures?.stems["vocals"]?.loudness
+        let vocalsTarget: Float = {
+            guard let vocalsLoudness, !frames.isEmpty else { return 0 }
+            let i = max(0, min(frames.count - 1, Int((clock * 30).rounded())))
+            let stemI = i + stemFrameOffset + stemSyncCompensationFrames
+            guard stemI >= 0, stemI < vocalsLoudness.count else { return 0 }
+            // Clamp to [0, 1] — vocals.loudness is RMS-like and rarely
+            // exceeds 1.0 but the clamp is cheap insurance against the
+            // bass-RMS-spike issue we hit on Slipstream's first stems pass.
+            return min(1.0, max(0, vocalsLoudness[stemI] * 4.0))
+        }()
+        let vocalsLerp = Float(min(1.0, deltaTime * Double(vocalGlowSmoothRate)))
+        state.smoothedVocals += (vocalsTarget - state.smoothedVocals) * vocalsLerp
+
+        // Vocal-attack scan: walk new vocals.onset entries and bump the
+        // attack envelope on each. Single envelope, most-recent wins.
+        // Drives a brief scale POP + brightness flash on the orb so
+        // phrase entries / consonant attacks ARTICULATE as discrete
+        // events, distinct from the held smoothedVocals sustain.
+        //
+        // BLEED FILTER: demucs' vocal stem isn't perfectly clean —
+        // drum hits (especially snare) often produce small spikes in
+        // vocals.onset. Gate the onset by requiring vocals.loudness
+        // at the same stem frame to exceed `vocalOnsetLoudnessFloor`
+        // (i.e., the singer is actually present, not just a percussion
+        // crackle bleeding through). Without this filter the orb pops
+        // on every snare hit.
+        let vocalsOnset: [Bool]? = stemFeatures?.stems["vocals"]?.onset
+        let vocalOnsetLoudnessFloor: Float = 0.03
+        if let vocalsOnset, !frames.isEmpty {
+            let currentIdx = max(0, min(frames.count - 1, Int((clock * 30).rounded())))
+            let startIdx = max(0, min(currentIdx, state.lastScannedVocalIndex + 1))
+            if currentIdx >= startIdx {
+                for i in startIdx...currentIdx {
+                    let stemI = i + stemFrameOffset + stemSyncCompensationFrames
+                    guard stemI >= 0, stemI < vocalsOnset.count else { continue }
+                    if vocalsOnset[stemI] {
+                        // Bleed filter: only count if the vocal channel
+                        // actually has energy at this frame.
+                        let loudHere: Float = {
+                            guard let vl = vocalsLoudness,
+                                  stemI < vl.count else { return 0 }
+                            return vl[stemI]
+                        }()
+                        if loudHere >= vocalOnsetLoudnessFloor {
+                            state.vocalAttackEnergy = 1.0
+                        }
+                    }
+                }
+            }
+            state.lastScannedVocalIndex = currentIdx
+        }
+        let vocalAttackDecayFactor = Float(exp(-Double(vocalAttackDecay) * deltaTime))
+        state.vocalAttackEnergy *= vocalAttackDecayFactor
+
+        // Pitch-driven Y motion. Use the vocals.chromagram argmax to find
+        // the dominant vocal pitch class at the current frame, then map
+        // it linearly to a Y offset around the orb's centerline. The orb
+        // literally rises/falls with the singer's melody — a held high
+        // note keeps the orb up; descending phrases pull it down. Smooth
+        // at vocalPitchSmoothRate Hz so legato melodic motion reads as
+        // continuous gesture, not strobing per-frame.
+        let vocalsChroma: [[Float]]? = stemFeatures?.stems["vocals"]?.chromagram
+        // Compute argmax once and reuse it for BOTH pitch-Y motion
+        // and pitch-driven hue. -1 = no meaningful pitch present
+        // (silent / instrumental). Saves a redundant chromagram read.
+        let dominantPitch: Int = {
+            guard let vocalsChroma, !frames.isEmpty else { return -1 }
+            let i = max(0, min(frames.count - 1, Int((clock * 30).rounded())))
+            let stemI = i + stemFrameOffset + stemSyncCompensationFrames
+            guard stemI >= 0, stemI < vocalsChroma.count,
+                  vocalsChroma[stemI].count == 12 else { return -1 }
+            let row = vocalsChroma[stemI]
+            let sum = row.reduce(0, +)
+            guard sum > 0.001 else { return -1 }
+            var maxIdx = 0
+            var maxVal = row[0]
+            for k in 1..<12 where row[k] > maxVal {
+                maxVal = row[k]
+                maxIdx = k
+            }
+            return maxIdx
+        }()
+
+        // Pitch-Y target: pitch class 0..11 → -0.5..+0.5 → ±vocalPitchYRange/2.
+        // The 12 pitch classes wrap (B → C jumps from +0.5 to -0.5),
+        // but at melodic timescales sequential notes rarely jump a
+        // full octave, so the wrap rarely fires visibly.
+        let pitchYTarget: Float = dominantPitch >= 0
+            ? (Float(dominantPitch) / 11.0 - 0.5) * vocalPitchYRange
+            : state.smoothedVocalPitchY  // hold position when silent
+        let pitchLerp = Float(min(1.0, deltaTime * Double(vocalPitchSmoothRate)))
+        state.smoothedVocalPitchY += (pitchYTarget - state.smoothedVocalPitchY) * pitchLerp
+
+        // Pitch-driven hue: pitch class 0..11 → hue 0..1 (chromatic
+        // wheel). Circular lerp at vocalGlowPitchHueSmoothRate so the
+        // color phrases smoothly with the melodic line without
+        // strobing on consonant transients. When silent or no stems,
+        // hue drifts toward the warm-amber fallback (vocalGlowHue)
+        // so the orb still looks like a "light source" between
+        // vocal sections.
+        let pitchHueTarget: Float = dominantPitch >= 0
+            ? Float(dominantPitch) / 12.0
+            : Float(vocalGlowHue)
+        if state.smoothedVocalPitchHue.isNaN {
+            state.smoothedVocalPitchHue = pitchHueTarget
+        } else {
+            // Circular lerp — shortest-arc on the [0, 1] hue ring.
+            var diff = pitchHueTarget - state.smoothedVocalPitchHue
+            if diff > 0.5 { diff -= 1 }
+            if diff < -0.5 { diff += 1 }
+            let hueLerp = Float(min(1.0, deltaTime * Double(vocalGlowPitchHueSmoothRate)))
+            var next = state.smoothedVocalPitchHue + diff * hueLerp
+            if next < 0 { next += 1 }
+            if next >= 1 { next -= 1 }
+            state.smoothedVocalPitchHue = next
         }
 
         // Smoothed speed-activity lerps toward current loudness at 1.5 Hz.
@@ -626,9 +1092,14 @@ enum SlipstreamVisualizer {
         state.smoothedSpeedActivity +=
             (currentLoudness - state.smoothedSpeedActivity) * speedLerp
 
-        // Effective speed = base × (floor + activity × gain). At quiet
-        // (activity ~0.03): forwardSpeed × (0.7 + 0.15) = 0.85× base.
-        // At loud (activity ~0.15): forwardSpeed × (0.7 + 0.75) = 1.45×.
+        // Effective speed = base × tempo × (floor + activity × gain +
+        // beatKick × aggro). Three modulations on the base forwardSpeed:
+        //   1. tempoMul — per-song scaling so fast songs flow faster
+        //   2. smoothedSpeedActivity — current loudness drives steady-
+        //      state acceleration (existing reactivity)
+        //   3. beatKick × aggroMul — transient acceleration ON each
+        //      beat trigger. Aggressive songs pump harder.
+        //
         // speedFloor bumped 0.5 → 0.7 on 2026-05-22 to fix FPS drift —
         // at 0.5 floor, quiet passages slowed the corridor enough that
         // gates persisted ~15s each, accumulating to 30-45 simultaneously
@@ -636,8 +1107,32 @@ enum SlipstreamVisualizer {
         // closer to the original 7.5s baseline at quiet sections.
         let speedFloor: Float = 0.7
         let speedGain: Float = 5.0
-        let effectiveSpeed = forwardSpeed
-            * (speedFloor + state.smoothedSpeedActivity * speedGain)
+        let beatKickGain: Float = 0.6  // peak transient add at beatKick=1
+        let bassSpeedGain: Float = 4.0  // bass.loudness multiplier on top of base
+
+        // Bass-loudness as an ADDITIONAL forward-speed term. When stems
+        // are available, the bass channel's loudness adds groove-driven
+        // momentum on top of the full-mix smoothed activity. Bass-heavy
+        // sections (verses with riding bass, dubby choruses) make the
+        // corridor flow visibly faster even when the full-mix loudness
+        // is moderate. Falls back to 0 contribution when no stems —
+        // the existing smoothedSpeedActivity term carries baseline
+        // reactivity in that case.
+        let bassLoudness: [Float]? = stemFeatures?.stems["bass"]?.loudness
+        let bassContribution: Float = {
+            guard let bassLoudness, !frames.isEmpty else { return 0 }
+            let i = max(0, min(frames.count - 1, Int((clock * 30).rounded())))
+            let stemI = i + stemFrameOffset + stemSyncCompensationFrames
+            guard stemI >= 0, stemI < bassLoudness.count else { return 0 }
+            // Clamp to avoid runaway speeds on bass-RMS spikes
+            // (similar to the bandLoudness clamp lesson from Architecture).
+            return min(1.0, max(0, bassLoudness[stemI] * bassSpeedGain))
+        }()
+
+        let effectiveSpeed = forwardSpeed * tempoMul
+            * (speedFloor + state.smoothedSpeedActivity * speedGain
+               + state.beatKickEnergy * beatKickGain * aggroMul
+               + bassContribution)
 
         // Advance corridor odometer by the effective speed × dt.
         state.corridorOdometer += effectiveSpeed * Float(deltaTime)
@@ -649,10 +1144,13 @@ enum SlipstreamVisualizer {
         state.onsetPulse *= exp(-Float(deltaTime) * 5.0)
         // Apply pulse as a uniform scale-pop on every live gate so each
         // new onset reverberates through the entire corridor, not just
-        // spawns one gate at the front. Max boost ~×1.18 at peak pulse —
-        // visible as a brief "the corridor breathes" without disrupting
-        // gate identity.
-        let pulseScale = 1.0 + state.onsetPulse * 0.18
+        // spawns one gate at the front. Max boost ~×1.18 at peak pulse
+        // (neutral danceability) — visible as a brief "the corridor
+        // breathes." Danceability scales the boost magnitude: high-dance
+        // songs (D=100) push to ~×1.25 at peak; low-dance (D=0) settle
+        // around ×1.11. Visible difference between Skinny Puppy
+        // (industrial, modest dance) and a disco track.
+        let pulseScale = 1.0 + state.onsetPulse * 0.18 * danceMul
 
         // Walk all gates: position update via odometer + eviction in one
         // pass. Skip the fog sphere and any other future non-gate child.
@@ -684,7 +1182,33 @@ enum SlipstreamVisualizer {
         if !frames.isEmpty {
             let i = max(0, min(frames.count - 1, Int((clock * 30).rounded())))
             let f = frames[i]
-            let targetHue = Float(f.color.hue)
+            // Fog hue source: prefer bass.chromagram when stems
+            // available — the bass line carries the harmonic
+            // foundation cleanly without drum-onset noise that muddies
+            // the full-mix chromagram. Bass usually plays one note at
+            // a time, so argmax is a robust pitch detector. Falls back
+            // to full-mix `f.color.hue` (TonalColor's weighted hue
+            // estimate) when no bass stem yet (instrumental song
+            // sections without bass, or pre-stem-load).
+            let bassChroma: [[Float]]? = stemFeatures?.stems["bass"]?.chromagram
+            let targetHue: Float = {
+                guard let bassChroma else { return Float(f.color.hue) }
+                let stemI = i + stemFrameOffset + stemSyncCompensationFrames
+                guard stemI >= 0, stemI < bassChroma.count,
+                      bassChroma[stemI].count == 12 else {
+                    return Float(f.color.hue)
+                }
+                let row = bassChroma[stemI]
+                let sum = row.reduce(0, +)
+                guard sum > 0.001 else { return Float(f.color.hue) }
+                var maxIdx = 0
+                var maxVal = row[0]
+                for k in 1..<12 where row[k] > maxVal {
+                    maxVal = row[k]
+                    maxIdx = k
+                }
+                return Float(maxIdx) / 12.0
+            }()
             let targetLoudness = Float(f.loudness)
 
             if !state.fogHueInitialized {
@@ -735,21 +1259,129 @@ enum SlipstreamVisualizer {
                       var modelComp = model.components[ModelComponent.self],
                       var mat = modelComp.materials.first as? UnlitMaterial
                 else { continue }
-                let brightness = fogBaseBrightness
-                    + fogLoudnessGain * CGFloat(state.fogLoudnessSmoothed)
-                let tint = PlatformColor(
-                    hue: CGFloat(state.fogHueSmoothed),
-                    saturation: fogBaseSaturation,
-                    brightness: brightness,
-                    alpha: fogAlpha
+                // Mood hue bias: pull the smoothed chromagram-derived
+                // hue toward warm (gold) for happy / cool (indigo) for
+                // sad. moodHuePull is 0 at neutral happiness; up to
+                // 0.25 at the extremes. Keeps the chromagram's tonal
+                // motion visible while shifting the overall feel.
+                var displayedHue = state.fogHueSmoothed
+                if moodHuePull > 0 {
+                    var diff = moodTargetHue - displayedHue
+                    if diff > 0.5 { diff -= 1 }
+                    if diff < -0.5 { diff += 1 }
+                    displayedHue += diff * moodHuePull
+                    if displayedHue < 0 { displayedHue += 1 }
+                    if displayedHue >= 1 { displayedHue -= 1 }
+                }
+                // Timbre brightness scales the brightness gain — bright-
+                // timbre songs (T=100) push fog brighter (1.3×); dark-
+                // timbre songs (T=0) dim it (0.7×). Multiplies BOTH base
+                // and gain components so the whole fog brightness curve
+                // shifts.
+                let brightness = (fogBaseBrightness
+                    + fogLoudnessGain * CGFloat(state.fogLoudnessSmoothed))
+                    * CGFloat(timbreMul)
+                // Throttle material rebuild — skip the GPU upload
+                // unless brightness or hue has meaningfully changed
+                // since last applied. Saves ~60 material uploads/sec
+                // on steady-state passages.
+                let hueChanged = state.lastAppliedFogHue.isNaN
+                    || min(abs(displayedHue - state.lastAppliedFogHue),
+                           1 - abs(displayedHue - state.lastAppliedFogHue)) >= fogHueDelta
+                let brightnessChanged = state.lastAppliedFogBrightness.isNaN
+                    || abs(brightness - state.lastAppliedFogBrightness) >= fogBrightnessDelta
+                if hueChanged || brightnessChanged {
+                    let tint = PlatformColor(
+                        hue: CGFloat(displayedHue),
+                        saturation: fogBaseSaturation,
+                        brightness: brightness,
+                        alpha: fogAlpha
+                    )
+                    mat.color = .init(tint: tint)
+                    mat.blending = .transparent(opacity: .init(floatLiteral: Float(fogAlpha)))
+                    mat.writesDepth = false
+                    modelComp.materials[0] = mat
+                    model.components.set(modelComp)
+                    state.lastAppliedFogBrightness = brightness
+                    state.lastAppliedFogHue = displayedHue
+                }
+                break  // only one fog sphere
+            }
+        }
+
+        // --- Vocal-source glow ---------------------------------------
+        // Three behaviors combine here so the orb reads as a singer,
+        // not just a light bulb:
+        //   1. SUSTAIN — smoothedVocals drives steady scale + brightness
+        //      across vowel bodies and held notes.
+        //   2. ATTACK — vocalAttackEnergy adds a brief scale POP +
+        //      brightness FLASH on each phrase entry / consonant onset.
+        //      This is what makes it look like the orb is articulating
+        //      syllables.
+        //   3. PITCH MOTION — smoothedVocalPitchY shifts the orb's Y
+        //      position with the melodic line. High notes = orb rises.
+        //   4. BREATH — when not singing, slow Y bob so the orb feels
+        //      "still there, breathing" rather than dead.
+        for child in root.children
+            where child.components[SlipstreamVocalGlowComponent.self] != nil
+        {
+            guard let model = child as? ModelEntity,
+                  var modelComp = model.components[ModelComponent.self],
+                  var mat = modelComp.materials.first as? UnlitMaterial
+            else { continue }
+            let v = state.smoothedVocals
+            let a = state.vocalAttackEnergy
+            // Scale: sustain (smoothedVocals) × attack pop.
+            let sustainScale = 1.0 + v * (vocalGlowMaxScale - 1.0)
+            let attackScale = 1.0 + a * vocalAttackScaleBoost
+            let scale = sustainScale * attackScale
+            // Position Y: pitch motion + breath idle.
+            // Breath is suppressed when actively singing so the two
+            // motions don't sum into a noisy wobble.
+            let breathY: Float = v < vocalBreathSuppressThreshold
+                ? Float(sin(clock * 2 * .pi * Double(vocalBreathRate))) * vocalBreathAmplitude
+                : 0
+            let posY = state.smoothedVocalPitchY + breathY
+            child.position = [0, posY, vocalGlowZ]
+            child.scale = SIMD3<Float>(repeating: scale)
+            // HDR boost: baseline + sustain × peak + attack × flash.
+            // Material rebuild + GPU upload is THROTTLED — only when
+            // the HDR value shifts by more than `orbMaterialDelta`
+            // since the last applied state. Previously this rebuilt
+            // every animate tick (60Hz) and crushed FPS from 60 → 30
+            // (with the fog doing the same pattern, ~120 GPU material
+            // uploads per second). Scale + position above stay
+            // per-frame because transform changes are cheap.
+            let hdr = vocalGlowBaseHDR
+                + CGFloat(v) * vocalGlowPeakHDR
+                + CGFloat(a) * vocalAttackHDRBoost
+            // Pitch-driven hue: the singer's melodic line colors the
+            // orb. C → red, moving up the chromatic scale through the
+            // color wheel. Saturation low-ish (vocalGlowSaturation)
+            // so it still reads as "light source" rather than vivid
+            // neon. Throttle rebuild on EITHER HDR delta OR hue delta
+            // — both can change independently.
+            let hue = state.smoothedVocalPitchHue
+            let hdrChanged = state.lastAppliedOrbHDR.isNaN
+                || abs(hdr - state.lastAppliedOrbHDR) >= orbMaterialDelta
+            let hueChanged = state.lastAppliedOrbHue.isNaN
+                || min(abs(hue - state.lastAppliedOrbHue),
+                       1 - abs(hue - state.lastAppliedOrbHue)) >= orbHueDelta
+            if hdrChanged || hueChanged {
+                let tint = PlatformColor.hdrColor(
+                    hue: CGFloat(hue),
+                    saturation: vocalGlowSaturation,
+                    brightness: 1.0,
+                    hdrBoost: hdr
                 )
-                mat.color = .init(tint: tint)
-                mat.blending = .transparent(opacity: .init(floatLiteral: Float(fogAlpha)))
+                mat.color = .init(tint: tint, texture: .init(sharedGlowTexture()))
                 mat.writesDepth = false
                 modelComp.materials[0] = mat
                 model.components.set(modelComp)
-                break  // only one fog sphere
+                state.lastAppliedOrbHDR = hdr
+                state.lastAppliedOrbHue = hue
             }
+            break  // only one vocal glow
         }
 
         root.components.set(state)
@@ -825,5 +1457,12 @@ enum SlipstreamVisualizer {
             withName: "slipstream-glow",
             options: .init(semantic: .color)
         )
+    }
+
+    /// Clamp a value to the [-1, 1] range. Used by mood-bias math
+    /// in the per-song character overrides (happiness normalized
+    /// around its neutral 50 → ±1).
+    private static func clamp01(_ x: Float) -> Float {
+        max(-1, min(1, x))
     }
 }

@@ -32,6 +32,7 @@ import RealityKit
 import AudioAnalysis
 import CoreGraphics
 import simd
+import RealityKitContent
 #if canImport(UIKit)
 import UIKit
 #elseif canImport(AppKit)
@@ -59,10 +60,6 @@ struct DodecahedronRootComponent: Component {
     var smoothedLoudness: Float = 0
     /// Smoothed timbre — drives a subtle accent we'll add later.
     var smoothedTimbre: Float = 0
-    /// Shockwave envelope (0…1). Bumped to 1.0 by sub-band onsets
-    /// (kicks); decays exponentially. Drives the central shockwave
-    /// entity's scale + opacity.
-    var shockwaveEnergy: Float = 0
     /// Sparkle envelope (0…1). Bumped to 1.0 by brilliance-band
     /// onsets (hats / shakers / cymbals); decays exponentially.
     /// Drives the orbiting sparkle pool's brightness.
@@ -70,9 +67,49 @@ struct DodecahedronRootComponent: Component {
     /// Smoothed brilliance-band loudness — provides a continuous
     /// "shimmer baseline" on the sparkle pool even between hat hits.
     var smoothedBrilliance: Float = 0
-    /// Smoothed sub-band loudness — colors the shockwave so its tint
-    /// follows whatever's in the sub band's pitch-class energy.
-    var smoothedSub: Float = 0
+    /// Bass-pulse envelope — drives the whole-dodec "punch" on
+    /// each bass onset. Set to a loudness-scaled amplitude on every
+    /// bass-stem onset (or lowMid-band onset fallback), then decays
+    /// exponentially with ~200ms half-life so the structure visibly
+    /// snaps + relaxes with each bass hit. Replaces the earlier
+    /// continuous-breath approach which read as sub-perceptible at
+    /// any setting because raw stem RMS rarely exceeds ~0.3.
+    var bassPulse: Float = 0
+    /// Running peak of raw bass loudness for per-onset amplitude
+    /// normalization. Raw stem RMS peaks at ~0.2-0.4 (varies by
+    /// song), so we divide loudness-at-onset by this to get a 0-1
+    /// punch amplitude that reliably fills the visible range no
+    /// matter how the song was mastered. Jumps up instantly, decays
+    /// with ~30s half-life. Floor at 0.05 prevents divide-by-tiny
+    /// during silent intros.
+    var bassLoudnessPeak: Float = 0.05
+    /// EMA-smoothed bass chromagram (12 pitch-class energies). Drives
+    /// the interior glow color so it tracks the dominant bass note.
+    /// Lerped at ~12 Hz so the hue settles quickly after a new bass
+    /// note enters without strobing on transients.
+    var smoothedBassChroma: [Float] = Array(repeating: 0, count: 12)
+    /// Smoothed "other" stem loudness — drives the per-tick final
+    /// multiplier on face-beam opacities so beams dim during quiet
+    /// passages and slam during loud ones. Source: stems["other"]?
+    /// .loudness when available, falls back to `f.loudness` (full
+    /// mix). Normalized via `otherLoudnessPeak` so the curve fills
+    /// [0, 1] regardless of song mastering.
+    var smoothedOtherLoudness: Float = 0
+    /// Running peak of raw "other"-stem loudness for per-song
+    /// normalization. Same pattern as `bassLoudnessPeak` — instant
+    /// rise + 30s half-life decay + 0.05 floor.
+    var otherLoudnessPeak: Float = 0.05
+    /// Smoothed vocals loudness — drives the vocal-aura ring's
+    /// opacity + emissive intensity. Source: stems["vocals"]?.loudness;
+    /// when no vocals stem is loaded the aura stays dark (the design
+    /// intent: aura is a stems-only feature, no band-fallback because
+    /// no full-mix band cleanly isolates vocals).
+    var smoothedVocalsLoudness: Float = 0
+    /// Smoothed vocals chromagram — used to pick the dominant vocal
+    /// pitch and tint the aura ring through the circle-of-fifths
+    /// palette. Each entry EMA-lerped at the same rate as the other
+    /// chromagrams so the color settles smoothly.
+    var smoothedVocalsChroma: [Float] = Array(repeating: 0, count: 12)
     /// Per-face beam opacities — separate smoothing track from the
     /// chromagram smoothing above. Lerped each tick toward an
     /// unsmoothed target opacity (derived from the current frame's
@@ -114,6 +151,18 @@ struct DodecahedronRootComponent: Component {
     /// `appModel.liveModeResetCounter` at last scan. Bump → track change
     /// → reset smoothing + rotation.
     var lastSeenResetCounter: Int = 0
+    /// Disco-ball beat-pulse envelope (0…1). Bumped to 1.0 on each
+    /// `frame.bandOnset[sub]` (kick onset); decays at
+    /// `discoBallBeatPulseDecay`. Originally driven by `beat.beatTrigger`
+    /// (BeatTracker metronome), but that felt "off" on songs with
+    /// syncopation or half-time choruses where the tracker predicts
+    /// beats the kick doesn't actually hit. Sub-band onsets fire on
+    /// the actual kick attack, locking the flash to the percussion.
+    var beatPulseEnergy: Float = 0
+    /// Accumulated rotation angle for the disco-ball group (separate
+    /// track from the dodec's `rotationAngle` so the ball drifts at its
+    /// own slow rate independent of the dodec's tumble).
+    var discoBallAngle: Float = 0
 }
 
 /// Per-face tag. `pitchClassIndex` identifies which of the 12 pitch
@@ -144,17 +193,89 @@ struct DodecahedronFaceBeamComponent: Component {
     let kind: DodecahedronBeamKind
 }
 
-/// Tag for the singular central shockwave entity. Lives under the
-/// rotator subroot so it tumbles with the dodec. Driven by
-/// `shockwaveEnergy` (bumped on sub-band onsets).
-struct DodecahedronShockwaveComponent: Component {}
-
 /// Tag for one sparkle in the orbiting brilliance-band particle pool.
 /// `phase` is the particle's individual twinkle offset (radians); each
 /// tick its opacity is `sparkleEnergy × (0.5 + 0.5 sin(t + phase))`.
 struct DodecahedronSparkleComponent: Component {
     let phase: Float
 }
+
+/// Tag for the surrounding disco-ball entity (sibling of the rotator
+/// under root). Slowly rotates around Y independent of the dodec's
+/// own tumble. The disco ball is implemented as a single inverted
+/// sphere with an RCP `ShaderGraphMaterial` — the shader handles the
+/// per-cell checkerboard and pulse-driven emissive internally, so we
+/// don't need per-tile entities anymore.
+struct DodecahedronDiscoBallComponent: Component {}
+
+/// Tag for the vocal-aura CONTAINER entity (child of `root`,
+/// sibling of the rotator). Holds the per-particle sparkles that
+/// form the volumetric "magic cloud" around the dodec. Container's
+/// brightness scales with vocals.loudness; individual sparkles
+/// twinkle at independent phases for the busy-shimmer effect.
+struct DodecahedronVocalAuraComponent: Component {}
+
+/// Tag for an individual vocal-cloud sparkle. Each one carries its
+/// own twinkle phase + frequency offset so the cloud doesn't pulse
+/// in lockstep. Animate-tick reads these to drive per-particle
+/// opacity through a sin curve, multiplied by the global vocals
+/// loudness envelope.
+struct DodecahedronVocalSparkleComponent: Component {
+    /// Random base phase in [0, 2π). Stops every sparkle being at
+    /// the same point of its twinkle cycle on first frame.
+    var phase: Float = 0
+    /// Per-particle twinkle frequency in Hz. Range ~1-3 Hz so the
+    /// cloud reads as alive without flicker.
+    var frequency: Float = 1.5
+    /// Base radial distance from the dodec center. Spread across the
+    /// shell radius range so the cloud has depth.
+    var radius: Float = 0.55
+}
+
+/// Tag for the sparkle CONTAINER entity (sibling of the rotator under
+/// root). Holds the brilliance-band sparkle pool, positioned + scaled
+/// to match the disco ball's coordinate system (same position offset,
+/// same Y-flip) so sparkle local positions live in the same frame the
+/// shader's cell UV math uses. Per-tick its Y rotation is synced to
+/// the disco ball's `discoBallAngle` so sparkles ride along with the
+/// lit-cell pattern they're aligned to.
+struct DodecahedronSparkleContainerComponent: Component {}
+
+/// Marker tag for the edge-skeleton container. Holds 30 thin additive
+/// boxes laid along the dodec's 30 edges — they sit at the dodec's
+/// nominal surface, so when face panels push outward on a bass pulse
+/// the underlying glowing edge becomes visible "through the crack."
+/// Per-tick the container's edges all get the same tint (driven by
+/// dominant bass-stem pitch) and brightness (driven by bassPulse).
+struct DodecahedronEdgeSkeletonComponent: Component {}
+
+/// Per-layer tag for one of the three additive layers in the edge
+/// stack — `0` = thin bright core, `1` = medium halo, `2` = wide
+/// outer halo. The per-tick update reads this to pick the right
+/// brightness + hdrBoost ramp for the layer's bassPulse response.
+struct DodecahedronEdgeLayerComponent: Component {
+    let layerIndex: Int
+}
+
+/// Layer parameters for the edge halo stack. Index 0 is the bright
+/// thin core that visually IS the crack; indices 1 and 2 are wider
+/// dimmer halos that bloom outward and read as "light spilling
+/// past the seam." All three are additive, `writesDepth=false`.
+struct DodecahedronEdgeLayer {
+    let thickness: Float
+    let baseBrightness: Float
+    let peakBrightness: Float
+    let baseHdrBoost: Float
+    let peakHdrBoost: Float
+}
+let dodecahedronEdgeLayers: [DodecahedronEdgeLayer] = [
+    .init(thickness: 0.010, baseBrightness: 0.05, peakBrightness: 1.00,
+          baseHdrBoost: 0.50, peakHdrBoost: 6.00),
+    .init(thickness: 0.030, baseBrightness: 0.03, peakBrightness: 0.70,
+          baseHdrBoost: 0.30, peakHdrBoost: 4.00),
+    .init(thickness: 0.075, baseBrightness: 0.01, peakBrightness: 0.40,
+          baseHdrBoost: 0.20, peakHdrBoost: 2.50),
+]
 
 enum DodecahedronVisualizer {
 
@@ -180,6 +301,24 @@ enum DodecahedronVisualizer {
     /// Inradius — distance from center to face center. For a regular
     /// dodecahedron the ratio is ~0.795 × circumradius.
     static let dodecahedronInradius: Float = 0.40 * 0.795
+
+    /// Vocal-cloud sparkle count. 80 reads as "dense magic cloud"
+    /// without hammering the GPU on per-tick material updates
+    /// (existing brilliance pool runs ~60 sparkles fine on M1 Pro).
+    static let vocalCloudSparkleCount: Int = 80
+    /// Inner / outer radius bounds of the vocal-cloud spherical
+    /// shell. Particles distributed across this range for visual
+    /// depth — closer ones feel intimate, farther ones halo the
+    /// silhouette. Inner radius set just outside the dodec
+    /// circumradius (0.40) so sparkles never intersect face geometry,
+    /// even at peak bass-breath scale (~+18%).
+    static let vocalCloudInnerRadius: Float = 0.50
+    static let vocalCloudOuterRadius: Float = 0.72
+    /// Per-particle sphere radius. Small enough to read as a
+    /// dust-mote sparkle, not a glowing orb. Halved from 0.010 →
+    /// 0.005 after Jesse's reaction-pass — original size read as
+    /// chunky dots rather than fine sparkles.
+    static let vocalCloudSparkleSize: Float = 0.005
     /// Intensity threshold below which a face's beam stays invisible.
     /// Raised 0.55 → 0.75 so only genuinely dominant pitch bins fire
     /// beams. With max-normalized chromagram in [0, 1], a 0.75
@@ -276,40 +415,116 @@ enum DodecahedronVisualizer {
     /// the sparkle baseline and shockwave color.
     static let bandLoudnessLerpRate: Float = 4.0
 
-    /// Sub-band onset bumps the shockwave envelope to 1.0; it decays
-    /// at this rate (per second). 2.5 Hz ≈ 280 ms half-life — long
-    /// enough to read as an expanding ring, short enough that
-    /// successive kicks at 120 BPM (2 Hz) stack visibly instead of
-    /// merging into a held glow.
-    static let shockwaveDecay: Float = 2.5
-    /// Maximum radial scale the shockwave reaches at peak energy,
-    /// expressed as a multiple of `dodecahedronRadius`. 2.2 = the
-    /// shockwave grows from 0 to ~2.2× the dodec's circumradius
-    /// (≈ 0.88 m) before fading out — well clear of the dodec body.
-    static let shockwaveMaxScaleMultiplier: Float = 2.2
-    /// Minimum scale floor — keeps the shockwave entity from
-    /// collapsing into a 0-scale singularity at rest. Invisible at
-    /// rest via opacity, but RealityKit can warn on degenerate scales.
-    static let shockwaveMinScale: Float = 0.05
-
-    /// Brilliance-band onset bumps the sparkle envelope to 1.0; it
+/// Brilliance-band onset bumps the sparkle envelope to 1.0; it
     /// decays at this rate (per second). 3.5 Hz = ~200 ms half-life,
     /// matched to the brief hat / shaker / cymbal hit feel.
     static let sparkleDecay: Float = 3.5
-    /// Number of orbiting sparkle entities around the dodec.
-    static let sparkleCount: Int = 32
-    /// Radius of the sparkle pool around the dodec center, in meters.
-    /// Sits between the dodec's circumradius (~0.4) and the
-    /// shockwave's peak reach (~0.88), so sparkles read as ambient
-    /// twinkle in the immediate space around the solid.
-    static let sparkleOrbitRadius: Float = 0.65
+    /// Number of sparkles embedded in mirror cells on the disco ball's
+    /// inner surface. Iterations: 32 (orbital shell) → 120 (volumetric
+    /// dense) → 40 (volumetric sparse) → 80 (surface-aligned). The
+    /// move to cell alignment changed the density math — 40 cells on a
+    /// 14×28 grid (~294 mirror cells) left obvious gaps; 80 gives
+    /// better coverage so most of the visible far-hemisphere cells
+    /// host a sparkle, still well below the ~294 total mirror cells.
+    static let sparkleCount: Int = 80
+    /// Sparkles now embed in the disco ball's INNER SURFACE inside
+    /// mirror (non-lit) cells. This inset multiplier places them just
+    /// inside the surface (0.97 × discoBallRadius) so they sit in the
+    /// cell rather than poking through. Smaller inset = deeper inside
+    /// the sphere = sparkle more obviously "behind" the mirror cell.
+    static let sparkleSurfaceInset: Float = 0.97
+    /// Cell-grid dimensions for the disco ball. SINGLE SOURCE OF TRUTH —
+    /// these values are pushed into the shader's `LatCells`/`LngCells`
+    /// uniforms at build time via setParameter (see `buildDiscoBall`).
+    /// The USDA carries matching defaults for RCP preview but they're
+    /// always overwritten at runtime, so changing these here is the
+    /// only edit needed to retune cell density.
+    static let discoBallLatCells: Int = 14
+    static let discoBallLngCells: Int = 28
     /// Size of each sparkle sprite (edge length, meters).
-    static let sparkleSize: Float = 0.018
+    static let sparkleSize: Float = 0.020
     /// Continuous shimmer floor — sparkle pool's minimum brightness
     /// at high brilliance loudness even between hat hits. Mixed with
     /// the onset-driven envelope so brilliance-heavy mixes (e.g. a
     /// shaker hi pattern) read as a continuously twinkling halo.
     static let sparkleShimmerStrength: Float = 0.35
+    /// Tempo-driven sparkle size endpoints. INVERTED relationship vs
+    /// the usual "faster = bigger" intuition: slow songs get LARGER
+    /// sparkles (0.9×) that read as deliberate visible particles —
+    /// they suit the slow ballad's "intimate floating points of light"
+    /// feel — while fast songs get tinier ones (0.25×) that read as
+    /// rapid micro-shimmer in the air, more like static buzz than
+    /// discrete particles. Applied as `entity.scale` per-tick.
+    static let sparkleSizeScaleSlow: Float = 0.9
+    static let sparkleSizeScaleFast: Float = 0.25
+    /// Extra brilliance-band tempo multiplier ON TOP of the existing
+    /// tempoIntensityScale (which dims everything on slow songs). Pushes
+    /// the sparkle pool's tempo dependence further so a high-BPM disco
+    /// track has a noticeably more present shimmer than a low-BPM
+    /// ballad, beyond what the global tempo dimming already gives.
+    /// 0.25 slow → 1.0 fast — keeps the 4× slow/fast contrast but at
+    /// half the absolute level (the earlier 0.5/2.0 range was too
+    /// dominant in the overall mix once the disco ball started reflecting
+    /// emissive elements).
+    static let sparkleBrillianceTempoMultSlow: Float = 0.25
+    static let sparkleBrillianceTempoMultFast: Float = 1.0
+
+    // MARK: - Disco-ball tuning
+    //
+    // These constants drive the RCP `ShaderGraphMaterial` that wraps
+    // the dodec. The shader handles the per-cell checkerboard and the
+    // lit-cell emissive internally; we just set uniforms each tick.
+    // The TILE-COUNT / GAP constants from the old per-entity build
+    // path are gone — that geometry lives in the shader now.
+
+    /// Radius of the surrounding disco-ball sphere, in meters. Camera /
+    /// viewer sits at root origin; the dodec sits ~0 m (its center) with
+    /// outer envelope ~0.9 m; the ball at 2.5 m surrounds both with
+    /// comfortable margin and fills most of the visible FOV.
+    /// Iteration: 2.5 → 3.25 m (30% larger). Pushes the surrounding
+    /// disco-ball further from the viewer so the dodec feels less
+    /// crowded and the cells subtend a smaller angle — the pattern
+    /// reads as wrap-around environment rather than close-in walls.
+    static let discoBallRadius: Float = 3.25
+    /// Slow Y-rotation of the entire disco ball, rev/s. Now tempo-driven
+    /// (lerped between Slow and Fast endpoints by tempoT each tick):
+    /// a 60 BPM ballad gives ~0.008 rev/s (one rev per ~125 s, very
+    /// slow drift); a 140 BPM disco track gives ~0.030 rev/s (one rev
+    /// per ~33 s, noticeably more motion). Both are still slower than
+    /// the dodec's tumble so the layers move at distinct rates.
+    static let discoBallRotationRateSlow: Float = 0.008
+    static let discoBallRotationRateFast: Float = 0.030
+    /// Lit tile beat-pulse decay rate (per second). 7.0 Hz ≈ 99 ms
+    /// half-life. Iteration history (in code path): 3.5 → 6.0 → 9.0 →
+    /// 7.0. Sweet spot where flashes are clear but don't snap-vanish
+    /// before the eye registers them.
+    static let discoBallBeatPulseDecay: Float = 7.0
+    /// Lit-cell emissive at rest (between beats). Driven into the
+    /// shader's `Baseline` parameter. Near-zero so tiles read as
+    /// genuinely dark between flashes.
+    static let discoBallLitOpacityBaseline: Float = 0.02
+    /// Lit-cell emissive at peak beat. Driven into the shader's
+    /// `Peak` parameter. Doubled 1.0 → 2.0 when the lit-cell COUNT
+    /// dropped from 50% to 25%: same net light pumped into the scene
+    /// per flash, just from fewer/brighter cells instead of more/dimmer.
+    /// 2.0 is HDR (above SDR white) so the remaining lit cells punch
+    /// hard with bloom; tonemap clamps the visible peak to white.
+    static let discoBallLitOpacityPeak: Float = 2.0
+    /// Weight of the chromagram-derived hue in the per-tick LitColor
+    /// blend. 0 = pure mood color (warm white / mood-tinted),
+    /// 1 = pure pitch color. 0.6 = pitch dominates but mood is still
+    /// audible, so the ball flashes the song's lead-band pitch hue
+    /// with a residual mood undertone.
+    static let discoBallChromaBlendWeight: CGFloat = 0.6
+    /// Tempo-driven roughness endpoints for the LIT (metallic) cells.
+    /// Faster songs → sharper reflections (0.04, near-perfect mirror)
+    /// to match the intensity; slower songs → softer reflections (0.14,
+    /// more diffuse). Pushed into the shader's `LitRoughness` parameter
+    /// each tick. Mirror (non-lit) cells stay at roughness 1.0 always.
+    static let discoBallLitRoughnessSlow: Float = 0.14
+    static let discoBallLitRoughnessFast: Float = 0.04
+
+
 
     /// Tempo-driven beam-opacity lerp endpoints.
     ///
@@ -521,6 +736,32 @@ enum DodecahedronVisualizer {
         }
     }
 
+    /// Enumerate the 30 unique edges of a regular dodecahedron as
+    /// (vertexA, vertexB) world-space pairs. Each face contributes 5
+    /// edges, every edge is shared between 2 faces → 12·5/2 = 30. We
+    /// dedupe by canonicalizing endpoints (sorted, rounded) into a
+    /// string key so floating-point equality doesn't bite.
+    private static func dodecahedronEdges() -> [(SIMD3<Float>, SIMD3<Float>)] {
+        var seen = Set<String>()
+        var edges: [(SIMD3<Float>, SIMD3<Float>)] = []
+        func key(_ v: SIMD3<Float>) -> String {
+            String(format: "%.4f,%.4f,%.4f", v.x, v.y, v.z)
+        }
+        for dir in faceDirections {
+            let perimeter = faceVertices(faceDirection: dir)
+            for j in 0..<5 {
+                let a = perimeter[j]
+                let b = perimeter[(j + 1) % 5]
+                let ka = key(a), kb = key(b)
+                let canonical = ka < kb ? "\(ka)|\(kb)" : "\(kb)|\(ka)"
+                if seen.insert(canonical).inserted {
+                    edges.append((a, b))
+                }
+            }
+        }
+        return edges
+    }
+
     /// Build a mesh for ONE face of a regular dodecahedron. Triangle-
     /// fan from face center out to the 5 perimeter vertices. Vertices
     /// are in WORLD-space relative to the dodecahedron center — no
@@ -668,6 +909,51 @@ enum DodecahedronVisualizer {
         let rotator = Entity()
         root.addChild(rotator)
 
+        // Edge skeleton — 30 thin additive boxes laid along the dodec's
+        // edges. Children of rotator (not of individual faces), so they
+        // stay at the original surface when faces push outward on a
+        // bass pulse. Closed panels overlap them visually; open panels
+        // expose them as "cracks of light." Color (per-tick) tracks
+        // dominant bass pitch, brightness scales with bassPulse — at
+        // rest the skeleton is nearly invisible, on a hit the seams
+        // blaze.
+        let edgeSkeleton = Entity()
+        edgeSkeleton.components.set(DodecahedronEdgeSkeletonComponent())
+        rotator.addChild(edgeSkeleton)
+        for (a, b) in dodecahedronEdges() {
+            let center = (a + b) / 2
+            let edgeVec = b - a
+            let length = simd_length(edgeVec)
+            let dirUnit = edgeVec / length
+            let orientation = simd_quatf(
+                from: SIMD3<Float>(1, 0, 0),
+                to: dirUnit
+            )
+            // Build all 3 halo layers coaxially. Same length + same
+            // center; varying thickness. Outer halos are wider so on
+            // a bass hit the seam reads as a bright core surrounded
+            // by a soft volumetric bloom rather than a hairline.
+            for (layerIdx, layer) in dodecahedronEdgeLayers.enumerated() {
+                var mat = UnlitMaterial(program: additiveProgram)
+                mat.color = .init(tint: PlatformColor.white)
+                // CRITICAL: writesDepth=false — same coaxial-additive
+                // discipline as Crystal/face beams. Without it the
+                // outer halo's depth write blocks the inner core at
+                // the depth-LESS test.
+                mat.writesDepth = false
+                let mesh = MeshResource.generateBox(size: SIMD3<Float>(
+                    length, layer.thickness, layer.thickness
+                ))
+                let entity = ModelEntity(mesh: mesh, materials: [mat])
+                entity.position = center
+                entity.orientation = orientation
+                entity.components.set(
+                    DodecahedronEdgeLayerComponent(layerIndex: layerIdx)
+                )
+                edgeSkeleton.addChild(entity)
+            }
+        }
+
         // Build 12 face entities. Each face has its OWN mesh built
         // from the 5 dodecahedron vertices that lie on that face,
         // expressed in world space relative to the dodecahedron center.
@@ -719,7 +1005,13 @@ enum DodecahedronVisualizer {
             var material = PhysicallyBasedMaterial()
             material.baseColor = .init(tint: tintColor)
             material.metallic = 1.0
-            material.roughness = 0.30
+            // Roughness dropped 0.30 → 0.10 for noticeably sharper
+            // specular highlights — the dodec faces now read as
+            // polished mirror-metal rather than brushed metal. The
+            // disco ball lit cells use roughness 0.08, so the dodec is
+            // similar (slightly less mirror) — gives the dodec and
+            // the disco ball a unified reflective family of surfaces.
+            material.roughness = 0.10
             material.emissiveColor = .init(color: tintColor)
             material.emissiveIntensity = 0.40
             material.blending = .transparent(opacity: .init(floatLiteral: 0.99))
@@ -818,63 +1110,67 @@ enum DodecahedronVisualizer {
             rotator.addChild(face)
         }
 
-        // ---- Central shockwave entity (sub-band onset → kick pulse) -
-        // An additive sphere centered on the dodec. Stays at scale ≈ 0
-        // and opacity 0 at rest; on each kick (`bandOnset[sub]`), the
-        // root's shockwaveEnergy bumps to 1.0 and animate() scales the
-        // sphere outward as opacity fades. Reads as a quick concentric
-        // shock radiating outward through the dodec on every kick hit.
+// ---- Cell-aligned sparkle pool (brilliance band → hats / shakers)
+        // Sparkles snap to mirror (non-lit) cells on the disco ball's
+        // INNER SURFACE so each one inhabits a dark cell. Visually this
+        // ties the brilliance band into the disco ball's percussive
+        // grid — when a sparkle pulses on a hi-hat, it pulses INSIDE
+        // a specific dark cell, reinforcing the geometric layer
+        // instead of floating randomly in the volume.
         //
-        // Lives on the rotator subroot so it tumbles with the dodec
-        // (matching the "the dodec is the universe" framing rather
-        // than "the shockwave is in the room").
-        // Base sphere radius = dodecahedronRadius (0.4 m) so when the
-        // per-tick scale crosses 2.2× (shockwaveMaxScaleMultiplier),
-        // the visible radius reaches ~0.88 m — comfortably beyond the
-        // dodec's outer envelope, so the wave reads as "passing
-        // through and out" instead of "barely poking out."
-        let shockwave = ModelEntity(
-            mesh: .generateSphere(radius: dodecahedronRadius),
-            materials: [{
-                var mat = UnlitMaterial(program: additiveProgram)
-                // Bright neutral-warm white tint; the per-tick HDR
-                // boost in animate() pushes the brightness above SDR.
-                mat.color = .init(tint: PlatformColor.hdrColor(
-                    hue: 0.06, saturation: 0.20,
-                    brightness: 1.0, hdrBoost: 2.5
-                ))
-                mat.writesDepth = false
-                return mat
-            }()]
-        )
-        shockwave.components.set(DodecahedronShockwaveComponent())
-        shockwave.components.set(OpacityComponent(opacity: 0.0))
-        shockwave.scale = SIMD3<Float>(repeating: shockwaveMinScale)
-        rotator.addChild(shockwave)
+        // Coordinate frame: sparkles live in a CONTAINER entity that
+        // matches the disco ball's transform (same position offset,
+        // same Y-flip from `scale = (1, -1, 1)`, same per-tick Y
+        // rotation). That way each sparkle's local position can be
+        // computed in the SAME frame as the shader's UV → 3D math, and
+        // the sparkles ride along as the disco ball rotates.
+        let sparkleContainer = Entity()
+        sparkleContainer.position = SIMD3<Float>(0, 0, -forwardDistance)
+        sparkleContainer.scale = SIMD3<Float>(1, -1, 1)
+        sparkleContainer.components.set(DodecahedronSparkleContainerComponent())
+        root.addChild(sparkleContainer)
 
-        // ---- Orbiting sparkle pool (brilliance band → hats / shakers)
-        // 32 tiny additive sprites positioned on a Fibonacci-spiral
-        // sphere around the dodec. Each sparkle has a per-particle
-        // phase so they twinkle individually rather than all flashing
-        // together. The pool's overall brightness is the sum of
-        // (continuous brilliance shimmer) and (onset-driven sparkle
-        // envelope) — a busy hat pattern reads as a constant twinkle,
-        // a single cymbal hit reads as a quick all-sparkle flash.
-        //
-        // Fibonacci spiral spacing: each successive index advances by
-        // the golden angle (~137.5°) around y, with z stepping
-        // uniformly from -1 to +1. Produces an even, non-clumpy
-        // distribution on the sphere — better than uniform random.
-        let goldenAngle: Float = .pi * (3 - sqrt(5))
-        for i in 0..<sparkleCount {
-            let z: Float = 1 - 2 * Float(i) / Float(sparkleCount - 1)
-            let radiusAtZ: Float = sqrt(max(0, 1 - z * z))
-            let theta: Float = goldenAngle * Float(i)
+        // Collect mirror-cell coordinates — same lit-mask formula the
+        // shader uses. Mirror = NOT lit, where lit is the staggered
+        // brick pattern (cellY%2==0 AND (cellX + cellY/2)%2 == 0).
+        var mirrorCells: [(Int, Int)] = []
+        for cellY in 0..<discoBallLatCells {
+            for cellX in 0..<discoBallLngCells {
+                let isLit = (cellY % 2 == 0) && ((cellX + cellY / 2) % 2 == 0)
+                if !isLit { mirrorCells.append((cellX, cellY)) }
+            }
+        }
+        // Score each mirror cell with a deterministic sin-based hash,
+        // sort, pick top N. Gives a reproducible well-spread subset
+        // (vs naive in-order which would cluster sparkles into the
+        // first few latitude bands).
+        let scored = mirrorCells.enumerated().map { (i, cell) -> ((Int, Int), Float) in
+            let h = sin(Float(i) * 12.9898 + 78.233) * 43758.5453
+            return (cell, h - floor(h))
+        }
+        let picked = scored.sorted { $0.1 < $1.1 }
+            .prefix(min(sparkleCount, mirrorCells.count))
+            .map { $0.0 }
+
+        let surfaceR = discoBallRadius * sparkleSurfaceInset
+        let latCellsF = Float(discoBallLatCells)
+        let lngCellsF = Float(discoBallLngCells)
+        for (i, cell) in picked.enumerated() {
+            let cellX = cell.0
+            let cellY = cell.1
+            // UV center → spherical coords. Matches the shader's
+            // texcoord → cell mapping exactly: u runs longitude
+            // 0..1, v runs latitude 0..1 (south pole at v=0).
+            let u = (Float(cellX) + 0.5) / lngCellsF
+            let v = (Float(cellY) + 0.5) / latCellsF
+            let longitude = u * 2 * .pi
+            let latitude = -.pi / 2 + v * .pi
+            let cosLat = cos(latitude)
             let position = SIMD3<Float>(
-                cos(theta) * radiusAtZ,
-                z,
-                sin(theta) * radiusAtZ
-            ) * sparkleOrbitRadius
+                surfaceR * cosLat * cos(longitude),
+                surfaceR * sin(latitude),
+                surfaceR * cosLat * sin(longitude)
+            )
 
             var sparkleMat = UnlitMaterial(program: additiveProgram)
             sparkleMat.color = .init(tint: PlatformColor.hdrColor(
@@ -895,10 +1191,282 @@ enum DodecahedronVisualizer {
             let phase = Float(i) * 0.61803398 * 2 * .pi
             sparkle.components.set(DodecahedronSparkleComponent(phase: phase))
             sparkle.components.set(OpacityComponent(opacity: 0.0))
-            rotator.addChild(sparkle)
+            sparkleContainer.addChild(sparkle)
         }
 
+        // ---- Surrounding disco-ball sphere -------------------------
+        // Single inverted-normal sphere with a custom RCP shader graph
+        // (Materials/DiscoBallMaterial.usda). The shader handles the
+        // per-cell checkerboard + beat-driven emissive via UV math.
+        // Build is async (material loads from the bundle).
+        //
+        // POSITIONING: root sits at the dodec position (forwardDistance
+        // ahead of the camera). We offset the ball by -forwardDistance
+        // in root's local space so its center lands at world origin =
+        // camera position, wrapping the viewer symmetrically.
+        if let discoBall = await buildDiscoBall() {
+            discoBall.position = SIMD3<Float>(0, 0, -forwardDistance)
+            root.addChild(discoBall)
+        }
+
+        // Vocal sparkle cloud (spherical shell of independently-
+        // twinkling particles around the dodec). Sibling of `rotator`
+        // under `root` so it doesn't tumble with the dodec — the
+        // cloud halos the solid as a stable shimmer while the
+        // structure spins inside it. Animate-tick scales each
+        // sparkle's brightness from vocals.loudness × per-particle
+        // sin twinkle.
+        let aura = buildVocalAura(additiveProgram: additiveProgram)
+        root.addChild(aura)
+
         return root
+    }
+
+    /// Build the vocal-cloud sparkle container. A spherical shell of
+    /// many small additive-blend particles arranged around the dodec
+    /// for the "magic dust cloud" effect: invisible at rest, dazzling
+    /// at peak vocals. Each particle stores its own twinkle phase +
+    /// frequency so the cloud doesn't pulse in lockstep — it reads
+    /// as a busy living shimmer instead.
+    ///
+    /// Replaces the earlier torus-halo design, which was too tame to
+    /// give vocals a wow moment.
+    @MainActor
+    private static func buildVocalAura(
+        additiveProgram: UnlitMaterial.Program
+    ) -> Entity {
+        let container = Entity()
+        container.position = SIMD3<Float>(0, 0, -forwardDistance)
+        container.components.set(DodecahedronVocalAuraComponent())
+
+        let mesh = MeshResource.generateSphere(radius: vocalCloudSparkleSize)
+        // Fixed seed (deterministic positions across launches helps
+        // visual continuity if a user is comparing songs side-by-side).
+        var rng = SystemRandomNumberGenerator()
+        for i in 0..<vocalCloudSparkleCount {
+            // Uniform sample on a spherical shell: pick a random
+            // unit direction, then scale by a random radius in the
+            // shell range. Two random angles → direction; one random
+            // for radial depth.
+            let azimuth = Float.random(in: 0..<(2 * .pi), using: &rng)
+            // Cosine-weighted polar (uniform on sphere surface).
+            let cosPolar = Float.random(in: -1...1, using: &rng)
+            let sinPolar = (1 - cosPolar * cosPolar).squareRoot()
+            let direction = SIMD3<Float>(
+                sinPolar * cos(azimuth),
+                cosPolar,
+                sinPolar * sin(azimuth)
+            )
+            let radius = Float.random(
+                in: vocalCloudInnerRadius...vocalCloudOuterRadius, using: &rng
+            )
+            // Independent twinkle phase + frequency per particle —
+            // the cloud's busy-shimmer comes from these being all
+            // different per particle.
+            let phase = Float.random(in: 0..<(2 * .pi), using: &rng)
+            let frequency = Float.random(in: 1.2...2.8, using: &rng)
+
+            var mat = UnlitMaterial(program: additiveProgram)
+            mat.color = .init(tint: .black)  // animate sets the live color
+            mat.writesDepth = false
+            let sparkle = ModelEntity(mesh: mesh, materials: [mat])
+            sparkle.position = direction * radius
+            sparkle.components.set(DodecahedronVocalSparkleComponent(
+                phase: phase, frequency: frequency, radius: radius
+            ))
+            _ = i  // silence unused-variable warning
+            container.addChild(sparkle)
+        }
+        return container
+    }
+
+    /// Procedural torus mesh generator. RealityKit doesn't ship a
+    /// torus primitive (only sphere / box / plane), so we build one
+    /// via MeshDescriptor: parametric (θ, φ) → position over
+    /// majorSegments × minorSegments quads, two triangles per quad.
+    /// Normals are the outward-facing tube surface normal so the
+    /// torus shades correctly under any lighting.
+    nonisolated private static func generateTorusMesh(
+        majorRadius R: Float, minorRadius r: Float,
+        majorSegments majorN: Int, minorSegments minorN: Int
+    ) -> MeshResource {
+        var positions: [SIMD3<Float>] = []
+        var normals: [SIMD3<Float>] = []
+        positions.reserveCapacity(majorN * minorN)
+        normals.reserveCapacity(majorN * minorN)
+        for i in 0..<majorN {
+            let theta = Float(i) / Float(majorN) * 2 * .pi
+            let cT = cos(theta), sT = sin(theta)
+            for j in 0..<minorN {
+                let phi = Float(j) / Float(minorN) * 2 * .pi
+                let cP = cos(phi), sP = sin(phi)
+                let x = (R + r * cP) * cT
+                let y = r * sP
+                let z = (R + r * cP) * sT
+                positions.append(SIMD3(x, y, z))
+                normals.append(SIMD3(cP * cT, sP, cP * sT))
+            }
+        }
+        var indices: [UInt32] = []
+        indices.reserveCapacity(majorN * minorN * 6)
+        for i in 0..<majorN {
+            let iNext = (i + 1) % majorN
+            for j in 0..<minorN {
+                let jNext = (j + 1) % minorN
+                let a = UInt32(i * minorN + j)
+                let b = UInt32(iNext * minorN + j)
+                let c = UInt32(iNext * minorN + jNext)
+                let d = UInt32(i * minorN + jNext)
+                indices.append(contentsOf: [a, b, c, a, c, d])
+            }
+        }
+        var desc = MeshDescriptor()
+        desc.positions = MeshBuffer(positions)
+        desc.normals = MeshBuffer(normals)
+        desc.primitives = .triangles(indices)
+        return (try? MeshResource.generate(from: [desc])) ?? .generateSphere(radius: 0.01)
+    }
+
+    // MARK: - Disco ball (RCP ShaderGraphMaterial)
+
+    /// Builds the surrounding disco-ball sphere. Single inverted-normal
+    /// sphere mesh + one `ShaderGraphMaterial` (authored as USDA in
+    /// `Materials/DiscoBallMaterial.usda`). The shader handles the
+    /// per-cell checkerboard + beat-driven emissive via UV math; we
+    /// just push uniforms per tick.
+    ///
+    /// `MeshResource.generateSphere` has outward normals (camera inside
+    /// = back-face-culled = invisible). Mirroring the entity along Y
+    /// flips triangle winding so the inside renders. UV.y also flips —
+    /// the checker is symmetric so it doesn't matter visually.
+    private static func buildDiscoBall() async -> Entity? {
+        let mesh = MeshResource.generateSphere(radius: discoBallRadius)
+        guard let material = try? await ShaderGraphMaterial(
+            named: "/Root/DiscoBallMaterial",
+            from: "Materials/DiscoBallMaterial",
+            in: realityKitContentBundle
+        ) else {
+            return nil
+        }
+        let sphere = ModelEntity(mesh: mesh, materials: [material])
+        sphere.scale = SIMD3<Float>(1, -1, 1)  // flip winding → inside visible
+        sphere.components.set(DodecahedronDiscoBallComponent())
+        // Override shader defaults so ALL cells are pure black between
+        // beats — only lit cells flash on the kick. Mirror cells stay
+        // black always (no constant dim glow), lit baseline is 0 (no
+        // dim warm rest state). Effect: every kick reveals a sparse
+        // constellation of bright cells against the void.
+        let black = CGColor(
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+            components: [0, 0, 0, 1]
+        )!
+        setDiscoBallFloat(sphere, name: "Baseline", value: 0.0)
+        setDiscoBallFloat(sphere, name: "Peak", value: discoBallLitOpacityPeak)
+        // Push the cell-grid dimensions from Swift so they're a single
+        // source of truth. The USDA carries the same values as defaults
+        // (for previewing the shader graph in RCP), but at runtime the
+        // shader uses these values. Same constants that drive the
+        // mirror-cell sparkle placement so they're guaranteed to match.
+        setDiscoBallFloat(sphere, name: "LatCells", value: Float(discoBallLatCells))
+        setDiscoBallFloat(sphere, name: "LngCells", value: Float(discoBallLngCells))
+        if var model = sphere.components[ModelComponent.self],
+           var mat = model.materials.first as? ShaderGraphMaterial {
+            try? mat.setParameter(name: "MirrorColor", value: .color(black))
+            model.materials[0] = mat
+            sphere.components.set(model)
+        }
+        return sphere
+    }
+
+    /// Helper: set a float parameter on the disco-ball's shader-graph
+    /// material. Material in RealityKit is a value-typed struct, so we
+    /// mutate a copy and write it back into the entity's ModelComponent.
+    private static func setDiscoBallFloat(
+        _ entity: Entity,
+        name: String,
+        value: Float
+    ) {
+        guard var model = entity.components[ModelComponent.self],
+              var mat = model.materials.first as? ShaderGraphMaterial
+        else { return }
+        try? mat.setParameter(name: name, value: .float(value))
+        model.materials[0] = mat
+        entity.components.set(model)
+    }
+
+    /// Push a Float input into the vocal-aura ShaderGraphMaterial.
+    /// Mirrors `setDiscoBallFloat`; bails silently when the aura
+    /// entity's material isn't a shader graph (fallback path).
+    @MainActor
+    private static func setVocalAuraFloat(
+        _ entity: Entity, name: String, value: Float
+    ) {
+        guard var model = entity.components[ModelComponent.self],
+              var mat = model.materials.first as? ShaderGraphMaterial
+        else { return }
+        try? mat.setParameter(name: name, value: .float(value))
+        model.materials[0] = mat
+        entity.components.set(model)
+    }
+
+    /// Push a color3 input. PlatformColor is platform-specific
+    /// (NSColor on macOS, UIColor on iOS); we convert to CGColor for
+    /// the .color() ParameterValue case.
+    @MainActor
+    private static func setVocalAuraColor(
+        _ entity: Entity, name: String, value: PlatformColor
+    ) {
+        guard var model = entity.components[ModelComponent.self],
+              var mat = model.materials.first as? ShaderGraphMaterial
+        else { return }
+        try? mat.setParameter(name: name, value: .color(value.cgColor))
+        model.materials[0] = mat
+        entity.components.set(model)
+    }
+
+    /// Helper: set a color3 parameter from a PlatformColor. `MaterialParameters.Value.color`
+    /// takes a `CGColor` — we explicitly construct one in the device-RGB
+    /// colorspace from the unpacked RGB components so there's no
+    /// ambiguity with the multiple `init(red:green:blue:alpha:)` overloads.
+    /// Blend two `PlatformColor`s in RGB space at `weight` (0 = pure a,
+    /// 1 = pure b). Both inputs assumed to be in 0..1 range (non-HDR).
+    /// Used for per-tick blending of the mood-tinted LitColor with the
+    /// currently-dominant chromagram pitch's hue.
+    private static func blendColors(
+        _ a: PlatformColor,
+        _ b: PlatformColor,
+        weight: CGFloat
+    ) -> PlatformColor {
+        var ar: CGFloat = 0, ag: CGFloat = 0, ab: CGFloat = 0, aa: CGFloat = 0
+        var br: CGFloat = 0, bg: CGFloat = 0, bb: CGFloat = 0, ba: CGFloat = 0
+        a.getRed(&ar, green: &ag, blue: &ab, alpha: &aa)
+        b.getRed(&br, green: &bg, blue: &bb, alpha: &ba)
+        let inv = 1 - weight
+        return PlatformColor(
+            red:   ar * inv + br * weight,
+            green: ag * inv + bg * weight,
+            blue:  ab * inv + bb * weight,
+            alpha: 1
+        )
+    }
+
+    private static func setDiscoBallColor(
+        _ entity: Entity,
+        name: String,
+        color: PlatformColor
+    ) {
+        guard var model = entity.components[ModelComponent.self],
+              var mat = model.materials.first as? ShaderGraphMaterial
+        else { return }
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        let cgColor = CGColor(
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+            components: [r, g, b, 1]
+        )!
+        try? mat.setParameter(name: name, value: .color(cgColor))
+        model.materials[0] = mat
+        entity.components.set(model)
     }
 
     // MARK: - Mood-driven palette
@@ -914,50 +1482,76 @@ enum DodecahedronVisualizer {
     static func sparkleColor(happiness: Float?) -> PlatformColor {
         let hue: CGFloat
         let saturation: CGFloat
+        let hdrBoost: CGFloat
         if let h = happiness {
             let t = CGFloat(min(1.0, max(0.0, h / 100.0)))
             if t < 0.5 {
-                let f = t * 2  // 0..1 across the sad half
-                hue        = 0.62 - 0.04 * f       // deeper blue → icy default
-                saturation = 0.40 - 0.15 * f       // 0.40 → 0.25
+                let f = t * 2  // 0..1 across the sad half (0=very sad → 1=neutral)
+                // Endpoint: hue 0.65 (deep indigo), sat 0.85, hdrBoost 2.3.
+                // Neutral end of half preserves the icy default (0.58 / 0.25 / 2.0).
+                hue        = 0.65 + (0.58 - 0.65) * f
+                saturation = 0.85 + (0.25 - 0.85) * f
+                hdrBoost   = 2.3  + (2.0  - 2.3 ) * f
             } else {
-                let f = (t - 0.5) * 2  // 0..1 across the happy half
-                hue        = 0.58 + (0.92 - 0.58) * f  // icy → warm pink
-                saturation = 0.25 + 0.25 * f           // 0.25 → 0.50
+                let f = (t - 0.5) * 2  // 0..1 across the happy half (0=neutral → 1=very happy)
+                // Endpoint: hue 0.93 (vivid magenta), sat 0.85, hdrBoost 2.3.
+                hue        = 0.58 + (0.93 - 0.58) * f
+                saturation = 0.25 + (0.85 - 0.25) * f
+                hdrBoost   = 2.0  + (2.3  - 2.0 ) * f
             }
         } else {
             hue = 0.58
             saturation = 0.25
+            hdrBoost = 2.0
         }
         return PlatformColor.hdrColor(
             hue: hue, saturation: saturation,
-            brightness: 1.0, hdrBoost: 2.0
+            brightness: 1.0, hdrBoost: hdrBoost
         )
     }
 
-    /// Shockwave color, modulated by happiness. Sad → cool blue;
-    /// neutral → warm-white (original); happy → warm gold.
-    static func shockwaveColor(happiness: Float?) -> PlatformColor {
+/// Lit-tile color for the disco-ball pattern, modulated by
+    /// happiness 0..100. Same piecewise-around-neutral shape as the
+    /// sparkle/shockwave palette but with **subtler extremes** — the
+    /// disco ball covers a much larger screen area than the sparkles
+    /// or central shockwave, so a fully saturated indigo across 196
+    /// lit tiles would overwhelm the dodec itself. The lit tiles stay
+    /// "warm-white-ish" at all happiness values, just shifted slightly
+    /// cool at sad / slightly warm-gold at happy.
+    static func discoBallLitColor(happiness: Float?) -> PlatformColor {
         let hue: CGFloat
         let saturation: CGFloat
+        let hdrBoost: CGFloat
         if let h = happiness {
             let t = CGFloat(min(1.0, max(0.0, h / 100.0)))
             if t < 0.5 {
-                let f = t * 2
-                hue        = 0.60 - 0.54 * f       // cool blue → warm white
-                saturation = 0.40 - 0.20 * f       // 0.40 → 0.20
+                let f = t * 2  // 0=very sad → 1=neutral
+                // Endpoint: cool indigo-white (subtler than sparkles' 0.65/0.85).
+                hue        = 0.62 + (0.08 - 0.62) * f
+                saturation = 0.40 + (0.10 - 0.40) * f
+                hdrBoost   = 1.0  + (1.0  - 1.0 ) * f
             } else {
-                let f = (t - 0.5) * 2
-                hue        = 0.06 + 0.06 * f       // warm white → warm gold
-                saturation = 0.20 + 0.30 * f       // 0.20 → 0.50
+                let f = (t - 0.5) * 2  // 0=neutral → 1=very happy
+                // Endpoint: warm gold (subtler than shockwave's 0.09/0.85).
+                hue        = 0.08 + (0.10 - 0.08) * f
+                saturation = 0.10 + (0.40 - 0.10) * f
+                hdrBoost   = 1.0  + (1.2  - 1.0 ) * f
             }
         } else {
-            hue = 0.06
-            saturation = 0.20
+            hue = 0.08
+            saturation = 0.10
+            // hdrBoost dropped 2.0 → 1.0. The previous 2.0 meant peak
+            // opacity = 1.0 contributed 2× to the additive layer, which
+            // saturated to white well below opacity 1.0 — so the user's
+            // perceived peak vs trough was tiny (both looked white).
+            // At 1.0, opacity directly maps to screen brightness:
+            // baseline 0.02 → 0.02 (black), peak 1.0 → 1.0 (white).
+            // Clear 50:1 dynamic range that reads as a sharp flash.
+            hdrBoost = 1.0
         }
         return PlatformColor.hdrColor(
             hue: hue, saturation: saturation,
-            brightness: 1.0, hdrBoost: 2.5
+            brightness: 1.0, hdrBoost: hdrBoost
         )
     }
 
@@ -977,38 +1571,14 @@ enum DodecahedronVisualizer {
     }
 
     // MARK: - Tempo helpers
-
-    /// Canonical musical-BPM range. Anything outside this gets folded
-    /// by halving/doubling until it lands inside. Spans roughly
-    /// "slow ballad" through "very fast dance" — wider would let
-    /// half/double-time interpretations slip through; narrower might
-    /// fold legitimate genre tempos (e.g. 160 BPM punk → 80).
-    static let canonicalBpmMin: Float = 70.0
-    static let canonicalBpmMax: Float = 140.0
-
-    /// Octave-fold a raw bpm into the canonical musical range. The
-    /// `BeatTracker` regularly locks onto half-time or double-time
-    /// interpretations of the perceived tempo (it's a known limit of
-    /// IOI-based trackers — a song with strong hat eighths and a
-    /// 110 BPM kick will often lock onto 220 BPM because the
-    /// inter-onset intervals are equally regular). Folding restores
-    /// the perceptual tempo so visual-treatment thresholds match what
-    /// a listener feels.
-    static func octaveFoldBpm(_ raw: Float) -> Float {
-        guard raw > 0 else { return 0 }
-        var bpm = raw
-        // Cap iterations to avoid pathological loops on bogus inputs.
-        for _ in 0..<8 {
-            if bpm > canonicalBpmMax {
-                bpm *= 0.5
-            } else if bpm < canonicalBpmMin {
-                bpm *= 2.0
-            } else {
-                return bpm
-            }
-        }
-        return bpm
-    }
+    //
+    // `octaveFoldBpm` + canonical BPM range constants hoisted to
+    // [[BeatHelpers]] so other visualizers can share the tempo math
+    // without depending on this enum. Callers now use
+    // `BeatHelpers.octaveFoldBpm(raw)` directly.
+    //
+    // (placeholder retained so neighboring private helpers below keep
+    // their MARK grouping)
 
     // MARK: - Animate
 
@@ -1045,7 +1615,14 @@ enum DodecahedronVisualizer {
         timeSigOverride: String? = nil,
         partyOverride: Float? = nil,
         relaxedOverride: Float? = nil,
-        keyOverride: Key? = nil
+        keyOverride: Key? = nil,
+        /// Per-stem features from the demucs-mlx sidecar. When non-nil,
+        /// the disco ball's beat-pulse trigger source switches from
+        /// `bandOnset[sub]` (which includes kick + bass + room rumble
+        /// because they all live in the sub frequency band) to the
+        /// isolated `drums` stem's onsets — strictly drum-attack events,
+        /// no bass-note bleed. nil → fall back to band-split path.
+        stemFeatures: StemSeparationResult? = nil
     ) {
         guard var state = root.components[DodecahedronRootComponent.self] else { return }
         guard !frames.isEmpty else { return }
@@ -1057,15 +1634,15 @@ enum DodecahedronVisualizer {
             state.pulses = .init(repeating: 0, count: 12)
             state.smoothedLoudness = 0
             state.smoothedTimbre = 0
-            state.shockwaveEnergy = 0
             state.sparkleEnergy = 0
             state.smoothedBrilliance = 0
-            state.smoothedSub = 0
             state.smoothedCoreOpacity = .init(repeating: 0, count: 12)
             state.smoothedHaloOpacity = .init(repeating: 0, count: 12)
             state.smoothedTempoT = 0.5
             state.firstTempoTick = true
             state.rotationAngle = 0
+            state.beatPulseEnergy = 0
+            state.discoBallAngle = 0
             state.lastFrameIndex = -1
             state.firstAnimateTick = true
             state.lastSeenResetCounter = appResetCounter
@@ -1081,8 +1658,30 @@ enum DodecahedronVisualizer {
         let brillianceIdx = FrequencyBand.brilliance.rawValue
 
         // Pull per-band chromagrams for this frame.
-        let highMidChroma = f.bandChromagram[highMidIdx]
-        let lowMidChroma = f.bandChromagram[lowMidIdx]
+        //
+        // Beam source selection:
+        //   • Stems available → use the `other` stem's chromagram for
+        //     BOTH the inner-core and outer-halo beams. `other` is
+        //     Demucs's catch-all for the harmonic/melodic layer
+        //     (guitar, piano, synths, horns). For a sustained
+        //     monochromatic song like Whiskey River, the full-mix
+        //     band-split chromagrams stay locked on one dominant
+        //     pitch — only one beam ever lights up. The `other` stem
+        //     isolates the actual chord movements so the beam
+        //     selection changes as the song progresses.
+        //   • Stems NOT available → fall back to the existing
+        //     per-band (highMid / lowMid) split from the full mix.
+        //     That's the pre-stems behavior the visualizer was built
+        //     against and works well for material with clear band
+        //     separation (drum-forward dance, etc.).
+        let otherChromaForFrame: [Float]? = {
+            guard let chroma = stemFeatures?.stems["other"]?.chromagram,
+                  i < chroma.count, chroma[i].count == 12
+            else { return nil }
+            return chroma[i]
+        }()
+        let highMidChroma = otherChromaForFrame ?? f.bandChromagram[highMidIdx]
+        let lowMidChroma = otherChromaForFrame ?? f.bandChromagram[lowMidIdx]
 
         // First-tick / post-reset: snap smoothed values to current
         // signal so the first visual doesn't lerp in from black.
@@ -1097,7 +1696,6 @@ enum DodecahedronVisualizer {
             state.smoothedLoudness = f.loudness
             state.smoothedTimbre = f.timbreBrightness
             state.smoothedBrilliance = f.bandLoudness[brillianceIdx]
-            state.smoothedSub = f.bandLoudness[subIdx]
             state.firstAnimateTick = false
         }
 
@@ -1129,8 +1727,133 @@ enum DodecahedronVisualizer {
         let bandLerp = Float(min(1.0, deltaTime * Double(bandLoudnessLerpRate)))
         state.smoothedBrilliance +=
             (f.bandLoudness[brillianceIdx] - state.smoothedBrilliance) * bandLerp
-        state.smoothedSub +=
-            (f.bandLoudness[subIdx] - state.smoothedSub) * bandLerp
+
+        // Bass-pulse envelope. On every bass onset (stems-isolated
+        // when available, lowMid-band fallback otherwise), set the
+        // pulse to a loudness-normalized amplitude in [0, 1]. Each
+        // frame the envelope decays exponentially (~200ms half-life)
+        // so the structure visibly snaps + relaxes per bass hit.
+        let bassLoudnessSource: Float = {
+            if let bassLoud = stemFeatures?.stems["bass"]?.loudness,
+               i < bassLoud.count {
+                return bassLoud[i]
+            }
+            return f.bandLoudness[lowMidIdx]
+        }()
+        let bassOnsetFired: Bool = {
+            if let bassOnsets = stemFeatures?.stems["bass"]?.onset,
+               i < bassOnsets.count {
+                return bassOnsets[i]
+            }
+            return f.bandOnset[lowMidIdx]
+        }()
+        // Per-song loudness normalization (rises instantly, ~30s
+        // half-life decay, floor at 0.05). Used to map raw RMS to
+        // a punch amplitude that fills [0, 1] regardless of how the
+        // song was mastered.
+        let bassPeakDecay = pow(Float(0.5), Float(deltaTime) / 30.0)
+        state.bassLoudnessPeak = max(
+            0.05,
+            max(state.bassLoudnessPeak * bassPeakDecay, bassLoudnessSource)
+        )
+        // Decay last frame's pulse before potentially retriggering.
+        let bassPulseDecay = pow(Float(0.5), Float(deltaTime) / 0.20)
+        state.bassPulse *= bassPulseDecay
+        if bassOnsetFired {
+            // Punch amplitude scaled by loudness at the onset frame.
+            // Floor at 0.45 so even quiet onsets register visibly
+            // (otherwise a soft verse-bass produces no movement).
+            let rawAmplitude = bassLoudnessSource / state.bassLoudnessPeak
+            let punchAmplitude = max(0.45, min(1.0, rawAmplitude))
+            // Max-blend so a tail from a previous onset isn't
+            // clobbered by a quieter new onset arriving before the
+            // tail finishes decaying.
+            state.bassPulse = max(state.bassPulse, punchAmplitude)
+        }
+
+        // "Other"-stem loudness pipeline (drives the final beam-opacity
+        // multiplier so beams dim during quiet passages and slam during
+        // loud ones). Falls back to full-mix loudness when stems aren't
+        // loaded. Per-song peak normalization mirrors the bass pipeline.
+        let otherLoudnessSource: Float = {
+            if let otherLoud = stemFeatures?.stems["other"]?.loudness,
+               i < otherLoud.count {
+                return otherLoud[i]
+            }
+            return f.loudness
+        }()
+        let otherPeakDecay = pow(Float(0.5), Float(deltaTime) / 30.0)
+        state.otherLoudnessPeak = max(
+            0.05,
+            max(state.otherLoudnessPeak * otherPeakDecay, otherLoudnessSource)
+        )
+        let otherNormalized = min(1.0, otherLoudnessSource / state.otherLoudnessPeak)
+        // Lerp at ~6 Hz — slower than the bass-pulse envelope but
+        // fast enough to register a chorus entry within ~200 ms.
+        // EMA on the *normalized* value so the smoothed result also
+        // lives in [0, 1].
+        let otherLerp = Float(min(1.0, deltaTime * 6.0))
+        state.smoothedOtherLoudness +=
+            (otherNormalized - state.smoothedOtherLoudness) * otherLerp
+
+        // Smooth the bass chromagram for the interior-glow color.
+        // Lerp at ~12 Hz so the hue settles quickly after a new
+        // bass note enters without strobing on per-frame chroma
+        // jitter. No fallback when stems aren't loaded — glow stays
+        // white in that case (still pulses with bassPulse).
+        if let bassChroma = stemFeatures?.stems["bass"]?.chromagram,
+           i < bassChroma.count {
+            let frame = bassChroma[i]
+            let chromaLerp = Float(min(1.0, deltaTime * 12.0))
+            for k in 0..<12 {
+                let target = k < frame.count ? frame[k] : 0
+                state.smoothedBassChroma[k] +=
+                    (target - state.smoothedBassChroma[k]) * chromaLerp
+            }
+        }
+
+        // Vocals stem smoothing (loudness + chromagram). No
+        // band-fallback: cloud stays dark when no vocals stem
+        // loaded. Faster lerp (4 Hz vs original 2.5 Hz) so the
+        // cloud snaps onto vocal entries / exits visibly rather
+        // than sluggishly fading in.
+        if let vocalsLoud = stemFeatures?.stems["vocals"]?.loudness,
+           i < vocalsLoud.count {
+            let vocLerp = Float(min(1.0, deltaTime * 4.0))
+            state.smoothedVocalsLoudness +=
+                (vocalsLoud[i] - state.smoothedVocalsLoudness) * vocLerp
+        } else {
+            // Decay quickly so cloud disappears within ~1s of
+            // switching away from a song with stems.
+            state.smoothedVocalsLoudness *= 0.85
+        }
+        if let vocalsChroma = stemFeatures?.stems["vocals"]?.chromagram,
+           i < vocalsChroma.count, vocalsChroma[i].count == 12 {
+            let chroma = vocalsChroma[i]
+            let chromaMax = max(0.001, chroma.max() ?? 0.001)
+            for k in 0..<12 {
+                state.smoothedVocalsChroma[k] +=
+                    (chroma[k] / chromaMax - state.smoothedVocalsChroma[k]) * chromaLerp
+            }
+        }
+
+        // Stem-features availability check — once per animate tick,
+        // not once per frame. When `drumsOnset` is non-nil, the
+        // pulse-trigger source switches from sub-band onsets to the
+        // isolated drums stem (no bass / room-rumble bleed in the
+        // sub band).
+        let drumsOnset = stemFeatures?.stems["drums"]?.onset
+        let drumsLoudness = stemFeatures?.stems["drums"]?.loudness
+        // `other` is Demucs's catch-all stem for content that isn't
+        // drums/bass/vocals — most of the harmonic/melodic layer
+        // (guitar, piano, synths, horns). Drives the per-face "light
+        // rays" pulse so the rays respond to the melody, not the
+        // drum hits (drum hits are the disco-ball's job). Falls back
+        // to full-mix `frame.onset` when no stem available — that's
+        // the pre-stem behavior. Caught by Whiskey River where the
+        // gentle full mix barely registers any onsets but the
+        // isolated acoustic guitar strums (in `other`) are clean.
+        let otherOnset = stemFeatures?.stems["other"]?.onset
 
         // Scan new onsets since last tick. Two passes:
         //   1. full-spectrum f.onset → per-pitch face pulse (existing)
@@ -1142,7 +1865,21 @@ enum DodecahedronVisualizer {
         } else if state.lastFrameIndex < i {
             for j in (state.lastFrameIndex + 1)...i {
                 let frame = frames[j]
-                if frame.onset {
+                // Face-pulse trigger: prefer the `other` stem's
+                // onsets (melodic/harmonic content — guitar, piano,
+                // horns), fall back to full-mix `frame.onset` when
+                // no stems available. The disco-ball uses `drums`,
+                // so the two visual layers respond to different
+                // musical sources. Caught by Whiskey River: gentle
+                // full-mix flux missed the acoustic guitar attacks
+                // but the isolated `other` stem catches them cleanly.
+                let faceTrigger: Bool
+                if let otherOnset, j < otherOnset.count {
+                    faceTrigger = otherOnset[j]
+                } else {
+                    faceTrigger = frame.onset
+                }
+                if faceTrigger {
                     // Find dominant pitch class for this onset (use
                     // the full chromagram so the pulse routing
                     // matches whichever pitch is loudest right now,
@@ -1155,9 +1892,46 @@ enum DodecahedronVisualizer {
                     }
                     state.pulses[dom] = min(2.0, state.pulses[dom] + pulseBump)
                 }
-                if frame.bandOnset[subIdx] {
-                    state.shockwaveEnergy = 1.0
+
+                // ---- Disco-ball pulse trigger ----------------------------
+                // Two sources, chosen at apply-time:
+                //   • PREFERRED: drums stem onset from demucs-mlx
+                //     (isolated kick/snare attacks, no bass bleed).
+                //     Magnitude scales with drums.loudness[j].
+                //   • FALLBACK: bandOnset[sub] (sub frequency band,
+                //     includes kick + bass + room rumble — the kick
+                //     lane is approximated by frequency, not source).
+                // The fallback is what shipped pre-Phase 1.4; the
+                // stem path activates as soon as the sidecar's separation
+                // for the current song lands (cache hit = sub-second,
+                // fresh compute = ~60s during which we use fallback).
+                let useStemPulse: Bool
+                if let drumsOnset, j < drumsOnset.count {
+                    useStemPulse = drumsOnset[j]
+                } else if let drumsOnset {
+                    // Frame index past end of stem features — fall through.
+                    useStemPulse = frame.bandOnset[subIdx]
+                } else {
+                    useStemPulse = frame.bandOnset[subIdx]
                 }
+                if useStemPulse {
+                    // Magnitude: prefer drums.loudness[j] when available
+                    // (drum-only RMS, much cleaner kick-strength signal
+                    // than the sub-band which is dominated by sustained
+                    // bass notes). Multiplier tuned for the librosa
+                    // RMS scale where typical drum frames peak ≈ 0.1-0.3.
+                    let kickStrength: Float
+                    if let drumsLoudness, j < drumsLoudness.count {
+                        kickStrength = min(1.0,
+                            max(0.4, drumsLoudness[j] * 4.0))
+                    } else {
+                        // Same fallback formula as pre-Phase 1.4
+                        kickStrength = min(1.0,
+                            max(0.4, frame.bandLoudness[subIdx] * 6.0))
+                    }
+                    state.beatPulseEnergy = max(state.beatPulseEnergy, kickStrength)
+                }
+
                 if frame.bandOnset[brillianceIdx] {
                     state.sparkleEnergy = 1.0
                 }
@@ -1168,10 +1942,18 @@ enum DodecahedronVisualizer {
         // Decay envelopes.
         let pulseDecayFactor = Float(exp(-Double(pulseDecay) * deltaTime))
         for k in 0..<12 { state.pulses[k] *= pulseDecayFactor }
-        let shockDecayFactor = Float(exp(-Double(shockwaveDecay) * deltaTime))
-        state.shockwaveEnergy *= shockDecayFactor
         let sparkleDecayFactor = Float(exp(-Double(sparkleDecay) * deltaTime))
         state.sparkleEnergy *= sparkleDecayFactor
+        let beatDecayFactor = Float(exp(-Double(discoBallBeatPulseDecay) * deltaTime))
+        state.beatPulseEnergy *= beatDecayFactor
+        // Disco-ball Y rotation advance — tempo-driven. Uses last tick's
+        // `state.smoothedTempoT` (this frame's tempoT is computed later
+        // in animate, after this point). One-tick lag is invisible on
+        // a rotation that's seconds-per-revolution.
+        let discoBallRotationRate = discoBallRotationRateSlow
+            + (discoBallRotationRateFast - discoBallRotationRateSlow)
+            * state.smoothedTempoT
+        state.discoBallAngle += Float(deltaTime) * discoBallRotationRate * 2 * .pi
 
         // Advance rotation. Two axes at different rates — Y (yaw) +
         // X (tumble) — gives a non-repeating tumble feel.
@@ -1193,6 +1975,11 @@ enum DodecahedronVisualizer {
             }
         }()
         state.rotationAngle += Float(deltaTime) * rotationSpeed * rotationRateScale * 2 * .pi
+        // Bass pulse expresses itself only as the per-face panel
+        // separation in `applyState` — separate scale + rotation kicks
+        // were tried (peak +25% scale, 2.5× rotation) but stacked with
+        // separation they read as too intense. Keeping the pulse to
+        // one clear physical metaphor (panels detach + rejoin).
 
         // Apply rotation to the rotator subroot. Y first then X so the
         // tumble axis stays world-locked rather than rotating with the
@@ -1351,7 +2138,7 @@ enum DodecahedronVisualizer {
                 partyT           * 0.15 +
                 inverseRelaxedT  * 0.10
         } else {
-            let foldedBpm = octaveFoldBpm(f.beat.bpm)
+            let foldedBpm = BeatHelpers.octaveFoldBpm(f.beat.bpm)
             hasBeat = f.beat.confidence >= beatConfidenceFloor && foldedBpm > 0
             let rawTempoT: Float = hasBeat
                 ? min(1.0, max(0.0, (foldedBpm - slowBpm) / (fastBpm - slowBpm)))
@@ -1411,6 +2198,21 @@ enum DodecahedronVisualizer {
             // the metallic look REQUIRES side faces to catch and
             // sweep specular highlights as the dodec rotates.
             let localNormal = faceDirections[fc.pitchClassIndex]
+
+            // Bass-pulse panel separation: push each face radially
+            // outward along its own normal on every bass onset, then
+            // let it spring back as `state.bassPulse` decays. Peak
+            // displacement at full pulse (~1.0) = 0.05 m (12.5% of
+            // dodec radius) — panels visibly detach from the body
+            // and rejoin in ~200 ms. Tried 0.20 m (50%) initially;
+            // panel separation that wide reads as a disintegrating
+            // shape rather than a breathing one. Child beams (core
+            // + halo) ride along since they're parented to `face`.
+            // Applied to ALL faces (including back-facing ones)
+            // before the backface-cull `continue` below so a face
+            // crossing into view never snaps from a stale position.
+            child.position = localNormal * (state.bassPulse * 0.05)
+
             let worldNormal = rotatorRotation.act(localNormal)
             let facingCamera = worldNormal.z > -0.3
             child.isEnabled = facingCamera
@@ -1524,11 +2326,13 @@ enum DodecahedronVisualizer {
             state.smoothedHaloOpacity[k] +=
                 (haloTarget - state.smoothedHaloOpacity[k]) * beamLerp
 
-            // Apply to the two beam group children. The OpacityComponent
-            // value we set is the post-tempo-smoothing one; the per-band
-            // intensity decomposition still routes core vs halo to
-            // different bands, but the speed of fade is now uniform-per-
-            // tempo across both groups.
+            // Final multiplier: smoothed normalized "other"-stem loudness
+            // (full-mix loudness fallback). Floor at 0.25 so a quiet but
+            // pitch-clear passage still produces visible beams. Picked
+            // post-cap (vs pre-cap on the shaped target) after A/B test
+            // 2026-05-27 — linear loudness response read more naturally
+            // than the plateau-at-cap behavior of pre-cap multiplication.
+            let loudnessMultiplier = 0.25 + 0.75 * state.smoothedOtherLoudness
             for beamChild in child.children {
                 guard let beamTag = beamChild.components[DodecahedronFaceBeamComponent.self]
                 else { continue }
@@ -1537,75 +2341,254 @@ enum DodecahedronVisualizer {
                 case .core: opacity = state.smoothedCoreOpacity[k]
                 case .halo: opacity = state.smoothedHaloOpacity[k]
                 }
-                beamChild.components.set(OpacityComponent(opacity: opacity))
+                beamChild.components.set(OpacityComponent(opacity: opacity * loudnessMultiplier))
             }
         }
 
-        // ---- Shockwave update (sub band) -------------------------------
-        // Find the shockwave entity (tagged) and update its scale +
-        // opacity from shockwaveEnergy. Energy decays from 1.0 (just
-        // kicked) to 0.0 (idle); during decay the sphere grows from
-        // ~0 to shockwaveMaxScaleMultiplier × dodecRadius and fades
-        // out — reads as an expanding concentric shock.
-        for child in rotator.children {
-            guard child.components.has(DodecahedronShockwaveComponent.self) else { continue }
-            let e = state.shockwaveEnergy
-            // Scale: at e=1 (just kicked), small; at e→0, full reach.
-            // Map (1 → e) to (0 → 1) for a "starts tight, grows
-            // outward" expansion. Multiplied by the max-scale param.
-            let growth = (1 - e) * shockwaveMaxScaleMultiplier + shockwaveMinScale
-            child.scale = SIMD3<Float>(repeating: max(shockwaveMinScale, growth))
-            // Opacity: peak at e≈0.85 (just past trigger, briefly
-            // bright), fades as it expands. Quadratic falloff so it
-            // doesn't linger. Scaled by tempoIntensityScale so slow
-            // songs get a subtler shockwave (kicks are less explosive
-            // visually) than fast songs.
-            let opacity = e * e * 0.65 * tempoIntensityScale
-            child.components.set(OpacityComponent(opacity: opacity))
-        }
-
-        // ---- Sparkle pool update (brilliance band) ---------------------
+// ---- Sparkle pool update (brilliance band) ---------------------
         // Each sparkle has its own phase; per-tick opacity is the sum
         // of the onset envelope (sparkleEnergy) and the continuous
         // brilliance shimmer (smoothedBrilliance × phase wave).
+        //
+        // Tempo-driven SIZE + INTENSITY: slow songs get small dim
+        // sparkles ("intimate atmosphere"); fast songs get larger
+        // brighter ones ("the air is buzzing"). The base
+        // `tempoIntensityScale` already dims everything on slow songs;
+        // the brilliance-specific multiplier here pushes the contrast
+        // further so the sparkle pool's tempo response is more
+        // pronounced than the dodec's other elements.
         let sparkleTime = Float(clock) * 6.0
-        // Shimmer baseline scales with tempoIntensityScale — slow
-        // songs get a near-invisible continuous shimmer (still there,
-        // but doesn't compete with the dimmed beams); fast songs get
-        // the full shimmer floor.
+        let brillianceTempoMult = sparkleBrillianceTempoMultSlow
+            + (sparkleBrillianceTempoMultFast - sparkleBrillianceTempoMultSlow) * tempoT
+        let sparkleScale = sparkleSizeScaleSlow
+            + (sparkleSizeScaleFast - sparkleSizeScaleSlow) * tempoT
         let shimmerBase = min(1.0, state.smoothedBrilliance * 6.0)
-            * sparkleShimmerStrength * tempoIntensityScale
-        // Onset-driven twinkle is also scaled (so a cymbal hit on a
-        // ballad is felt but not loud-disco-explosive).
-        let twinkleScale = tempoIntensityScale
-        for child in rotator.children {
-            guard let sp = child.components[DodecahedronSparkleComponent.self] else { continue }
-            let phaseWave = 0.5 + 0.5 * sin(sparkleTime + sp.phase)
-            let twinkle = state.sparkleEnergy * phaseWave * twinkleScale
-            let shimmer = shimmerBase * phaseWave
-            let opacity = min(1.0, twinkle + shimmer)
-            child.components.set(OpacityComponent(opacity: opacity))
+            * sparkleShimmerStrength * tempoIntensityScale * brillianceTempoMult
+        let twinkleScale = tempoIntensityScale * brillianceTempoMult
+        // Edge-skeleton update: tint all 90 edge-layer entities to
+        // the dominant bass-stem pitch hue. Each layer (core / mid /
+        // wide) interpolates its own brightness + hdrBoost ramp
+        // between its base (rest) and peak values according to
+        // `state.bassPulse`. The wide outer halo is what reads as
+        // "light bleeding past the seam."
+        if let skeleton = rotator.children.first(where: {
+            $0.components.has(DodecahedronEdgeSkeletonComponent.self)
+        }) {
+            var dominantIdx = 0
+            var dominantVal: Float = 0
+            for k in 0..<12 {
+                if state.smoothedBassChroma[k] > dominantVal {
+                    dominantVal = state.smoothedBassChroma[k]
+                    dominantIdx = k
+                }
+            }
+            let hue = CGFloat(
+                (PitchClass(rawValue: dominantIdx) ?? .c).circleOfFifthsHue
+            )
+            let pulse = state.bassPulse
+            let saturation: CGFloat = CGFloat(0.90 - pulse * 0.30)
+            // Precompute one tint per layer (3 total) — far cheaper
+            // than computing per-edge in the inner loop.
+            var layerTints: [PlatformColor] = []
+            for layer in dodecahedronEdgeLayers {
+                let brightness = CGFloat(
+                    layer.baseBrightness
+                    + (layer.peakBrightness - layer.baseBrightness) * pulse
+                )
+                let hdrBoost = CGFloat(
+                    layer.baseHdrBoost
+                    + (layer.peakHdrBoost - layer.baseHdrBoost) * pulse
+                )
+                layerTints.append(PlatformColor.hdrColor(
+                    hue: hue,
+                    saturation: saturation,
+                    brightness: brightness,
+                    hdrBoost: hdrBoost
+                ))
+            }
+            for edge in skeleton.children {
+                guard let layerComp = edge.components[DodecahedronEdgeLayerComponent.self],
+                      let model = edge as? ModelEntity,
+                      var modelComp = model.components[ModelComponent.self],
+                      var mat = modelComp.materials.first as? UnlitMaterial
+                else { continue }
+                let layerIdx = layerComp.layerIndex
+                guard layerIdx < layerTints.count else { continue }
+                mat.color = .init(tint: layerTints[layerIdx])
+                modelComp.materials[0] = mat
+                model.components.set(modelComp)
+            }
+        }
+
+        // Sync the sparkle container's Y rotation with the disco ball
+        // so sparkles ride along with the lit-cell grid they're
+        // aligned to. Both share `state.discoBallAngle`.
+        let sparkleContainer = root.children.first(where: {
+            $0.components.has(DodecahedronSparkleContainerComponent.self)
+        })
+        if let sparkleContainer {
+            sparkleContainer.orientation = simd_quatf(
+                angle: state.discoBallAngle,
+                axis: SIMD3<Float>(0, 1, 0)
+            )
+            for child in sparkleContainer.children {
+                guard let sp = child.components[DodecahedronSparkleComponent.self] else { continue }
+                let phaseWave = 0.5 + 0.5 * sin(sparkleTime + sp.phase)
+                let twinkle = state.sparkleEnergy * phaseWave * twinkleScale
+                let shimmer = shimmerBase * phaseWave
+                let opacity = min(1.0, twinkle + shimmer)
+                child.components.set(OpacityComponent(opacity: opacity))
+                child.scale = SIMD3<Float>(repeating: sparkleScale)
+            }
+        }
+
+        // ---- Disco-ball update (RCP shader graph → BeatPulse uniform) ---
+        // Single setParameter per tick fades all lit cells together via
+        // the shader's emissive math. Cost: one entity lookup, one
+        // material struct mutation, one component set.
+        //
+        // No confidence gate: the trigger source is `bandOnset[sub]`
+        // (kick onsets) which is direct energy-detection — it either
+        // fires or it doesn't, no "tracker uncertainty" concept like
+        // beatTrigger had. Pulses always reach the shader; if there's
+        // no kick, the envelope decays and the cells go dark naturally.
+        let effectivePulse = state.beatPulseEnergy
+        let discoBall = root.children.first(where: {
+            $0.components.has(DodecahedronDiscoBallComponent.self)
+        })
+        if let discoBall {
+            // Slow Y rotation, accumulated in state.discoBallAngle. Note
+            // the entity also has scale.y = -1 (winding flip), so a
+            // pure-Y rotation here composes fine — Y-axis rotation
+            // commutes with Y-axis scale.
+            discoBall.orientation = simd_quatf(
+                angle: state.discoBallAngle,
+                axis: SIMD3<Float>(0, 1, 0)
+            )
+            setDiscoBallFloat(discoBall, name: "BeatPulse", value: effectivePulse)
+
+            // Per-tick LitColor: blend mood-tinted base with the
+            // currently-dominant pitch hue. The disco ball flashes the
+            // color of whichever pitch class is leading the mix, with
+            // the mood undertone preserved. Dominant pitch comes from
+            // the smoothed high-mid chromagram (lead band, normalized).
+            var dom = 0
+            var domW: Float = 0
+            for k in 0..<12 where state.smoothedHighMidChroma[k] > domW {
+                domW = state.smoothedHighMidChroma[k]
+                dom = k
+            }
+            let pitchHue = CGFloat(PitchClass(rawValue: dom)?.circleOfFifthsHue ?? 0.5)
+            let pitchColor = PlatformColor.hdrColor(
+                hue: pitchHue, saturation: 0.5,
+                brightness: 1.0, hdrBoost: 1.0
+            )
+            let moodColor = discoBallLitColor(happiness: happinessOverride)
+            let blended = blendColors(
+                moodColor, pitchColor,
+                weight: discoBallChromaBlendWeight
+            )
+            setDiscoBallColor(discoBall, name: "LitColor", color: blended)
+
+            // Energy-driven LIT roughness — sharper reflections when
+            // the song is intense, softer when it's quiet. Combined
+            // energy = 0.6 × tempoT + 0.4 × normalized loudness, so
+            // the BASE roughness tracks the song's BPM character and
+            // dynamic peaks (loud chorus) push it sharper still on
+            // top. `smoothedLoudness × 4` is a rough normalization —
+            // peak music loudness ≈ 0.25 → 1.0 after the multiplier.
+            // Mirror cells are unaffected (shader fallback = 1.0).
+            let loudnessEnergy = min(1.0, state.smoothedLoudness * 4.0)
+            let combinedEnergy = 0.6 * tempoT + 0.4 * loudnessEnergy
+            let litRoughness = discoBallLitRoughnessSlow
+                + (discoBallLitRoughnessFast - discoBallLitRoughnessSlow) * combinedEnergy
+            setDiscoBallFloat(discoBall, name: "LitRoughness", value: litRoughness)
         }
 
         // ---- Mood-driven palette refresh ----
-        // Sparkle pool + shockwave colors track the `happinessOverride`.
-        // We update materials only when the value CHANGES (per Shazam
-        // lookup that returns a happiness, or per track change to nil)
-        // rather than every tick — material replacement triggers a
-        // render-pipeline update each time, and there's no reason to
-        // pay that cost every frame for a value that only changes on
-        // song boundaries.
+        // Sparkle pool color tracks `happinessOverride`. Updated only
+        // when the value CHANGES (per Shazam lookup that returns a
+        // happiness, or per track change to nil) rather than every
+        // tick — material replacement triggers a render-pipeline
+        // update each time, and there's no reason to pay that cost
+        // every frame for a value that only changes on song boundaries.
         if state.lastAppliedHappiness != happinessOverride {
             let sparkleTint = sparkleColor(happiness: happinessOverride)
-            let shockwaveTint = shockwaveColor(happiness: happinessOverride)
-            for child in rotator.children {
-                if child.components.has(DodecahedronShockwaveComponent.self) {
-                    updateUnlitTint(child, color: shockwaveTint)
-                } else if child.components.has(DodecahedronSparkleComponent.self) {
+            // Sparkles live in `sparkleContainer` (cell-aligned on the
+            // disco ball's inner surface), not under the rotator.
+            if let sparkleContainer {
+                for child in sparkleContainer.children
+                    where child.components.has(DodecahedronSparkleComponent.self) {
                     updateUnlitTint(child, color: sparkleTint)
                 }
             }
+            // Disco-ball LitColor is now blended with the chromagram
+            // pitch hue per-tick (see the disco-ball apply block above),
+            // so no per-song-boundary push is needed — happinessOverride
+            // is folded in via discoBallLitColor() inside the per-tick
+            // blend each frame.
             state.lastAppliedHappiness = happinessOverride
+        }
+
+        // Vocal sparkle cloud update: walk each particle, set its
+        // material tint to (vocals-hue × global-intensity ×
+        // per-particle twinkle). Additive blend means black tint =
+        // invisible, brighter tint = brighter. Heavy gain (×8) so
+        // the cloud goes from black to dazzling within a song — the
+        // previous halo's ×4.5 was too subtle for the design intent.
+        if let auraContainer = root.children.first(
+            where: { $0.components[DodecahedronVocalAuraComponent.self] != nil }
+        ) {
+            // Dominant vocal pitch → hue.
+            var domIdx = 0
+            var domVal = state.smoothedVocalsChroma[0]
+            for k in 1..<12 where state.smoothedVocalsChroma[k] > domVal {
+                domVal = state.smoothedVocalsChroma[k]
+                domIdx = k
+            }
+            let pitchHue = PitchClass(rawValue: domIdx)?.circleOfFifthsHue ?? 0
+            // Global intensity (vocals loudness curve, more aggressive
+            // than before).
+            let globalIntensity = min(1.0, Float(state.smoothedVocalsLoudness * 8.0))
+            if globalIntensity > 0.005 {
+                // Drive each particle's twinkle. Use `clock` (song
+                // playback time, monotonic) as the phase advance so
+                // sparkles animate at consistent speed regardless
+                // of frame rate.
+                let songTime = Float(clock)
+                for sparkle in auraContainer.children {
+                    guard
+                        let cfg = sparkle.components[DodecahedronVocalSparkleComponent.self],
+                        let model = (sparkle as? ModelEntity)?.model,
+                        var mat = model.materials.first as? UnlitMaterial
+                    else { continue }
+                    // sin(phase + t × frequency × 2π) lives in [-1, 1];
+                    // halve+offset to [0, 1]; multiply by global. Per-
+                    // particle frequencies differ so they sparkle out
+                    // of phase, reading as a busy shimmer.
+                    let twinkle = (sin(cfg.phase + songTime * cfg.frequency * 2 * .pi) * 0.5) + 0.5
+                    let particleIntensity = globalIntensity * twinkle
+                    let tint = PlatformColor.hdrColor(
+                        hue: CGFloat(pitchHue),
+                        saturation: 0.7,
+                        brightness: 1.0,
+                        hdrBoost: CGFloat(3.0 * particleIntensity)
+                    )
+                    mat.color = .init(tint: tint)
+                    (sparkle as? ModelEntity)?.model?.materials = [mat]
+                }
+            } else {
+                // Cloud invisible — zero out any lingering particles.
+                for sparkle in auraContainer.children {
+                    guard
+                        let model = (sparkle as? ModelEntity)?.model,
+                        var mat = model.materials.first as? UnlitMaterial,
+                        mat.color.tint != .black
+                    else { continue }
+                    mat.color = .init(tint: .black)
+                    (sparkle as? ModelEntity)?.model?.materials = [mat]
+                }
+            }
         }
 
         root.components.set(state)

@@ -1,0 +1,144 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+# Vocal-aura halo material. Renders the dodec's surrounding torus as
+# a misty glow that's brightest along the tube's center line and
+# fades softly to transparent at the tube's edges — much more
+# halo-like than a uniformly-colored surface.
+#
+# Exposed parameters (settable from Swift via setParameter):
+#   Intensity  : 0..1 — overall brightness/opacity of the halo.
+#                Drives smoothedVocalsLoudness through a curve in
+#                the dodec animate-tick.
+#   TintColor  : RGB color — already-HDR-boosted hue from the
+#                vocals chromagram's dominant pitch. Swift composes
+#                it via PlatformColor.hdrColor so the shader doesn't
+#                need an HSV→RGB node (which isn't in the verified
+#                MaterialX node set).
+#
+# Per-fragment computation:
+#   1. Read UV.y (we use the torus's minor-axis V to map across the
+#      tube cross-section: V=0 / V=1 at edges, V=0.5 at center).
+#   2. Falloff = 1 - 4 × (V - 0.5)² — parabolic bell peaked at V=0.5.
+#      Smooth without needing smoothstep, which isn't in the
+#      verified node set either.
+#   3. FinalIntensity = Intensity × Falloff.
+#   4. Emissive  = TintColor × FinalIntensity.
+#   5. Opacity   = FinalIntensity (alpha-blends to invisible at
+#      tube edges and during instrumental breaks).
+#
+# v1 — no noise yet. The edge falloff alone gives a soft halo;
+# adding animated noise for "moving mist" is a natural follow-up
+# (would need ND_noise2d_float / ND_time_float, both of which need
+# verification against this RCP version's allowed nodes).
+def Xform "Root"
+{
+    def Material "VocalAuraMaterial"
+    {
+        # ---- Exposed parameters ----
+        float inputs:Intensity = 0.0
+        color3f inputs:TintColor = (1.0, 1.0, 1.0)
+
+        token outputs:mtlx:surface.connect = </Root/VocalAuraMaterial/PreviewSurface.outputs:out>
+        token outputs:realitykit:vertex
+        token outputs:surface
+
+        # ---- Surface output ----
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "ND_UsdPreviewSurface_surfaceshader"
+            color3f inputs:diffuseColor = (0, 0, 0)
+            color3f inputs:emissiveColor.connect = </Root/VocalAuraMaterial/EmissiveCalc.outputs:out>
+            float inputs:opacity.connect = </Root/VocalAuraMaterial/FinalIntensity.outputs:out>
+            float inputs:metallic = 0
+            float inputs:roughness = 1
+            token outputs:out
+        }
+
+        # ---- Edge falloff via UV ----
+        def Shader "UV"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            int inputs:index = 0
+            float2 outputs:out
+        }
+
+        def Shader "SeparateUV"
+        {
+            uniform token info:id = "ND_separate2_vector2"
+            float2 inputs:in.connect = </Root/VocalAuraMaterial/UV.outputs:out>
+            float outputs:outx
+            float outputs:outy
+        }
+
+        # V - 0.5 → centered around 0, range [-0.5, 0.5]
+        def Shader "DeltaV"
+        {
+            uniform token info:id = "ND_subtract_float"
+            float inputs:in1.connect = </Root/VocalAuraMaterial/SeparateUV.outputs:outy>
+            float inputs:in2 = 0.5
+            float outputs:out
+        }
+
+        # DeltaV² → always positive, peaks at 0.25 at edges
+        def Shader "DeltaSq"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/VocalAuraMaterial/DeltaV.outputs:out>
+            float inputs:in2.connect = </Root/VocalAuraMaterial/DeltaV.outputs:out>
+            float outputs:out
+        }
+
+        # Scale by 4 → peaks at 1.0 at tube edges, 0 at center
+        def Shader "DeltaSqScaled"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/VocalAuraMaterial/DeltaSq.outputs:out>
+            float inputs:in2 = 4.0
+            float outputs:out
+        }
+
+        # Falloff = 1 - DeltaSqScaled → 1.0 at tube center, 0 at edges
+        def Shader "Falloff"
+        {
+            uniform token info:id = "ND_subtract_float"
+            float inputs:in1 = 1.0
+            float inputs:in2.connect = </Root/VocalAuraMaterial/DeltaSqScaled.outputs:out>
+            float outputs:out
+        }
+
+        # FinalIntensity = Intensity × Falloff
+        # Used both as opacity (alpha) and as the scalar for emissive.
+        def Shader "FinalIntensity"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/VocalAuraMaterial.inputs:Intensity>
+            float inputs:in2.connect = </Root/VocalAuraMaterial/Falloff.outputs:out>
+            float outputs:out
+        }
+
+        # FinalIntensity broadcast into a color3 so we can multiply
+        # by TintColor (no scalar-color multiply in the verified set).
+        def Shader "IntensityColor"
+        {
+            uniform token info:id = "ND_combine3_color3"
+            float inputs:in1.connect = </Root/VocalAuraMaterial/FinalIntensity.outputs:out>
+            float inputs:in2.connect = </Root/VocalAuraMaterial/FinalIntensity.outputs:out>
+            float inputs:in3.connect = </Root/VocalAuraMaterial/FinalIntensity.outputs:out>
+            color3f outputs:out
+        }
+
+        # Emissive = TintColor × FinalIntensity (per-channel)
+        def Shader "EmissiveCalc"
+        {
+            uniform token info:id = "ND_multiply_color3"
+            color3f inputs:in1.connect = </Root/VocalAuraMaterial.inputs:TintColor>
+            color3f inputs:in2.connect = </Root/VocalAuraMaterial/IntensityColor.outputs:out>
+            color3f outputs:out
+        }
+    }
+}

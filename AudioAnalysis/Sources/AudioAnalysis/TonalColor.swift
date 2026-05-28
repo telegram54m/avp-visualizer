@@ -6,7 +6,7 @@ import Foundation
 /// classifying the music into a named key — which proved unreliable — it maps
 /// the full chromagram directly into a color that is consistent and
 /// expressive for any given clip.
-public struct TonalColor: Sendable, Equatable {
+public struct TonalColor: Sendable, Equatable, Codable {
 
     /// Position on the color wheel, 0...1.
     public let hue: Double

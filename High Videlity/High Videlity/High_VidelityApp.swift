@@ -15,6 +15,19 @@ struct High_VidelityApp: App {
 
     init() {
         ShardComponent.registerComponent()
+        // Pull any new cache records (alignment offsets + song
+        // metadata) the user accumulated on other Apple devices into
+        // local UserDefaults. Fire and forget; all read paths remain
+        // local-first so this can take its time without blocking
+        // anything. See [[CloudCacheSync]].
+        Task.detached(priority: .utility) {
+            await CloudCacheSync.shared.bootstrapSync()
+        }
+        // Both `runSelfTest()` (private DB) and `runPublicSelfTest()`
+        // (public DB) are still wired in DEBUG (see CloudCacheSync.swift)
+        // — call them manually from a debug hook if the wiring ever
+        // needs re-verifying. Both have been seen to PASS on real
+        // launches; auto-firing on every launch is wasteful.
     }
 
     var body: some SwiftUI.Scene {

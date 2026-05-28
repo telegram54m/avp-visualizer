@@ -103,7 +103,18 @@ struct AmbientRootComponent: Component {
     /// far and away the most common time signature in popular music;
     /// 3/4 tracks will get an off-rotating "phantom downbeat" but
     /// that's an acceptable degradation vs. doing real meter detection.
+    /// Also doubles as the SUB-GROUP INDEX for drum-driven star
+    /// blooms — see `applyStarfieldState` for the 4-way partition.
     var beatCounter: Int = 0
+    /// Sub-group cursor for the drum-half stars when the beat tracker
+    /// is NOT confident (onset-fallback path). Cycles 0..3 on each
+    /// onset so consecutive onsets bloom different sub-groups,
+    /// creating the "dancing across the sky" effect rather than
+    /// random scatter.
+    var drumOnsetSubGroup: Int = 0
+    /// Sub-group cursor for the vocal-half stars. Cycles 0..3 on
+    /// each vocal onset.
+    var vocalOnsetSubGroup: Int = 0
     /// Smoothed harmonic complexity (raw signal is twitchy). Drives
     /// star saturation — simple monophonic passages → stars stay
     /// cool-white; dense harmonized passages → stars take on more
@@ -137,6 +148,17 @@ struct AmbientRootComponent: Component {
     /// jitter. Reset on track-change so a new song doesn't start by
     /// lerping out of the previous song's tint.
     var smoothedWaterRGB: SIMD3<Float> = .init(0.2, 0.5, 0.8)
+    /// Smoothed vocals-stem loudness — drives a brightness + HDR-boost
+    /// multiplier on the starfield so stars "wake up" during vocal
+    /// sections and settle during instrumental breaks. Stays 0 when no
+    /// vocals stem is loaded (no full-mix fallback — the design intent
+    /// is "stars sing with the voice," not "stars react to volume").
+    var smoothedVocalsLoudness: Float = 0
+    /// Smoothed vocals-stem chromagram. When vocals are active, dominant
+    /// pitch overrides the starfield's "other"-stem chromagram so the
+    /// star tint specifically tracks the vocal melody. Falls back to
+    /// the existing other-stem chromagram tinting when no vocals.
+    var smoothedVocalsChroma: [Float] = .init(repeating: 0, count: 12)
 }
 
 /// State for one of the 12 wedge tile entities. Carries:
@@ -247,6 +269,33 @@ struct AmbientStarfieldComponent: Component {
 /// signal as the starfield (timbre + onset pulse).
 struct AmbientStarlightComponent: Component {}
 
+/// Marker tag for the bass-ripple pool container — the parent entity
+/// holding all `AmbientBassRippleComponent`-tagged rings. Used by
+/// animate() to locate the pool via `root.children.first(where:)`.
+struct AmbientBassRipplePoolComponent: Component {}
+
+/// Per-ring state for the bass-onset ripple effect (Phase 2 option D).
+/// Each ring in the pool starts `active=false` and is claimed by an
+/// incoming bass onset. Shimmer + non-uniformity params are baked at
+/// spawn so each ripple has a unique signature across its life.
+struct AmbientBassRippleComponent: Component {
+    var active: Bool
+    var age: Float
+    var lifetime: Float
+    var hue: CGFloat
+    /// Y-yaw at spawn (radians, 0…2π). Per-ripple random so the
+    /// textured wobble lands in a different orientation each time.
+    var spawnYaw: Float
+    /// Slow yaw drift (radians/sec, ±0.20). The ring rotates gently
+    /// over its life — shimmer-on-the-water cue without breaking
+    /// the "wave traveling outward" reading.
+    var yawRate: Float
+    /// Phase offset for the brightness twinkle sin wave (0…2π).
+    var twinklePhase: Float
+    /// Per-ripple random seed for non-uniform XZ stretch.
+    var stretchSeed: Float
+}
+
 enum AmbientVisualizer {
 
     // MARK: - Tuning constants
@@ -324,7 +373,12 @@ enum AmbientVisualizer {
 
     /// Star dome. Upper hemisphere only (y > 0 in dome-local coords).
     /// Larger radius than v1's 12m so stars feel genuinely distant.
-    static let starCount = 300
+    /// Total star instances in the sky dome. Doubled from 300 →
+    /// 600 (2026-05-27) so the field can be partitioned: when stems
+    /// are loaded, indices [0, starCount/2) bloom on drum onsets,
+    /// and indices [starCount/2, starCount) bloom on vocals onsets.
+    /// Without stems all 600 react to full-mix onsets as before.
+    static let starCount = 600
     static let starDomeRadius: Float = 25.0
     /// Star particle billboard size.
     static let starSize: Float = 0.05
@@ -394,6 +448,43 @@ enum AmbientVisualizer {
     /// between beats.
     static let starPulseBump: Float = 1.0
     static let starPulseDecay: Float = 1.5
+
+    /// Bass ripple wave tuning (Phase 2 option D, v2). Single wave
+    /// (pool size 1) — each bass onset RESETS the active wave to age
+    /// zero, so the visual is always "one wave from center" rather
+    /// than concentric rings stacking. Thick annulus (innerRatio
+    /// 0.55 → 45% radial thickness) reads as a soft wave front, not
+    /// a hairline. Bright HDR-boosted color = bass dominant pitch.
+    /// Concurrent ripples — each bass onset claims an inactive ring.
+    /// Pool size 6 supports ~2 onsets per second sustained with a
+    /// 3-second lifetime (peak concurrency ~6). When the pool is
+    /// saturated, new onsets are dropped this tick rather than
+    /// overwriting in-flight waves.
+    static let bassRipplePoolSize: Int = 6
+    /// Annulus helper params (currently unused — sphere is the active
+    /// shape). Kept so a textured-disk approach can be revisited.
+    static let bassRippleSegments: Int = 96
+    static let bassRippleInnerRatio: Float = 0.30
+    /// Disk scales from `startScale` to `endScale` over `lifetime`.
+    /// The texture's bright ring sits at 80% of the disk radius, so
+    /// at peak scale 20 the ring reaches ~16m — the horizon-glow
+    /// radius. Wave persists at near-full brightness for most of
+    /// its travel (hold-then-fade curve in the per-tick handler),
+    /// only dimming as it approaches the horizon.
+    static let bassRippleStartScale: Float = 0.5
+    static let bassRippleEndScale: Float = 20.0
+    static let bassRippleLifetime: Float = 5.5
+    /// Starting brightness — dialed well down so the wave reads as a
+    /// quiet moonlit shimmer that lingers, not an HDR slam.
+    static let bassRippleStartOpacity: Float = 0.17
+    /// Height: just above water surface (water at y=-1.60, caustics
+    /// at y=-1.42). Ring above caustics in sort group too.
+    static let bassRippleHeight: Float = -1.40
+    /// Saturation — bumped 0.42 → 0.62 so the bass-pitch tint is
+    /// clearly readable as color (not just a hint) while the water's
+    /// blue still dominates the overall lake palette.
+    static let bassRippleSaturation: CGFloat = 0.62
+    static let bassRippleHdrBoost: CGFloat = 1.0
 
     /// Lake-highlight onset pulse — uniform across all starlight tiles,
     /// like a sheen-pulse across the water surface on each beat. Kept
@@ -696,6 +787,59 @@ enum AmbientVisualizer {
         let caustics = await buildCaustics()
         assignSortOrder(caustics, 4)
         root.addChild(caustics)
+
+        // Bass ripple pool (Phase 2 option D, v3) — flat disk at
+        // water level with a RADIAL ALPHA TEXTURE peaking at ~0.80
+        // normalized radius. As the disk scales up, the textured
+        // ring traces outward across the lake.
+        //
+        // Why textured disk: a flat geometric ring is invisible at
+        // Ambient's near-horizon camera angle (heavy foreshortening).
+        // A textured disk solves this the same way wedge tiles do —
+        // the texture's soft alpha falloff makes the ring read as a
+        // generous band of light even at oblique viewing angles,
+        // and the disk stays "on the water" (not floating mid-air
+        // like the sphere attempt that read as a glowing orb).
+        //
+        // Additive blend so the ring color glows over the cyan
+        // water + caustics underneath.
+        var addDescriptor = UnlitMaterial.Program.Descriptor()
+        addDescriptor.blendMode = .add
+        let additiveProgram = await UnlitMaterial.Program(
+            descriptor: addDescriptor
+        )
+        let ripplePool = Entity()
+        ripplePool.components.set(AmbientBassRipplePoolComponent())
+        ripplePool.position = SIMD3<Float>(0, bassRippleHeight, 0)
+        // Unit-radius disk — entity.scale controls visible size.
+        let ringMesh = makeDiskMesh(radius: 1.0, segments: 48)
+        let ringTexture = sharedRippleRingTexture()
+        // Annulus helper still authored — keep for future use.
+        _ = bassRippleInnerRatio
+        _ = bassRippleSegments
+        for _ in 0..<bassRipplePoolSize {
+            var ringMat = UnlitMaterial(program: additiveProgram)
+            ringMat.color = .init(
+                tint: PlatformColor.white, texture: .init(ringTexture)
+            )
+            ringMat.writesDepth = false
+            let ring = ModelEntity(mesh: ringMesh, materials: [ringMat])
+            ring.scale = SIMD3<Float>(repeating: bassRippleStartScale)
+            ring.isEnabled = false
+            ring.components.set(AmbientBassRippleComponent(
+                active: false,
+                age: 0,
+                lifetime: bassRippleLifetime,
+                hue: 0,
+                spawnYaw: 0,
+                yawRate: 0,
+                twinklePhase: 0,
+                stretchSeed: 0
+            ))
+            assignSortOrder(ring, 5)
+            ripplePool.addChild(ring)
+        }
+        root.addChild(ripplePool)
 
         var state = AmbientRootComponent()
         state.lastFrameIndex = -1
@@ -1518,8 +1662,48 @@ enum AmbientVisualizer {
         clock: Double,
         frames: [FeatureFrame],
         deltaTime: Double,
-        appResetCounter: Int = -1
+        appResetCounter: Int = -1,
+        stemFeatures: StemSeparationResult? = nil
     ) {
+        // Phase 1 stem-aware signal extractors (2026-05-27 port). When
+        // stems are loaded, each existing signal site reads the cleaner
+        // stem-isolated value; otherwise falls back to the full-mix
+        // feature so the visualizer still works for songs without
+        // cached stems. Mapping rationale:
+        //   • chromagram  ← stems["other"]  — melody/harmony content
+        //     drives wedges, water tint, horizon, caustics. Removes
+        //     bass + drum noise from the pitch read.
+        //   • onset       ← stems["drums"]  — beat-locked twinkles
+        //     only fire on actual percussion, not vocal attacks or
+        //     bass plucks.
+        //   • loudness    ← stems["other"]  — sparkleAmount + breath
+        //     + horizon brightness track the melodic content's
+        //     dynamics, matching the wedges' pitch source.
+        // `timbreBrightness`, `harmonicComplexity`, and beat.beatTrigger
+        // remain full-mix — no stem produces them and they're
+        // semantically about the whole signal anyway.
+        let otherChromaTimeline = stemFeatures?.stems["other"]?.chromagram
+        let otherLoudnessTimeline = stemFeatures?.stems["other"]?.loudness
+        let drumsOnsetTimeline = stemFeatures?.stems["drums"]?.onset
+        func chromagram(at k: Int) -> [Float] {
+            if let other = otherChromaTimeline,
+               k < other.count, other[k].count == 12 {
+                return other[k]
+            }
+            return frames[k].chromagram
+        }
+        func loudness(at k: Int) -> Float {
+            if let other = otherLoudnessTimeline, k < other.count {
+                return other[k]
+            }
+            return frames[k].loudness
+        }
+        func onset(at k: Int) -> Bool {
+            if let drums = drumsOnsetTimeline, k < drums.count {
+                return drums[k]
+            }
+            return frames[k].onset
+        }
         guard var state = root.components[AmbientRootComponent.self] else { return }
         guard !frames.isEmpty else { return }
 
@@ -1540,6 +1724,8 @@ enum AmbientVisualizer {
             state.trailingIntensity = 0
             state.smoothedComplexity = 0
             state.beatCounter = 0
+            state.drumOnsetSubGroup = 0
+            state.vocalOnsetSubGroup = 0
             state.lastBurstTime = -1000
             // Reset drift clock too — tiles would otherwise teleport to
             // wherever the sin curve happens to be at reset time. Restart
@@ -1560,12 +1746,14 @@ enum AmbientVisualizer {
         // First-tick init / post-reset re-seed — snap smoothed values to
         // current frame's signal.
         if state.firstAnimateTick {
+            let initialChroma = chromagram(at: i)
             for k in 0..<12 {
-                state.smoothedChromagram[k] = f.chromagram[k]
+                state.smoothedChromagram[k] = initialChroma[k]
             }
-            state.smoothedLoudness = f.loudness
+            let initialLoud = loudness(at: i)
+            state.smoothedLoudness = initialLoud
             state.smoothedTimbre = f.timbreBrightness
-            state.slowLoudness = f.loudness
+            state.slowLoudness = initialLoud
             state.songIntensity = max(0, min(1,
                 state.slowLoudness * intensityScale))
             state.trailingIntensity = state.songIntensity
@@ -1605,11 +1793,53 @@ enum AmbientVisualizer {
         // confidence is low we fall back to onset-driven bloom.
         var newBeatTriggerCount = 0
         var latestBeatConfidence: Float = 0
+        // Bass-stem onset accumulation for the ripple pool (Phase 2
+        // option D). Captured here so the per-tick pool update below
+        // can claim rings on each new onset. Each entry is (hue) at
+        // the onset frame — extracted from bass.chromagram dominant
+        // pitch. Empty when no bass stem is loaded.
+        var bassRippleSpawnHues: [CGFloat] = []
+        let bassOnsetTimeline = stemFeatures?.stems["bass"]?.onset
+        let bassChromaTimeline = stemFeatures?.stems["bass"]?.chromagram
+
+        // Vocal-stem onset accumulation for the starfield split
+        // (2026-05-27). When stems are loaded, vocal onsets drive
+        // the second half of the star instances; drum/full-mix
+        // onsets drive the first half. Empty when no vocals stem.
+        var newVocalOnsetCount = 0
+        let vocalsOnsetTimeline = stemFeatures?.stems["vocals"]?.onset
+        let hasVocalsStem = vocalsOnsetTimeline != nil
+
         if state.lastFrameIndex < i {
             let start = max(0, state.lastFrameIndex + 1)
             for k in start...i {
-                if frames[k].onset && frames[k].loudness > onsetLoudnessGate {
-                    let chroma = frames[k].chromagram
+                // Bass ripple spawning — independent of the main onset
+                // gate so it tracks bass even when the full-mix
+                // detector misses. With pool size 1 the wave resets
+                // on each bass hit (always one wave-from-center at a
+                // time). Multiple onsets in one tick collapse to the
+                // latest hue — fine because the visible result of two
+                // onsets 33ms apart is identical to the latest one.
+                if let bassOnsets = bassOnsetTimeline,
+                   k < bassOnsets.count, bassOnsets[k],
+                   loudness(at: k) > onsetLoudnessGate {
+                    var hue: CGFloat = 0
+                    if let bassChroma = bassChromaTimeline,
+                       k < bassChroma.count, bassChroma[k].count == 12 {
+                        var domBin = 0
+                        var domVal: Float = -1
+                        for j in 0..<12 where bassChroma[k][j] > domVal {
+                            domVal = bassChroma[k][j]
+                            domBin = j
+                        }
+                        hue = CGFloat(
+                            (PitchClass(rawValue: domBin) ?? .c).circleOfFifthsHue
+                        )
+                    }
+                    bassRippleSpawnHues.append(hue)
+                }
+                if onset(at: k) && loudness(at: k) > onsetLoudnessGate {
+                    let chroma = chromagram(at: k)
                     var dominant = 0
                     var best: Float = -1
                     for j in 0..<12 where chroma[j] > best {
@@ -1624,6 +1854,15 @@ enum AmbientVisualizer {
                 }
                 if frames[k].beat.beatTrigger {
                     newBeatTriggerCount += 1
+                }
+                // Vocal onset accumulation — independent of the
+                // main onset gate so vocals fire even when drums
+                // are quiet, but still gated on overall loudness
+                // so silent-with-noise intros don't fire phantoms.
+                if let vocalsOnsets = vocalsOnsetTimeline,
+                   k < vocalsOnsets.count, vocalsOnsets[k],
+                   loudness(at: k) > onsetLoudnessGate {
+                    newVocalOnsetCount += 1
                 }
             }
             latestBeatConfidence = frames[i].beat.confidence
@@ -1641,22 +1880,53 @@ enum AmbientVisualizer {
         // Smooth chromagram bin weights toward the current frame's
         // per-bin-max-normalized values. Normalizing makes streak/wedge
         // intensities feel consistent regardless of how loud the song is.
-        let chromaMax = f.chromagram.max() ?? 1
+        let currentChroma = chromagram(at: i)
+        let chromaMax = currentChroma.max() ?? 1
         let chromaNorm = chromaMax > 0.0001 ? chromaMax : 1
         let chromaLerp = Float(min(1.0, deltaTime * Double(chromaLerpRate)))
         for k in 0..<12 {
-            let normalized = f.chromagram[k] / chromaNorm
+            let normalized = currentChroma[k] / chromaNorm
             state.smoothedChromagram[k] +=
                 (normalized - state.smoothedChromagram[k]) * chromaLerp
         }
 
         // Smooth loudness + timbre.
+        let currentLoud = loudness(at: i)
         let loudLerp = Float(min(1.0, deltaTime * Double(loudnessLerpRate)))
         state.smoothedLoudness +=
-            (f.loudness - state.smoothedLoudness) * loudLerp
+            (currentLoud - state.smoothedLoudness) * loudLerp
         let timbreLerp = Float(min(1.0, deltaTime * Double(timbreLerpRate)))
         state.smoothedTimbre +=
             (f.timbreBrightness - state.smoothedTimbre) * timbreLerp
+
+        // Vocals stem smoothing (Phase 2 option B). Loudness drives a
+        // brightness boost on the starfield; chromagram tints star hue
+        // when vocals are present. Faster lerp (4 Hz) on loudness so
+        // the cloud snaps onto entries / exits, slower lerp (3 Hz) on
+        // chroma so the hue settles without strobing. No fallback:
+        // when no vocals stem is loaded both decay to zero quickly so
+        // the starfield reverts to its current behavior.
+        if let vocalsLoud = stemFeatures?.stems["vocals"]?.loudness,
+           i < vocalsLoud.count {
+            let vocLerp = Float(min(1.0, deltaTime * 4.0))
+            state.smoothedVocalsLoudness +=
+                (vocalsLoud[i] - state.smoothedVocalsLoudness) * vocLerp
+        } else {
+            state.smoothedVocalsLoudness *= 0.85
+        }
+        if let vocalsChroma = stemFeatures?.stems["vocals"]?.chromagram,
+           i < vocalsChroma.count, vocalsChroma[i].count == 12 {
+            let vocChroma = vocalsChroma[i]
+            let vocChromaMax = max(0.0001, vocChroma.max() ?? 0.0001)
+            let vocChromaLerp = Float(min(1.0, deltaTime * 3.0))
+            for k in 0..<12 {
+                let normalized = vocChroma[k] / vocChromaMax
+                state.smoothedVocalsChroma[k] +=
+                    (normalized - state.smoothedVocalsChroma[k]) * vocChromaLerp
+            }
+        } else {
+            for k in 0..<12 { state.smoothedVocalsChroma[k] *= 0.85 }
+        }
 
         // Song-section intensity — much slower EMA of loudness (~10 s
         // settle time) so it reads as the song's energy arc rather
@@ -1665,7 +1935,7 @@ enum AmbientVisualizer {
         // verses. See [[ambient]] for tuning notes.
         let slowLerp = Float(min(1.0, deltaTime * Double(slowLoudnessLerpRate)))
         state.slowLoudness +=
-            (f.loudness - state.slowLoudness) * slowLerp
+            (currentLoud - state.slowLoudness) * slowLerp
         state.songIntensity = max(0, min(1, state.slowLoudness * intensityScale))
 
         // Even-slower trailing intensity — used as reference baseline
@@ -1696,6 +1966,8 @@ enum AmbientVisualizer {
                 applyStarfieldState(child, state: &state,
                                     newOnsetCount: newOnsetCount,
                                     newBeatTriggerCount: newBeatTriggerCount,
+                                    newVocalOnsetCount: newVocalOnsetCount,
+                                    hasVocalsStem: hasVocalsStem,
                                     beatConfidence: latestBeatConfidence,
                                     deltaTime: deltaTime)
             } else if child.components[AmbientStarlightComponent.self] != nil {
@@ -1710,10 +1982,119 @@ enum AmbientVisualizer {
                 applyNebulaState(child, state: state)
             } else if child.components[AmbientHorizonGlowComponent.self] != nil {
                 applyHorizonGlowState(child, state: state)
+            } else if child.components[AmbientBassRipplePoolComponent.self] != nil {
+                applyBassRipplePoolState(
+                    child,
+                    spawnHues: bassRippleSpawnHues,
+                    deltaTime: deltaTime
+                )
             }
         }
 
         root.components.set(state)
+    }
+
+    /// Per-tick bass-ripple pool update (Phase 2 option D).
+    ///   1. Claim one inactive ring per `spawnHues` entry, set its
+    ///      age=0, capture the hue, mark active + enabled.
+    ///   2. Advance every active ring's age by `deltaTime`.
+    ///   3. For each active ring: scale lerps `startScale → endScale`,
+    ///      opacity fades `startOpacity → 0` with a decelerating
+    ///      shape (1 - t)² so the early visible part of the wave
+    ///      dominates and the long tail fades quietly.
+    ///   4. Rings whose age exceeds `lifetime` get deactivated +
+    ///      hidden so the pool can reclaim them.
+    private static func applyBassRipplePoolState(
+        _ pool: Entity,
+        spawnHues: [CGFloat],
+        deltaTime: Double
+    ) {
+        // Pool model: each bass onset claims an INACTIVE ring rather
+        // than resetting a single ring. Multiple in-flight ripples
+        // travel outward concurrently — earlier waves continue their
+        // journey to the horizon when a new onset spawns its own.
+        // When the pool is saturated (all 6 rings active), excess
+        // onsets are dropped rather than truncating an in-flight
+        // wave.
+        var spawnQueue = spawnHues
+        for child in pool.children {
+            guard var ripple = child.components[AmbientBassRippleComponent.self]
+            else { continue }
+            if !ripple.active, !spawnQueue.isEmpty {
+                ripple.active = true
+                ripple.age = 0
+                ripple.hue = spawnQueue.removeFirst()
+                // Bake per-ripple shimmer / non-uniformity params.
+                ripple.spawnYaw = Float.random(in: 0..<(2 * .pi))
+                ripple.yawRate = Float.random(in: -0.20...0.20)
+                ripple.twinklePhase = Float.random(in: 0..<(2 * .pi))
+                ripple.stretchSeed = Float.random(in: 0..<(2 * .pi))
+                child.isEnabled = true
+            }
+            if !ripple.active {
+                child.components.set(ripple)
+                continue
+            }
+            ripple.age += Float(deltaTime)
+            let t = min(1.0, ripple.age / max(0.001, ripple.lifetime))
+            if t >= 1.0 {
+                ripple.active = false
+                child.isEnabled = false
+                child.components.set(ripple)
+                continue
+            }
+            // Yaw drifts slowly over the ripple's life — shimmer-on-
+            // the-water cue. Together with the per-spawn random
+            // starting yaw, no two rings look alike at any moment.
+            let yaw = ripple.spawnYaw + ripple.yawRate * ripple.age
+            child.orientation = simd_quatf(angle: yaw, axis: [0, 1, 0])
+            // Scale lerp (linear outward). Non-uniform XZ stretch
+            // (±8%) keyed off the ripple's random stretchSeed so the
+            // ellipse is stable across this ripple's life but
+            // different from neighbouring ripples.
+            let baseScale = bassRippleStartScale
+                + (bassRippleEndScale - bassRippleStartScale) * t
+            let stretchX = 1.0 + 0.08 * sin(ripple.stretchSeed)
+            let stretchZ = 1.0 + 0.08 * cos(ripple.stretchSeed * 1.37)
+            child.scale = SIMD3<Float>(
+                baseScale * stretchX,
+                baseScale,
+                baseScale * stretchZ
+            )
+            // Brightness: HOLD-THEN-FADE + high-frequency twinkle.
+            // Hold at 1.0 for first 85% of lifetime so the wave
+            // persists nearly to the horizon, then ramps to zero
+            // over the last 15%. Twinkle is a small sin oscillation
+            // (±15% at 9 Hz) per ripple with a randomized phase —
+            // adds the "shimmer as it moves" feel.
+            let holdEnd: Float = 0.85
+            let fadeShape: Float
+            if t < holdEnd {
+                fadeShape = 1.0
+            } else {
+                let fadeT = (t - holdEnd) / (1.0 - holdEnd)
+                fadeShape = 1.0 - fadeT
+            }
+            let twinkle = 1.0 + 0.15 * sin(ripple.age * 9.0 + ripple.twinklePhase)
+            let brightness = bassRippleStartOpacity * fadeShape * twinkle
+            if let model = child as? ModelEntity,
+               var modelComp = model.components[ModelComponent.self],
+               var mat = modelComp.materials.first as? UnlitMaterial {
+                let tint = PlatformColor.hdrColor(
+                    hue: ripple.hue,
+                    saturation: bassRippleSaturation,
+                    brightness: CGFloat(brightness),
+                    hdrBoost: bassRippleHdrBoost
+                )
+                // Preserve the radial alpha texture — re-tinting
+                // without passing the existing texture would erase
+                // the ring shape and produce a solid disk again.
+                mat.color = .init(tint: tint, texture: mat.color.texture)
+                modelComp.materials[0] = mat
+                model.components.set(modelComp)
+            }
+            child.components.set(ripple)
+        }
     }
 
     /// Drive a single wedge's material from its smoothed chromagram weight
@@ -1740,15 +2121,13 @@ enum AmbientVisualizer {
         let intensity = min(1.5, chromaWeight + pulse * 0.6)
 
         // SQUARED-intensity alpha curve preserves dynamic range between
-        // dormant and active wedges. Cap raised 0.55 → 0.85 so active
-        // wedges punch through the now-tinted water surface more
-        // forcefully. Dormant wedges still nearly vanish (intensity 0
-        // → alpha 0.02 → effective center alpha ~0.015 against the
-        // 0.75 glow peak).
-        let alpha = min(0.85, 0.02 + intensity * intensity * 0.85)
-        // HDR boost bumped 0.7 → 1.1 so the peak wedge HDR-pops on a
-        // capable display rather than just maxing out at SDR white.
-        let hdrBoost: CGFloat = 1.0 + CGFloat(intensity) * 1.1
+        // dormant and active wedges. Cap stepped down twice on
+        // 2026-05-27: 0.85 → 0.72 (~15% cut) and then 0.72 → 0.58
+        // (another ~20%) to settle the wedges against the locked-in
+        // Deep Sea water tint. Dormant wedges still nearly vanish.
+        let alpha = min(0.58, 0.02 + intensity * intensity * 0.58)
+        // HDR boost stepped down in lockstep: 1.1 → 0.94 → 0.75.
+        let hdrBoost: CGFloat = 1.0 + CGFloat(intensity) * 0.75
 
         let pitchClass = PitchClass(rawValue: k) ?? .c
         // Brightness floor lifted 0.40 → 0.55, peak unchanged at 0.95.
@@ -1828,6 +2207,8 @@ enum AmbientVisualizer {
         state: inout AmbientRootComponent,
         newOnsetCount: Int,
         newBeatTriggerCount: Int,
+        newVocalOnsetCount: Int,
+        hasVocalsStem: Bool,
         beatConfidence: Float,
         deltaTime: Double
     ) {
@@ -1867,6 +2248,32 @@ enum AmbientVisualizer {
         // Bump scale: ramp from 0.5× (songEnergy=0) to 1.8× (songEnergy=1).
         let bumpScale: Float = 0.5 + songEnergy * 1.3
 
+        // Star-index partition (2026-05-27): when a vocals stem is
+        // loaded, the first half of star indices is reserved for
+        // drum/beat-driven blooms, the second half is reserved for
+        // vocal-driven blooms. Without a vocals stem, the original
+        // "all stars react to all onsets" behavior is preserved by
+        // setting `drumHalfEnd == pulses.count`.
+        let drumHalfEnd: Int = hasVocalsStem
+            ? sf.pulses.count / 2
+            : sf.pulses.count
+        let vocalHalfStart: Int = drumHalfEnd
+
+        // Each half is further subdivided into 4 SUB-GROUPS that
+        // cycle round-robin per onset (2026-05-27). Without sub-
+        // grouping, consecutive onsets bloom random scatter across
+        // the whole half — successive onsets visually blur together.
+        // With sub-grouping each onset paints a different fixed-
+        // index sub-group, giving consecutive blooms distinct
+        // "where in the sky" identity. Each sub-group's stars get
+        // ~4 onsets of breathing room between hits, so individual
+        // onsets read as discrete events rather than continuous
+        // scintillation.
+        let subGroupCount = 4
+        let drumSubGroupSize = max(1, drumHalfEnd / subGroupCount)
+        let vocalHalfSize = sf.pulses.count - vocalHalfStart
+        let vocalSubGroupSize = max(1, vocalHalfSize / subGroupCount)
+
         // Chorus-drop burst detection (Tier C.2). The trailing
         // intensity is the ~30 s baseline; if current intensity
         // pulled meaningfully above that AND we're past the
@@ -1875,10 +2282,11 @@ enum AmbientVisualizer {
         let sinceLastBurst = state.elapsedTime - state.lastBurstTime
         if intensityJump > burstJumpThreshold
            && sinceLastBurst > burstRefractory {
-            // Burst — bloom ALL stars with 2× bump. Strong visual cue
-            // for the moment a song transitions into its loud section.
+            // Burst — bloom the drum half with 2× bump. Strong visual
+            // cue for chorus transitions. Vocal half handled separately
+            // by its own vocal-onset bloom path.
             let burstBump = starPulseBump * 2.0
-            for idx in 0..<sf.pulses.count {
+            for idx in 0..<drumHalfEnd {
                 sf.pulses[idx] = min(2.5, sf.pulses[idx] + burstBump)
             }
             state.lastBurstTime = state.elapsedTime
@@ -1887,12 +2295,13 @@ enum AmbientVisualizer {
         let beatLocked = beatConfidence > 0.3
         if beatLocked && newBeatTriggerCount > 0 {
             for _ in 0..<newBeatTriggerCount {
-                // Advance beat counter (mod 4) per trigger.
-                state.beatCounter = (state.beatCounter + 1) % 4
+                // Advance beat counter (mod 4) per trigger — also
+                // serves as the sub-group index this beat targets.
+                state.beatCounter = (state.beatCounter + 1) % subGroupCount
                 let isDownbeat = state.beatCounter == 0
-
-                // Downbeat: full sky + 1.5× bump multiplier.
-                // Off-beat: intensity-driven fraction at scaled bump.
+                // Within the chosen sub-group, bloom an intensity-
+                // scaled fraction. Downbeat = full sub-group at 1.5×
+                // bump; off-beat = 15–85% of sub-group at base bump.
                 let bloomFraction: Float
                 let perStarBump: Float
                 if isDownbeat {
@@ -1902,17 +2311,52 @@ enum AmbientVisualizer {
                     bloomFraction = 0.15 + songEnergy * 0.70
                     perStarBump = starPulseBump * bumpScale
                 }
-                for idx in 0..<sf.pulses.count {
+                let subStart = state.beatCounter * drumSubGroupSize
+                let subEnd = min(subStart + drumSubGroupSize, drumHalfEnd)
+                for idx in subStart..<subEnd {
                     if Float.random(in: 0..<1) < bloomFraction {
                         sf.pulses[idx] = min(2.0, sf.pulses[idx] + perStarBump)
                     }
                 }
             }
         } else if newOnsetCount > 0 {
-            let fallbackStarsPerOnset = 10
+            // Beat tracker not confident — cycle a separate counter
+            // across the drum sub-groups so consecutive onsets still
+            // paint distinct sub-groups.
+            let fallbackStarsPerOnset = 12
             for _ in 0..<newOnsetCount {
+                state.drumOnsetSubGroup =
+                    (state.drumOnsetSubGroup + 1) % subGroupCount
+                let subStart = state.drumOnsetSubGroup * drumSubGroupSize
+                let subEnd = min(subStart + drumSubGroupSize, drumHalfEnd)
+                guard subStart < subEnd else { continue }
                 for _ in 0..<fallbackStarsPerOnset {
-                    let idx = Int.random(in: 0..<sf.pulses.count)
+                    let idx = Int.random(in: subStart..<subEnd)
+                    sf.pulses[idx] = min(2.0, sf.pulses[idx] + starPulseBump)
+                }
+            }
+        }
+
+        // Vocal-driven bloom on the second half of stars (only when
+        // vocals stem is loaded — otherwise vocalHalfStart ==
+        // pulses.count and this block does nothing). Sub-group
+        // cycling mirrors the drum path: each vocal onset advances
+        // to the next of 4 vocal sub-groups so consecutive vocal
+        // hits light up different "vocal stars."
+        if hasVocalsStem && newVocalOnsetCount > 0 {
+            // Aim for ~50% of the sub-group per onset — vocals are
+            // less frequent than drums so each entry should land
+            // with more visual weight.
+            let starsPerVocalOnset = max(8, vocalSubGroupSize / 2)
+            for _ in 0..<newVocalOnsetCount {
+                state.vocalOnsetSubGroup =
+                    (state.vocalOnsetSubGroup + 1) % subGroupCount
+                let subStart = vocalHalfStart
+                    + state.vocalOnsetSubGroup * vocalSubGroupSize
+                let subEnd = min(subStart + vocalSubGroupSize, sf.pulses.count)
+                guard subStart < subEnd else { continue }
+                for _ in 0..<starsPerVocalOnset {
+                    let idx = Int.random(in: subStart..<subEnd)
                     sf.pulses[idx] = min(2.0, sf.pulses[idx] + starPulseBump)
                 }
             }
@@ -1929,17 +2373,29 @@ enum AmbientVisualizer {
         // as "barely-tinted starlight" rather than colored points).
         // The sky itself stays static — Jesse's call: only the stars
         // carry the song color.
+        //
+        // Phase 2 option B (2026-05-27): vocals stem loudness boosts
+        // both brightness and HDR so stars "wake up" during vocal
+        // sections. Multiplier ranges 1.0 (no vocals) → ~1.5 at peak.
         let timbre = state.smoothedTimbre
-        let intensity = min(1.0, 0.85 + timbre * 0.15)
-        let hdrBoost: CGFloat = 2.0 + CGFloat(intensity) * 0.8
+        let vocalsBoost = 1.0 + min(1.0, state.smoothedVocalsLoudness * 8.0) * 0.5
+        let intensity = min(1.0, (0.85 + timbre * 0.15) * vocalsBoost)
+        let hdrBoost: CGFloat = (2.0 + CGFloat(intensity) * 0.8) * CGFloat(vocalsBoost)
 
-        // Sample dominant pitch's hue for star tint. argmax of the
-        // smoothed chromagram — same source as the water surface.
+        // Sample dominant pitch's hue for star tint. When a vocals stem
+        // is active (smoothedVocalsLoudness > ~0.02), use the vocals
+        // chromagram so star color tracks the vocal melody. Otherwise
+        // fall back to the "other"-stem (or full-mix) smoothed
+        // chromagram — same source as the water surface.
+        let useVocalsForHue = state.smoothedVocalsLoudness > 0.02
+        let hueChromaSource = useVocalsForHue
+            ? state.smoothedVocalsChroma
+            : state.smoothedChromagram
         var domIdx = 0
         var domWeight: Float = 0
-        for k in 0..<state.smoothedChromagram.count
-        where state.smoothedChromagram[k] > domWeight {
-            domWeight = state.smoothedChromagram[k]
+        for k in 0..<hueChromaSource.count
+        where hueChromaSource[k] > domWeight {
+            domWeight = hueChromaSource[k]
             domIdx = k
         }
         let pitchClass = PitchClass(rawValue: domIdx) ?? .c
@@ -1971,8 +2427,15 @@ enum AmbientVisualizer {
         let complexityBoost = CGFloat(
             min(1.0, state.smoothedComplexity * 1.5)
         )
+        // When the vocals stem is driving the hue, add a flat
+        // saturation boost so the stars carry the vocal melody's
+        // color more legibly. Without this boost the saturation
+        // would top out at ~0.20 even on a strong vocal — too
+        // close to white starlight to register the color shift.
+        let vocalSatBoost: CGFloat = useVocalsForHue ? 0.22 : 0.0
         let saturation: CGFloat =
             0.05 + 0.15 * tintFactor * (0.4 + 0.6 * complexityBoost)
+            + vocalSatBoost
 
         let tint = PlatformColor.hdrColor(
             hue: hue,
@@ -2007,7 +2470,20 @@ enum AmbientVisualizer {
     /// If the material isn't a ShaderGraphMaterial (Stage A fallback to
     /// UnlitMaterial), this is a silent no-op.
     @MainActor
-    private static func applyWaterSurfaceState(_ entity: Entity, state: inout AmbientRootComponent) {
+    /// Baked Deep Sea water-tint preset (2026-05-27, locked in after
+    /// real-time A/B picker session). Blends the dominant-pitch RGB
+    /// toward this deep navy and floors `chromaMix` so the tint
+    /// shows even on silent intros / non-tonal passages. Switching
+    /// presets again would mean restoring the AmbientWaterTint enum
+    /// + HUD picker — see git history for that pattern.
+    private static let waterTintTargetRGB = SIMD3<Float>(0.03, 0.08, 0.30)
+    private static let waterTintMixWeight: Float = 0.65
+    private static let waterTintBaselineMix: Float = 0.32
+
+    private static func applyWaterSurfaceState(
+        _ entity: Entity,
+        state: inout AmbientRootComponent
+    ) {
         guard let model = entity as? ModelEntity,
               var modelComp = model.components[ModelComponent.self],
               var shader = modelComp.materials.first as? ShaderGraphMaterial
@@ -2047,7 +2523,13 @@ enum AmbientVisualizer {
         let lerp: Float = 0.04
         state.smoothedWaterRGB += (target - state.smoothedWaterRGB) * lerp
 
-        let smoothedRGB = state.smoothedWaterRGB
+        // Deep Sea water-tint blend (baked): shift the smoothed
+        // pitch-color RGB toward the navy target. The chromaMix floor
+        // below ensures the tint shows even when no song pitch is
+        // dominant.
+        var smoothedRGB = state.smoothedWaterRGB
+        smoothedRGB = smoothedRGB * (1 - waterTintMixWeight)
+            + waterTintTargetRGB * waterTintMixWeight
         let cs = CGColorSpace(name: CGColorSpace.sRGB)!
         let chromaCG = CGColor(
             colorSpace: cs,
@@ -2064,8 +2546,9 @@ enum AmbientVisualizer {
         let loudnessBoost = 1.0 + Double(loud) * 1.2
         // Final cap also dropped 33% (0.55 → 0.37) so even peak loud
         // chord on a strongly-tonal song stays subtle.
-        let chromaMix = min(0.37,
-            Double(min(1.0, domWeight)) * Double(chromaMixStrength) * loudnessBoost
+        let pitchDrivenMix = Double(min(1.0, domWeight)) * Double(chromaMixStrength) * loudnessBoost
+        let chromaMix = min(0.55,
+            max(Double(waterTintBaselineMix), pitchDrivenMix)
         )
 
         // Sparkle density driven by loudness — Stage C's audio
@@ -2271,6 +2754,52 @@ enum AmbientVisualizer {
         }
     }
 
+    /// Annulus mesh (flat ring) in the XZ plane, normal +Y. Baked at
+    /// outer radius 1.0 with thickness `1.0 - innerRatio` so the
+    /// caller controls overall size via `entity.scale`. Used by the
+    /// bass-ripple pool — each ring scales outward over its lifetime
+    /// to make the rings "expand across the lake."
+    private static func makeAnnulusMesh(innerRatio: Float, segments: Int) -> MeshResource {
+        var positions: [SIMD3<Float>] = []
+        var normals: [SIMD3<Float>] = []
+        var texCoords: [SIMD2<Float>] = []
+        var indices: [UInt32] = []
+        positions.reserveCapacity(segments * 2)
+        normals.reserveCapacity(segments * 2)
+        texCoords.reserveCapacity(segments * 2)
+        indices.reserveCapacity(segments * 6)
+        let step = (2 * Float.pi) / Float(segments)
+        for s in 0..<segments {
+            let theta = Float(s) * step
+            let c = cos(theta), si = sin(theta)
+            positions.append(SIMD3(innerRatio * c, 0, innerRatio * si))
+            positions.append(SIMD3(c, 0, si))
+            normals.append(SIMD3(0, 1, 0))
+            normals.append(SIMD3(0, 1, 0))
+            texCoords.append(SIMD2(Float(s) / Float(segments), 0))
+            texCoords.append(SIMD2(Float(s) / Float(segments), 1))
+        }
+        for s in 0..<segments {
+            let a = UInt32(s * 2)
+            let b = UInt32(s * 2 + 1)
+            let c = UInt32(((s + 1) % segments) * 2)
+            let d = UInt32(((s + 1) % segments) * 2 + 1)
+            // Two triangles per quad: (a, b, d) and (a, d, c)
+            indices.append(contentsOf: [a, b, d, a, d, c])
+        }
+        var descriptor = MeshDescriptor()
+        descriptor.positions = MeshBuffer(positions)
+        descriptor.normals = MeshBuffer(normals)
+        descriptor.textureCoordinates = MeshBuffer(texCoords)
+        descriptor.primitives = .triangles(indices)
+        do {
+            return try MeshResource.generate(from: [descriptor])
+        } catch {
+            // Fallback: trivial plane (won't read as ring; should never trigger).
+            return .generatePlane(width: 2, height: 2)
+        }
+    }
+
     /// Star sprite — small XY-plane quad facing +Z. Billboarded at runtime.
     private static func makeStarQuadMesh(size: Float) -> MeshResource {
         let h = size / 2
@@ -2307,6 +2836,84 @@ enum AmbientVisualizer {
     ///
     /// Four-stop gradient — the extra mid stop gives the alpha curve
     /// a longer plateau before the soft fade.
+    /// Radial alpha texture for the bass ripple disk — alpha peaks
+    /// near 0.80 normalized radius with **angular wobble** so the
+    /// ring is not a perfect circle. Built by direct pixel
+    /// manipulation: each pixel's effective radial position is
+    /// perturbed by two summed sine modes (5 lobes + 8 lobes at
+    /// independent phases). On spawn each ripple also gets a
+    /// random Y-rotation + small non-uniform scale so successive
+    /// ripples look distinct rather than identical.
+    @MainActor private static var cachedRippleRingTexture: TextureResource?
+    @MainActor
+    private static func sharedRippleRingTexture() -> TextureResource {
+        if let cached = cachedRippleRingTexture { return cached }
+        let tex = makeRippleRingTexture()
+        cachedRippleRingTexture = tex
+        return tex
+    }
+    private static func makeRippleRingTexture() -> TextureResource {
+        let size = 256
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bytesPerRow = size * 4
+        var pixels = [UInt8](repeating: 0, count: size * bytesPerRow)
+        let centerXY = Float(size) / 2.0
+        let maxR = Float(size) / 2.0
+        // Angular wobble: peak ring radius varies sinusoidally with
+        // angle. Two lobe counts at random phases blend to give an
+        // irregular but smooth ring shape — no symmetry the eye
+        // picks up as "decorative pattern."
+        let mode1 = 5
+        let mode2 = 8
+        let phase1 = Float.random(in: 0..<(2 * .pi))
+        let phase2 = Float.random(in: 0..<(2 * .pi))
+        let amp1: Float = 0.06
+        let amp2: Float = 0.04
+        let peakR: Float = 0.78
+        let bellHalfWidth: Float = 0.16
+        for y in 0..<size {
+            let dy = Float(y) - centerXY
+            for x in 0..<size {
+                let dx = Float(x) - centerXY
+                let r = sqrt(dx * dx + dy * dy) / maxR
+                let angle = atan2(dy, dx)
+                let peakOffset = amp1 * sin(angle * Float(mode1) + phase1)
+                              + amp2 * sin(angle * Float(mode2) + phase2)
+                let delta = abs(r - peakR + peakOffset)
+                var alpha: Float = 0
+                if delta < bellHalfWidth {
+                    // Smooth quadratic falloff from peak inward + outward
+                    let u = delta / bellHalfWidth
+                    alpha = 1.0 - u * u
+                }
+                // Also fully zero outside [0, 1] radial — texture
+                // shouldn't bleed past disk edge.
+                if r > 1.0 { alpha = 0 }
+                let idx = (y * size + x) * 4
+                pixels[idx + 0] = 255
+                pixels[idx + 1] = 255
+                pixels[idx + 2] = 255
+                pixels[idx + 3] = UInt8(max(0, min(255, alpha * 255)))
+            }
+        }
+        let providerData = NSData(bytes: &pixels, length: pixels.count)
+        let provider = CGDataProvider(data: providerData)!
+        let image = CGImage(
+            width: size, height: size,
+            bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider, decode: nil,
+            shouldInterpolate: true, intent: .defaultIntent
+        )!
+        return try! TextureResource(
+            image: image,
+            withName: "ambient-ripple-ring",
+            options: .init(semantic: .color)
+        )
+    }
+
     private static func makeLakeGlowTexture() -> TextureResource {
         let size = 128
         let colorSpace = CGColorSpaceCreateDeviceRGB()
@@ -2326,23 +2933,27 @@ enum AmbientVisualizer {
         // 0.85 so the hex MESH's perimeter (which cuts off the
         // texture sample at the polygon edge) falls inside the
         // transparent region — eliminates the "I can see hex-shaped
-        // edges" artifact. Peak slightly raised (0.75 → 0.80) to
-        // compensate for the inward-pulled falloff. Eight stops
-        // (vs four) gives CGGradient finer slope segments to draw,
-        // killing the linear-interpolation banding.
+        // edges" artifact.
+        //
+        // 2026-05-27 update: pushed an additional ~25% feather pass.
+        // Strategy: reduce the peak alpha (smaller hot core) AND
+        // pull every falloff stop INWARD so the soft tail occupies
+        // more of the texture's radial range. The blob now has a
+        // small bright nucleus and a long gradual fade rather than
+        // a wide bright core with a short transition.
         let gradient = CGGradient(
             colorsSpace: colorSpace,
             colors: [
-                CGColor(red: 1, green: 1, blue: 1, alpha: 0.80),
-                CGColor(red: 1, green: 1, blue: 1, alpha: 0.72),
-                CGColor(red: 1, green: 1, blue: 1, alpha: 0.58),
-                CGColor(red: 1, green: 1, blue: 1, alpha: 0.40),
+                CGColor(red: 1, green: 1, blue: 1, alpha: 0.60),
+                CGColor(red: 1, green: 1, blue: 1, alpha: 0.50),
+                CGColor(red: 1, green: 1, blue: 1, alpha: 0.36),
                 CGColor(red: 1, green: 1, blue: 1, alpha: 0.22),
-                CGColor(red: 1, green: 1, blue: 1, alpha: 0.08),
+                CGColor(red: 1, green: 1, blue: 1, alpha: 0.12),
+                CGColor(red: 1, green: 1, blue: 1, alpha: 0.05),
                 CGColor(red: 1, green: 1, blue: 1, alpha: 0.01),
                 CGColor(red: 1, green: 1, blue: 1, alpha: 0.00)
             ] as CFArray,
-            locations: [0.0, 0.15, 0.30, 0.45, 0.60, 0.75, 0.88, 1.0]
+            locations: [0.0, 0.10, 0.22, 0.36, 0.52, 0.68, 0.84, 1.0]
         )!
         ctx.drawRadialGradient(
             gradient,

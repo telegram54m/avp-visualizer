@@ -18,6 +18,13 @@ import AudioAnalysis
 struct VisualizerView: View {
 
     @Environment(AppModel.self) private var appModel
+    /// iOS-only: dismiss the fullScreenCover. Wired to the in-viz
+    /// close button. Other platforms use NavigationLink push and
+    /// dismiss via the standard back navigation, so the environment
+    /// dismiss action isn't needed there.
+    #if os(iOS)
+    @Environment(\.dismiss) private var dismiss
+    #endif
 
     /// Drag-start snapshot of (yaw, pitch) for Ambient's free-look camera.
     /// Set on the first `.onChanged` of a drag, cleared on `.onEnded`,
@@ -89,6 +96,16 @@ struct VisualizerView: View {
             #else
             let isLive = false
             #endif
+            // Slipstream-specific: local-file playback wants the
+            // live-spawn path (incremental gates with stem-isolated
+            // onsets) rather than the preview-path pre-spawn (which
+            // assumes constant corridor speed and breaks for full
+            // songs where bass-modulated speed accumulates drift —
+            // gates flow off-screen before reaching the camera).
+            // Treat local file as live for Slipstream, with a
+            // playback-bounded scan so we don't process all of
+            // `frames` in a single tick.
+            let isLocalFilePlayback = appModel.hasLocalPlaybackSource && !isLive
 
             // Snapshot frames.count at view-open time. Live builders seed
             // `lastSeenFrameIndex` to this so the first scanForNewOnsets
@@ -226,14 +243,31 @@ struct VisualizerView: View {
                         deltaTime: event.deltaTime,
                         // Track-change reset wiring — same as Clouds. Clears
                         // ripples and re-inits hue smoothing on track change.
-                        appResetCounter: appModel.liveModeResetCounter
+                        appResetCounter: appModel.liveModeResetCounter,
+                        bpmOverride: appModel.shazamBpmOverride,
+                        happinessOverride: appModel.shazamHappinessOverride,
+                        keyOverride: appModel.shazamKeyOverride
                     )
                 }
 
             case .slipstream:
-                let slipstream: Entity = isLive
+                // Three constructor paths:
+                //   • isLive (system-audio streaming): empty root,
+                //     scanForNewOnsets walks live-appended frames.
+                //   • isLocalFilePlayback (full-song from library /
+                //     import): empty root, scanForNewOnsets walks
+                //     frames bounded by current playbackTime so gates
+                //     spawn incrementally as playback advances.
+                //   • else (preview-only): pre-spawn all gates from
+                //     the 30-second iTunes preview.
+                let useLiveSpawn = isLive || isLocalFilePlayback
+                let slipstream: Entity = useLiveSpawn
                     ? SlipstreamVisualizer.makeSlipstreamLive(
-                        startingFrameIndex: liveStartIndex,
+                        // Local file starts from frame 0 so gates spawn
+                        // throughout the song. Live streaming seeds
+                        // past current frames so we don't replay
+                        // history of onsets captured pre-toggle.
+                        startingFrameIndex: isLive ? liveStartIndex : 0,
                         startingResetCounter: liveStartResetCounter
                       )
                     : SlipstreamVisualizer.makeSlipstream(from: appModel.frames)
@@ -248,11 +282,26 @@ struct VisualizerView: View {
                     to: SceneEvents.Update.self
                 ) { event in
                     appModel.recordFrameDelta(event.deltaTime)
-                    if isLive {
+                    if useLiveSpawn {
+                        // For LOCAL FILE: bound the scan to current
+                        // playback frame + ~2s lookahead. The lookahead
+                        // lets gates spawn slightly ahead of the audio
+                        // onset so they have time to flow from the
+                        // spawn frontier (-spawnDistance) forward to
+                        // the camera as playback reaches their onset
+                        // moment. ~60 frames = 2 sec at 30 fps.
+                        // For LIVE streaming: no bound (frames grows
+                        // naturally, scan everything available).
+                        let bound: Int? = isLocalFilePlayback
+                            ? Int((appModel.playbackTime * 30).rounded()) + 60
+                            : nil
                         SlipstreamVisualizer.scanForNewOnsets(
                             slipstream,
                             frames: appModel.frames,
-                            appResetCounter: appModel.liveModeResetCounter
+                            appResetCounter: appModel.liveModeResetCounter,
+                            stemFeatures: appModel.stemFeatures,
+                            stemFrameOffset: appModel.stemFrameOffset,
+                            playbackUpperBoundFrame: bound
                         )
                     }
                     SlipstreamVisualizer.animate(
@@ -260,43 +309,14 @@ struct VisualizerView: View {
                         clock: appModel.playbackTime,
                         frames: appModel.frames,
                         deltaTime: event.deltaTime,
-                        appResetCounter: appModel.liveModeResetCounter
-                    )
-                }
-
-            case .architecture:
-                let arch: Entity = isLive
-                    ? ArchitectureVisualizer.makeArchitectureLive(
-                        startingFrameIndex: liveStartIndex,
-                        startingResetCounter: liveStartResetCounter
-                      )
-                    : await ArchitectureVisualizer.makeArchitecture(from: appModel.frames)
-                // Same windowed-eye-height adjustment as Clouds and Rings —
-                // the immersive eye frame puts the cluster at y=1.3, but the
-                // windowed virtual camera is at origin, so center vertically.
-                // -2.5 instead of the immersive default -3.0 — the
-                // constellation is now ~5.4m wide (radial 0..2.7 + ring
-                // 0.93), so at -2.5 it fills the windowed viewport
-                // comfortably without clipping at the edges.
-                arch.position = SIMD3<Float>(0, 0, -2.5)
-                content.add(arch)
-                appModel.debugSceneRoot = arch
-                appModel.sceneUpdateSubscription = content.subscribe(
-                    to: SceneEvents.Update.self
-                ) { event in
-                    appModel.recordFrameDelta(event.deltaTime)
-                    if isLive {
-                        ArchitectureVisualizer.scanForNewOnsets(
-                            arch,
-                            frames: appModel.frames,
-                            appResetCounter: appModel.liveModeResetCounter
-                        )
-                    }
-                    ArchitectureVisualizer.animate(
-                        arch,
-                        clock: appModel.playbackTime,
-                        energy: appModel.currentEnergy(),
-                        deltaTime: event.deltaTime
+                        appResetCounter: appModel.liveModeResetCounter,
+                        bpmOverride: appModel.shazamBpmOverride,
+                        danceabilityOverride: appModel.shazamDanceabilityOverride,
+                        aggressivenessOverride: appModel.shazamAggressivenessOverride,
+                        happinessOverride: appModel.shazamHappinessOverride,
+                        timbreBrightnessOverride: appModel.shazamTimbreBrightnessOverride,
+                        stemFeatures: appModel.stemFeatures,
+                        stemFrameOffset: appModel.stemFrameOffset
                     )
                 }
 
@@ -337,7 +357,8 @@ struct VisualizerView: View {
                         clock: appModel.playbackTime,
                         frames: appModel.frames,
                         deltaTime: event.deltaTime,
-                        appResetCounter: appModel.liveModeResetCounter
+                        appResetCounter: appModel.liveModeResetCounter,
+                        stemFeatures: appModel.stemFeatures
                     )
                 }
 
@@ -372,7 +393,8 @@ struct VisualizerView: View {
                         timeSigOverride: appModel.shazamTimeSigOverride,
                         partyOverride: appModel.shazamPartyOverride,
                         relaxedOverride: appModel.shazamRelaxedOverride,
-                        keyOverride: appModel.shazamKeyOverride
+                        keyOverride: appModel.shazamKeyOverride,
+                        stemFeatures: appModel.stemFeatures
                     )
                     // Surface beat tracker bpm + confidence to the
                     // debug BeatBadge. Throttled inside recordBeat so
@@ -384,6 +406,23 @@ struct VisualizerView: View {
                         appModel.recordBeat(bpm: beat.bpm, confidence: beat.confidence)
                     }
                 }
+
+            case .fractal:
+                let fractal = await FractalVisualizer.makeFractal(from: appModel.frames)
+                content.add(fractal)
+                appModel.sceneUpdateSubscription = content.subscribe(
+                    to: SceneEvents.Update.self
+                ) { event in
+                    appModel.recordFrameDelta(event.deltaTime)
+                    FractalVisualizer.animate(
+                        fractal,
+                        clock: appModel.playbackTime,
+                        frames: appModel.frames,
+                        deltaTime: event.deltaTime,
+                        appResetCounter: appModel.liveModeResetCounter,
+                        stemFeatures: appModel.stemFeatures
+                    )
+                }
             }
         }
         // Force a full RealityView remount on mode change so the new
@@ -391,12 +430,28 @@ struct VisualizerView: View {
         // this, switching modes from the in-viz button would leave the
         // old entities + subscription running.
         .id(appModel.mode)
+        // Fill the parent. Without this, RealityView can settle at a
+        // small intrinsic size on iPhone — leaving black bars around
+        // the scene and the badge HStack floating in nowhere-land.
+        // Combined with the parent's .ignoresSafeArea(.all), the scene
+        // extends edge-to-edge including past the Dynamic Island in
+        // landscape on iPhone.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
         // HTML reference layers scene.fog (pale lavender-grey lifting darks)
         // then a #grain canvas (timbre-driven noise) on top of the 3D scene.
         // We do the same in SwiftUI overlay order: fog first, then grain.
         .overlay(FogOverlay())
         .overlay(GrainOverlay())
+        // Empty-state nudge when no song is loaded. Without a song the
+        // visualizer renders an unreactive static scene; this overlay
+        // points the user at the ways to start playback. Hidden as
+        // soon as any source becomes active.
+        .overlay(alignment: .center) {
+            if shouldShowEmptyState {
+                EmptyStatePrompt()
+            }
+        }
         // Mode-cycle button in the lower-left so the user can switch
         // visualizers without navigating back to ContentView. Placed
         // outside the macOS-only block since mode-switching is useful
@@ -410,6 +465,37 @@ struct VisualizerView: View {
                     .environment(appModel)
                 BeatBadge()
                     .environment(appModel)
+                #if os(macOS)
+                StemsBadge()
+                    .environment(appModel)
+                #else
+                // On iOS / iPadOS / visionOS, stems aren't computed
+                // locally — the relevant signal here is which TIER of
+                // frame data is driving the visualizer (preview-
+                // extrapolated vs. AB-augmented vs. real).
+                TierBadge()
+                    .environment(appModel)
+                #endif
+                #if !os(macOS)
+                // iOS / iPadOS / visionOS only — surface MicListener's
+                // session config + streaming-analyzer frame counter
+                // on-screen so we can debug the mic pipeline without
+                // Console.app. Only visible while mic mode is active.
+                if appModel.useMic {
+                    MicDiagBadge()
+                        .environment(appModel)
+                }
+                #endif
+                #if os(iOS)
+                // System-music pivot — small badge with the current
+                // Music.app track + playhead. Visible while in that
+                // mode so the user can see at a glance that the
+                // visualizer is following the song they're playing.
+                if appModel.useSystemMusic {
+                    SystemMusicBadge()
+                        .environment(appModel)
+                }
+                #endif
             }
             .padding(16)
         }
@@ -424,6 +510,39 @@ struct VisualizerView: View {
                 .padding(16)
         }
         #endif
+        // Local-file transport HUD (play/pause/restart + next-track
+        // for library mode) — visible only when a local AVAudioPlayer
+        // is the active source (imported file OR library pick).
+        // Positioned bottom-trailing to match the macOS NowPlayingBadge
+        // pattern; a single "current source" element on each
+        // platform's preferred edge.
+        .overlay(alignment: .bottomTrailing) {
+            if appModel.hasLocalPlaybackSource {
+                LocalPlaybackHUD()
+                    .environment(appModel)
+                    .padding(16)
+            }
+        }
+        #if os(iOS)
+        // fullScreenCover on iOS has no built-in dismiss gesture
+        // (unlike .sheet which has swipe-down). Provide an explicit
+        // close button in the upper-right. Aligned to the top — the
+        // bottom is busy with mode/badge/system-music rows.
+        .overlay(alignment: .topTrailing) {
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .padding(10)
+                    .background(.thinMaterial, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .padding(16)
+            .accessibilityLabel("Close visualizer")
+        }
+        #endif
         // Ambient draggable camera. The gesture is always attached but
         // gated on `appModel.mode == .ambient` inside — other modes have
         // their own camera logic (Crystal inverse-camera, Rings auto-
@@ -435,6 +554,20 @@ struct VisualizerView: View {
         // a pinch-and-move, in which case "drag to rotate ambient"
         // is a nice bonus interaction.
         .gesture(ambientDragGesture)
+        // iOS presents this view via .fullScreenCover (see
+        // ContentView.showVisualizer) so we're not in a NavigationStack
+        // here — no nav bar to hide. The fullScreenCover modifier in
+        // ContentView already applies .ignoresSafeArea(.all) on both
+        // the visualizer and its black background. Reapplying here
+        // would be redundant but harmless.
+        #if os(iOS)
+        .ignoresSafeArea(.all)
+        // Hide the iPhone home indicator after a moment of no
+        // interaction (and keep the screen alive while the visualizer
+        // is on). The home indicator at the bottom is otherwise a
+        // bright pill over the visualizer's lower edge.
+        .persistentSystemOverlays(.hidden)
+        #endif
         .onAppear { appModel.startPlayback() }
         .onDisappear { appModel.stopPlayback() }
     }
@@ -464,6 +597,64 @@ struct VisualizerView: View {
                 ambientDragStart = nil
             }
     }
+
+    /// Show the "pick a song" empty-state nudge when there are no
+    /// frames AND no live input source running. As soon as any source
+    /// becomes active (mic / system audio / system music) we hide it
+    /// — those modes start producing frames within a beat.
+    private var shouldShowEmptyState: Bool {
+        guard appModel.frames.isEmpty else { return false }
+        if appModel.useMic { return false }
+        #if os(macOS)
+        if appModel.useSystemAudio { return false }
+        #endif
+        #if os(iOS)
+        if appModel.useSystemMusic { return false }
+        #endif
+        return true
+    }
+}
+
+/// Centered prompt shown when no song is loaded and no live input
+/// source is active. Tells the user how to start playback. Sized to
+/// be unobtrusive when no controls are visible (visionOS / iOS
+/// full-screen modes).
+private struct EmptyStatePrompt: View {
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "music.note.list")
+                .font(.system(size: 44))
+                .foregroundStyle(.white.opacity(0.6))
+            Text("No song loaded")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.85))
+            #if os(macOS)
+            Text("Use the controls to import a file, browse your audio library, or listen to your Mac's system audio.")
+                .font(.callout)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.white.opacity(0.6))
+                .frame(maxWidth: 360)
+            #elseif os(iOS)
+            Text("Open the Music app and turn on system-music mode, or import a local file from the controls below.")
+                .font(.callout)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.white.opacity(0.6))
+                .frame(maxWidth: 320)
+            #else
+            Text("Connect a song source from the controls below.")
+                .font(.callout)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.white.opacity(0.6))
+                .frame(maxWidth: 320)
+            #endif
+        }
+        .padding(28)
+        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(.white.opacity(0.12), lineWidth: 1)
+        )
+    }
 }
 
 /// Bottom-left pill in the visualizer: shows the current mode and
@@ -479,6 +670,8 @@ private struct ModeCycleButton: View {
             HStack(spacing: 6) {
                 Image(systemName: "sparkles")
                 Text(appModel.mode.displayName)
+                    .lineLimit(1)
+                    .fixedSize()
                 Image(systemName: "arrow.right.circle.fill")
             }
             .font(.caption.weight(.medium))
@@ -576,7 +769,7 @@ struct BeatBadge: View {
                 return "— bpm"
             }
             let raw = appModel.publishedBeatBpm
-            let folded = DodecahedronVisualizer.octaveFoldBpm(raw)
+            let folded = BeatHelpers.octaveFoldBpm(raw)
             // Show folded bpm with raw in parens when they differ
             // (so half/double-time tracker locks are visible).
             if abs(folded - raw) < 1.0 {
@@ -587,12 +780,202 @@ struct BeatBadge: View {
         Text(label)
             .font(.caption.weight(.medium).monospacedDigit())
             .foregroundStyle(.secondary)
+            // Single-line + tail-truncate. With many override axes
+            // populated (D, A, X, H, V, T, P, R, etc.) the compound
+            // can hit ~250pt natural width and otherwise wraps to
+            // many vertical lines when the parent HStack runs out
+            // of horizontal room on iPhone landscape.
+            .lineLimit(1)
+            .truncationMode(.tail)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(.thinMaterial, in: Capsule())
             .help("Beat tracker bpm + confidence — debug")
     }
 }
+
+/// Provenance + state of the stem-separation pipeline for the
+/// currently-playing song. Four states:
+///   • idle      → "stems —"        (dim grey)   no stems, band-split
+///   • computing → "stems …"        (yellow-ish) separation in flight
+///   • cached    → "stems ✓ cached" (green)      instant cache hit
+///   • fresh     → "stems ⟳ fresh"  (blue)       just computed this session
+///
+/// Reads the small observable `stemStatus` enum — NOT the giant
+/// `stemFeatures` struct — so this view re-renders cheaply on
+/// status transitions only.
+/// Shows which fidelity tier the visualizer is currently reading from.
+/// Used on iOS / iPadOS / visionOS in place of the StemsBadge (which
+/// is macOS-relevant since stem separation only runs locally there).
+/// Tier 3 = preview-extrapolated frames; Tier 2 = preview + AB beats;
+/// Tier 1 = full real audio analysis; none = no frames loaded yet.
+struct TierBadge: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        let (label, color, help): (String, Color, String) = {
+            switch appModel.currentFrameTier {
+            case .none:
+                return ("tier —", .secondary,
+                        "No frames loaded yet.")
+            case .tier3:
+                return ("tier 3", .yellow,
+                        "Preview-extrapolated frames. Beat grid is BPM-extrapolated from the 30s preview; chord progression loops the preview.")
+            case .tier2:
+                return ("tier 2", .blue,
+                        "Preview chromagram + AcousticBrainz full-song beat positions. Beat-accurate; chord progression scripted.")
+            case .tier1:
+                return ("tier 1 ✓", .green,
+                        "Full real-audio analysis (live tap or cached frames). Every onset and chromagram value is ground truth.")
+            }
+        }()
+        Text(label)
+            .font(.caption.weight(.medium).monospacedDigit())
+            .foregroundStyle(color)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.thinMaterial, in: Capsule())
+            .help(help)
+    }
+}
+
+struct StemsBadge: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        let (label, color, help): (String, Color, String) = {
+            switch appModel.stemStatus {
+            case .idle:
+                return ("stems —", .secondary,
+                        "No stems for this song — visualizer is on band-split fallback.")
+            case .computing(.none):
+                return ("stems …", .yellow,
+                        "Separation in flight — visualizer is on band-split until stems land.")
+            case .computing(.some(let fraction)):
+                let pct = Int((fraction * 100).rounded())
+                return ("stems \(pct)%", .yellow,
+                        "Throttled separation — \(pct)% complete. Audio + visualizer stay smooth while the sidecar yields between chunks.")
+            case .ready(fromCache: true):
+                return ("stems ✓ cached", .green,
+                        "Stems loaded instantly from local cache. Disco ball is drum-isolated.")
+            case .ready(fromCache: false):
+                return ("stems ⟳ fresh", .blue,
+                        "Stems just computed this session. Disco ball is drum-isolated.")
+            }
+        }()
+        Text(label)
+            .font(.caption.weight(.medium).monospacedDigit())
+            .foregroundStyle(color)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.thinMaterial, in: Capsule())
+            .help(help)
+    }
+}
+
+#if !os(macOS)
+/// iOS / iPadOS / visionOS diagnostic pill — surfaces MicListener's
+/// session config + streaming-analyzer frame emit count on-screen.
+/// Visible only while `appModel.useMic == true`. Lets us debug the
+/// mic pipeline without Console.app: if `frames=0` after audible
+/// audio is playing → StreamingAnalyzer isn't seeing input → audio
+/// session or format issue. If `frames` ticks up → pipeline is
+/// healthy and any visualizer issues are downstream.
+struct MicDiagBadge: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        let session = appModel.micListener.publishedSessionInfo
+        let frames = appModel.micListener.publishedFramesEmitted
+        let loudness = appModel.micListener.smoothedLoudness
+        let tapCalls = appModel.micListener.publishedTapCalls
+        let peak = appModel.micListener.publishedTapPeak
+        // Compact 2-line label so we can fit everything on iPhone.
+        // Top line: session config (cat/mode/sr)
+        // Bottom line: pipeline diagnostics (tap calls, peak, frames, loudness)
+        let label = "🎙 \(session)\ntaps=\(tapCalls) pk=\(String(format: "%.3f", peak)) f=\(frames) L=\(String(format: "%.2f", loudness))"
+        Text(label)
+            .font(.caption2.weight(.medium).monospacedDigit())
+            .foregroundStyle(.orange)
+            .multilineTextAlignment(.leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+#endif
+
+#if os(iOS)
+/// iOS-only badge for the system-music-follow mode. Shows what Music.app
+/// reports playing + the live playhead in seconds, plus prev/play-pause/
+/// next transport controls. Companion to MicDiagBadge for the other
+/// (mic-based) iOS audio path. Mirrors the macOS NowPlayingBadge's
+/// transport row.
+struct SystemMusicBadge: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        let title = appModel.systemMusic.title
+        let artist = appModel.systemMusic.artist
+        let pos = appModel.systemMusic.currentPlaybackTime
+        let isPlaying = appModel.systemMusic.isPlaying
+        VStack(alignment: .leading, spacing: 4) {
+            Text(titleLabel(title: title, artist: artist, isPlaying: isPlaying, pos: pos))
+                .font(.caption2.weight(.medium).monospacedDigit())
+                .foregroundStyle(isPlaying ? .primary : .secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            transportRow(isPlaying: isPlaying, hasTrack: !title.isEmpty)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        // Tighter cap so we don't dominate the badge HStack on iPhone
+        // landscape. Title truncates aggressively; transport row is
+        // compact icons.
+        .frame(maxWidth: 200, alignment: .leading)
+    }
+
+    private func titleLabel(title: String, artist: String,
+                            isPlaying: Bool, pos: Double) -> String {
+        guard !title.isEmpty else { return "♫ —" }
+        let icon = isPlaying ? "▶" : "❚❚"
+        let posStr = String(format: "%d:%02d", Int(pos) / 60, Int(pos) % 60)
+        // Drop the artist on iPhone — the title alone is what the user
+        // needs to confirm the sync. Title truncates inside the parent
+        // Text via .lineLimit(1)/.truncationMode(.tail).
+        return "\(icon) \(title)  \(posStr)"
+    }
+
+    private func transportRow(isPlaying: Bool, hasTrack: Bool) -> some View {
+        HStack(spacing: 14) {
+            Button {
+                appModel.systemMusic.skipToPrevious()
+            } label: {
+                Image(systemName: "backward.fill")
+            }
+            .disabled(!hasTrack)
+
+            Button {
+                appModel.systemMusic.togglePlayPause()
+            } label: {
+                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+            }
+            .disabled(!hasTrack)
+
+            Button {
+                appModel.systemMusic.skipToNext()
+            } label: {
+                Image(systemName: "forward.fill")
+            }
+            .disabled(!hasTrack)
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 12, weight: .semibold))
+        .foregroundStyle(hasTrack ? .primary : .secondary)
+    }
+}
+#endif
 
 #if os(macOS)
 /// Small in-corner readout: which process is being tapped + what's

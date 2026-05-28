@@ -3,7 +3,7 @@ import Foundation
 /// Per-frame output of ``BeatTracker``. All visualizers can read these
 /// fields off ``FeatureFrame`` to drive rhythmically-locked animations
 /// without each one rolling its own tempo estimator.
-public struct BeatState: Sendable, Equatable {
+public struct BeatState: Sendable, Equatable, Codable {
     /// Currently estimated tempo in beats per minute. `0` while the tracker
     /// hasn't locked yet (need ≥ 4 onsets in a stable interval).
     public let bpm: Float

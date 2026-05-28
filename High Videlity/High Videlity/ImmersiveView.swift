@@ -75,22 +75,10 @@ struct ImmersiveView: View {
                         clock: appModel.playbackTime,
                         frames: appModel.frames,
                         deltaTime: event.deltaTime,
-                        appResetCounter: appModel.liveModeResetCounter
-                    )
-                }
-
-            case .architecture:
-                let arch = await ArchitectureVisualizer.makeArchitecture(from: appModel.frames)
-                content.add(arch)
-                appModel.sceneUpdateSubscription = content.subscribe(
-                    to: SceneEvents.Update.self
-                ) { event in
-                    appModel.recordFrameDelta(event.deltaTime)
-                    ArchitectureVisualizer.animate(
-                        arch,
-                        clock: appModel.playbackTime,
-                        energy: appModel.currentEnergy(),
-                        deltaTime: event.deltaTime
+                        appResetCounter: appModel.liveModeResetCounter,
+                        bpmOverride: appModel.shazamBpmOverride,
+                        happinessOverride: appModel.shazamHappinessOverride,
+                        keyOverride: appModel.shazamKeyOverride
                     )
                 }
 
@@ -106,7 +94,14 @@ struct ImmersiveView: View {
                         clock: appModel.playbackTime,
                         frames: appModel.frames,
                         deltaTime: event.deltaTime,
-                        appResetCounter: appModel.liveModeResetCounter
+                        appResetCounter: appModel.liveModeResetCounter,
+                        bpmOverride: appModel.shazamBpmOverride,
+                        danceabilityOverride: appModel.shazamDanceabilityOverride,
+                        aggressivenessOverride: appModel.shazamAggressivenessOverride,
+                        happinessOverride: appModel.shazamHappinessOverride,
+                        timbreBrightnessOverride: appModel.shazamTimbreBrightnessOverride,
+                        stemFeatures: appModel.stemFeatures,
+                        stemFrameOffset: appModel.stemFrameOffset
                     )
                 }
 
@@ -122,7 +117,8 @@ struct ImmersiveView: View {
                         clock: appModel.playbackTime,
                         frames: appModel.frames,
                         deltaTime: event.deltaTime,
-                        appResetCounter: appModel.liveModeResetCounter
+                        appResetCounter: appModel.liveModeResetCounter,
+                        stemFeatures: appModel.stemFeatures
                     )
                 }
 
@@ -149,7 +145,25 @@ struct ImmersiveView: View {
                         timeSigOverride: appModel.shazamTimeSigOverride,
                         partyOverride: appModel.shazamPartyOverride,
                         relaxedOverride: appModel.shazamRelaxedOverride,
-                        keyOverride: appModel.shazamKeyOverride
+                        keyOverride: appModel.shazamKeyOverride,
+                        stemFeatures: appModel.stemFeatures
+                    )
+                }
+
+            case .fractal:
+                let fractal = await FractalVisualizer.makeFractal(from: appModel.frames)
+                content.add(fractal)
+                appModel.sceneUpdateSubscription = content.subscribe(
+                    to: SceneEvents.Update.self
+                ) { event in
+                    appModel.recordFrameDelta(event.deltaTime)
+                    FractalVisualizer.animate(
+                        fractal,
+                        clock: appModel.playbackTime,
+                        frames: appModel.frames,
+                        deltaTime: event.deltaTime,
+                        appResetCounter: appModel.liveModeResetCounter,
+                        stemFeatures: appModel.stemFeatures
                     )
                 }
             }

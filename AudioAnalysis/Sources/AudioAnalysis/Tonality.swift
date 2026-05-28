@@ -30,7 +30,16 @@ public struct Tonality: Sendable, Equatable {
         // actually present. If the thirds carry negligible energy relative to
         // the tonal center, treat the tonality as ambiguous rather than
         // computing a ratio of near-zero noise.
-        if thirdsTotal < centerEnergy * 0.15 {
+        //
+        // The `thirdsTotal <= 0` short-circuit is critical for SILENT
+        // frames: when the whole chromagram is zero, `centerEnergy *
+        // 0.15` is also zero, so `thirdsTotal < centerEnergy * 0.15`
+        // evaluates `0 < 0` → false, falls into the divide branch,
+        // produces NaN. The downstream TonalColor inherits the NaN
+        // into `brightness`, which then breaks JSON serialization
+        // (FrameFeatureCache write fails with `invalidValue(nan, ...)`).
+        // Burnt in by a Supertramp track with a silent passage.
+        if thirdsTotal <= 0 || thirdsTotal < centerEnergy * 0.15 {
             self.majorness = 0
         } else {
             self.majorness = (majorThird - minorThird) / thirdsTotal

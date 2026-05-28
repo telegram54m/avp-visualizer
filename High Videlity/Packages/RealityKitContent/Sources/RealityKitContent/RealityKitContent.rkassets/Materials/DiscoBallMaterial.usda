@@ -1,0 +1,284 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "Root"
+{
+    def Material "DiscoBallMaterial"
+    {
+        # ----- Exposed parameters (settable from Swift via setParameter) -----
+        # BeatPulse: 0..1 envelope, bumped on each beatTrigger, decayed each tick.
+        float inputs:BeatPulse = 0.0
+        # Baseline lit-cell emissive (between beats). Near-zero so cells go dark.
+        float inputs:Baseline = 0.02
+        # Peak lit-cell emissive at full BeatPulse.
+        float inputs:Peak = 1.0
+        # Mood-tinted lit color (warm-white default; shifted indigo at sad / gold at happy).
+        color3f inputs:LitColor = (1.0, 0.92, 0.85)
+        # Dim cool-gray for mirror cells — always visible between flashes.
+        color3f inputs:MirrorColor = (0.15, 0.16, 0.18)
+        # Cell counts along latitude (vertical, UV.y) and longitude (UV.x).
+        # These DEFAULTS exist for RCP preview only — at runtime the
+        # values get overwritten via setParameter from Swift's
+        # `discoBallLatCells` / `discoBallLngCells` constants, which
+        # are the single source of truth (they also drive the sparkle
+        # cell-snapping math, so coupling them avoids drift).
+        float inputs:LatCells = 14.0
+        float inputs:LngCells = 28.0
+        # LIT-cell roughness. Mirror cells stay at 1.0 (matte fallback in
+        # RoughnessSelector). Lower = sharper reflections. Driven from
+        # Swift per-tick by song tempo so fast tracks have crisper
+        # mirror cells and slow tracks have softer ones.
+        float inputs:LitRoughness = 0.08
+
+        token outputs:mtlx:surface.connect = </Root/DiscoBallMaterial/PreviewSurface.outputs:out>
+        token outputs:realitykit:vertex
+        token outputs:surface
+
+        # ----- Surface output (UsdPreviewSurface as the MaterialX surface) -----
+        # Lit cells: metallic=1, roughness=0.3, baseColor=LitColor → they
+        # reflect the dodec (which sits at the sphere center, in the
+        # camera's line of sight to every lit cell). Mirror cells:
+        # metallic=0, roughness=1, baseColor=black → no reflection, no
+        # diffuse, pure dark.
+        # Emissive still drives the beat pulse on lit cells (LitContrib);
+        # mirror cells get MirrorColor (set to black from Swift).
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "ND_UsdPreviewSurface_surfaceshader"
+            color3f inputs:diffuseColor.connect = </Root/DiscoBallMaterial/DiffuseSelector.outputs:out>
+            color3f inputs:emissiveColor.connect = </Root/DiscoBallMaterial/MixFinal.outputs:out>
+            float inputs:metallic.connect = </Root/DiscoBallMaterial/Mask.outputs:out>
+            float inputs:roughness.connect = </Root/DiscoBallMaterial/RoughnessSelector.outputs:out>
+            token outputs:out
+        }
+
+        # ----- PBR property selectors driven by Mask -----
+        # Lit cells get LitColor as their base reflectance (tints
+        # metallic reflections of the dodec in the cell's warm/cool hue);
+        # mirror cells get pure black baseColor so they don't pick up
+        # ambient diffuse.
+        def Shader "DiffuseSelector"
+        {
+            uniform token info:id = "ND_ifgreater_color3"
+            float inputs:value1.connect = </Root/DiscoBallMaterial/Mask.outputs:out>
+            float inputs:value2 = 0.5
+            color3f inputs:in1.connect = </Root/DiscoBallMaterial.inputs:LitColor>
+            color3f inputs:in2 = (0, 0, 0)
+            color3f outputs:out
+        }
+
+        # Lit cells get the externally-driven `LitRoughness` parameter
+        # (per-tick from Swift, tempo-modulated 0.04..0.14). Mirror
+        # (non-lit) cells get roughness 1.0 (matte fallback). Wiring
+        # via ifgreater on the Mask keeps the per-cell branching in
+        # the shader; tempo modulation just changes the lit branch's
+        # value at runtime.
+        def Shader "RoughnessSelector"
+        {
+            uniform token info:id = "ND_ifgreater_float"
+            float inputs:value1.connect = </Root/DiscoBallMaterial/Mask.outputs:out>
+            float inputs:value2 = 0.5
+            float inputs:in1.connect = </Root/DiscoBallMaterial.inputs:LitRoughness>
+            float inputs:in2 = 1.0
+            float outputs:out
+        }
+
+        # ----- UV → cell coordinates → parity mask -----
+        # Standard MaterialX texcoord: UV.x = longitude (0..1 around sphere),
+        # UV.y = latitude (0..1 south→north pole). For an inverted/Y-mirrored
+        # sphere mesh the mapping flips on Y, which is fine — the checker
+        # pattern is symmetric.
+        def Shader "Texcoord"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            float2 outputs:out
+        }
+
+        def Shader "SplitUV"
+        {
+            uniform token info:id = "ND_separate2_vector2"
+            float2 inputs:in.connect = </Root/DiscoBallMaterial/Texcoord.outputs:out>
+            float outputs:outx
+            float outputs:outy
+        }
+
+        # UV.x * LngCells → cell column (continuous)
+        def Shader "ScaleU"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial/SplitUV.outputs:outx>
+            float inputs:in2.connect = </Root/DiscoBallMaterial.inputs:LngCells>
+            float outputs:out
+        }
+
+        # UV.y * LatCells → cell row (continuous)
+        def Shader "ScaleV"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial/SplitUV.outputs:outy>
+            float inputs:in2.connect = </Root/DiscoBallMaterial.inputs:LatCells>
+            float outputs:out
+        }
+
+        # floor() to get integer cell indices.
+        def Shader "FloorU"
+        {
+            uniform token info:id = "ND_floor_float"
+            float inputs:in.connect = </Root/DiscoBallMaterial/ScaleU.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "FloorV"
+        {
+            uniform token info:id = "ND_floor_float"
+            float inputs:in.connect = </Root/DiscoBallMaterial/ScaleV.outputs:out>
+            float outputs:out
+        }
+
+        # Staggered (brick-style) lit pattern: lit only on EVEN rows
+        # (cellY % 2 == 0), and the cellX alignment ALTERNATES per
+        # lit-row pair so adjacent lit rows don't share columns. With
+        # 14 lat × 28 lng:
+        #   Row 0 (cellY=0): lit at cellX = 0, 2, 4, 6, ...
+        #   Row 2 (cellY=2): lit at cellX = 1, 3, 5, 7, ...
+        #   Row 4 (cellY=4): lit at cellX = 0, 2, 4, 6, ...
+        #   Row 6 (cellY=6): lit at cellX = 1, 3, 5, 7, ...
+        # Total density still ~25%. The vertical alignment between lit
+        # cells is broken — gives a more disco-ball-like masonry feel
+        # instead of a regular sparse grid.
+        #
+        # Formula: lit when (cellY % 2 == 0) AND ((cellX + cellY/2) % 2 == 0).
+        # The cellY/2 term flips the cellX parity every other lit row.
+
+        # mod(cellY, 2) → 0 (lit row) or 1 (dark row).
+        def Shader "RowMod"
+        {
+            uniform token info:id = "ND_modulo_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial/FloorV.outputs:out>
+            float inputs:in2 = 2.0
+            float outputs:out
+        }
+
+        # cellY / 2 → continuous float. Floor next to get integer.
+        def Shader "HalfVRaw"
+        {
+            uniform token info:id = "ND_divide_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial/FloorV.outputs:out>
+            float inputs:in2 = 2.0
+            float outputs:out
+        }
+
+        def Shader "HalfV"
+        {
+            uniform token info:id = "ND_floor_float"
+            float inputs:in.connect = </Root/DiscoBallMaterial/HalfVRaw.outputs:out>
+            float outputs:out
+        }
+
+        # cellX + floor(cellY/2) → staggered column index. Adding the
+        # half-row index alternates the cellX parity every other lit row.
+        def Shader "StaggerCol"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial/FloorU.outputs:out>
+            float inputs:in2.connect = </Root/DiscoBallMaterial/HalfV.outputs:out>
+            float outputs:out
+        }
+
+        # mod(staggerCol, 2) → 0 if this cell's column matches the lit
+        # row's offset, else 1.
+        def Shader "ColMod"
+        {
+            uniform token info:id = "ND_modulo_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial/StaggerCol.outputs:out>
+            float inputs:in2 = 2.0
+            float outputs:out
+        }
+
+        # SumMod = RowMod + ColMod. 0 means lit (both even), 1 or 2 = dark.
+        def Shader "SumMod"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial/RowMod.outputs:out>
+            float inputs:in2.connect = </Root/DiscoBallMaterial/ColMod.outputs:out>
+            float outputs:out
+        }
+
+        # Mask = 1.0 if SumMod < 0.5 (i.e., == 0, both even), else 0.0.
+        # Feeds the downstream ND_ifgreater_color3 (which tests Mask > 0.5
+        # to pick lit vs mirror). With integer-valued SumMod the test is
+        # robust to float epsilon.
+        def Shader "Mask"
+        {
+            uniform token info:id = "ND_ifgreater_float"
+            float inputs:value1 = 0.5
+            float inputs:value2.connect = </Root/DiscoBallMaterial/SumMod.outputs:out>
+            float inputs:in1 = 1.0
+            float inputs:in2 = 0.0
+            float outputs:out
+        }
+
+        # ----- Lit-cell emissive: Baseline + (Peak − Baseline) × BeatPulse -----
+        def Shader "PulseRange"
+        {
+            uniform token info:id = "ND_subtract_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial.inputs:Peak>
+            float inputs:in2.connect = </Root/DiscoBallMaterial.inputs:Baseline>
+            float outputs:out
+        }
+
+        def Shader "ScaledPulse"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial.inputs:BeatPulse>
+            float inputs:in2.connect = </Root/DiscoBallMaterial/PulseRange.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "LitMag"
+        {
+            uniform token info:id = "ND_add_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial.inputs:Baseline>
+            float inputs:in2.connect = </Root/DiscoBallMaterial/ScaledPulse.outputs:out>
+            float outputs:out
+        }
+
+        # Promote scalar LitMag to a color3 vector (LitMag, LitMag, LitMag)
+        # so we can multiply the color3 LitColor by it. NOTE: avoiding
+        # ND_multiply_color3FA — per [[ambient]] that node is broken on
+        # macOS RealityKit, the color3×color3 path works reliably.
+        def Shader "LitMagVec"
+        {
+            uniform token info:id = "ND_combine3_color3"
+            float inputs:in1.connect = </Root/DiscoBallMaterial/LitMag.outputs:out>
+            float inputs:in2.connect = </Root/DiscoBallMaterial/LitMag.outputs:out>
+            float inputs:in3.connect = </Root/DiscoBallMaterial/LitMag.outputs:out>
+            color3f outputs:out
+        }
+
+        def Shader "LitContrib"
+        {
+            uniform token info:id = "ND_multiply_color3"
+            color3f inputs:in1.connect = </Root/DiscoBallMaterial.inputs:LitColor>
+            color3f inputs:in2.connect = </Root/DiscoBallMaterial/LitMagVec.outputs:out>
+            color3f outputs:out
+        }
+
+        # ----- Final: select MirrorColor or LitContrib based on parity mask -----
+        # ND_ifgreater_color3: if (value1 > value2) then in1 else in2.
+        # Mask is 0 or 1, so testing > 0.5 cleanly picks lit (1) vs mirror (0).
+        def Shader "MixFinal"
+        {
+            uniform token info:id = "ND_ifgreater_color3"
+            float inputs:value1.connect = </Root/DiscoBallMaterial/Mask.outputs:out>
+            float inputs:value2 = 0.5
+            color3f inputs:in1.connect = </Root/DiscoBallMaterial/LitContrib.outputs:out>
+            color3f inputs:in2.connect = </Root/DiscoBallMaterial.inputs:MirrorColor>
+            color3f outputs:out
+        }
+    }
+}
