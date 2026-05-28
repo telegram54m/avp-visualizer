@@ -166,37 +166,30 @@ class AppModel {
 
     /// The analyzed song timeline that drives the visualization.
     ///
-    /// NOTE: experimentally tried `@ObservationIgnored` here on 2026-05-22
-    /// to fix cross-mode FPS drift (theory: per-append Observation
-    /// invalidation × 30/sec on @Observable-tracked frames was burning
-    /// cycles on UI re-evaluation). Result: broke initial preview load
-    /// — SongLoader.load(term) appeared to never complete, no iTunes
-    /// logs emitted, app stuck on "Analyzing preview..." indefinitely.
-    /// Root cause unclear; possibly the Observation macro's expansion
-    /// interacts badly with @ObservationIgnored on a mutable property
-    /// also referenced from non-MainActor URLSession callbacks. Reverted.
-    /// FPS drift remains an open investigation (see task #31).
-    var frames: [FeatureFrame] = [] {
-        didSet {
-            // Direct assignment auto-resets the fidelity tier so the
-            // tier ladder stays correct without retrofitting every
-            // existing `frames = loaded.frames` site:
-            //   • Empty → `.none` (song-change reset)
-            //   • Non-empty assignment WHEN tier was `.none` → assume
-            //     it's the cached Tier 1 path (the only other writers
-            //     are `upgradeFrames`, which sets tier explicitly AFTER
-            //     this didSet fires, overriding the default below)
-            if frames.isEmpty {
-                currentFrameTier = .none
-                // Also clear preview seed — new song coming, the
-                // old seed is no longer relevant.
-                previewSeedFrames = nil
-                previewSeedSongDuration = nil
-            } else if currentFrameTier == .none {
-                currentFrameTier = .tier1
-            }
-        }
-    }
+    /// **`@ObservationIgnored` is intentional and load-bearing.** The
+    /// streaming-audio path (SystemAudioListener → appendLiveFrames)
+    /// mutates this array ~30 Hz with `frames.append(...)`. Without
+    /// `@ObservationIgnored`, those 30 Hz mutations trigger SwiftUI's
+    /// Observation invalidation cascade through every view body that
+    /// reads any property on AppModel — even via the throttled
+    /// `framesCount` mirror, the cost compounded as AppModel grew more
+    /// @Observable properties through the week. Empirical: 50 fps with
+    /// @Observable, 100-110 fps with @ObservationIgnored, isolated by
+    /// session-2026-05-28 bisection.
+    ///
+    /// Visualizer reads of `frames` happen inside RealityKit
+    /// `SceneEvents.Update` closures, which are NOT SwiftUI view
+    /// bodies and don't require Observation tracking — they read the
+    /// current value directly. SwiftUI consumers that need to display
+    /// a live count read `framesCount` (a 1 Hz throttled @Observable
+    /// snapshot updated by `publishFramesCountIfDue`).
+    ///
+    /// A 2026-05-22 attempt at this fix was reverted after misdiagnosing
+    /// an unrelated preview-load hang as caused by `@ObservationIgnored`;
+    /// the same change applied today works correctly. The earlier hang
+    /// was likely a stale-state issue unrelated to observation semantics.
+    @ObservationIgnored
+    var frames: [FeatureFrame] = []
 
     /// Fidelity level of the currently-loaded `frames` array. Lower
     /// raw value = higher fidelity (Tier 1 is best, Tier 3 is the
@@ -1042,8 +1035,6 @@ class AppModel {
     /// array index. After this, `frame.time == Double(arrayIndex) / 30`
     /// and `playbackTime == Double(frames.count - 1) / 30` agree.
     fileprivate func appendLiveFrames(_ newFrames: [FeatureFrame]) {
-        // At least one live source must be active. Mic is universal;
-        // system audio is macOS-only.
         let liveActive: Bool = {
             if useMic { return true }
             #if os(macOS)
