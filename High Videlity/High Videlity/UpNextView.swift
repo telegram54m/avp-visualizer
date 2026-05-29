@@ -22,6 +22,25 @@ struct UpNextView: View {
     let appModel: AppModel
 
     var body: some View {
+        // Pick which queue to render. Local queue wins whenever a
+        // local track is loaded — even if AM also has an upcoming
+        // list cached, the user's active context is local playback
+        // and showing AM's Up Next would be confusing.
+        #if os(macOS)
+        if appModel.localQueue.currentItem != nil {
+            localUpNext
+        } else {
+            amUpNext
+        }
+        #else
+        amUpNext
+        #endif
+    }
+
+    // MARK: - AM Up Next (existing behavior)
+
+    @ViewBuilder
+    private var amUpNext: some View {
         let mk = appModel.musicKit
         if mk.upcomingItems.isEmpty {
             EmptyView()
@@ -54,6 +73,72 @@ struct UpNextView: View {
             .frame(maxWidth: 420)
         }
     }
+
+    // MARK: - Local Up Next
+
+    #if os(macOS)
+    /// Local-queue version. Same shell + row vocabulary as the AM
+    /// list so the surface reads consistently between sources; only
+    /// the underlying data + actions differ (skip / remove call
+    /// AppModel's local-queue ops instead of MusicKitController).
+    @ViewBuilder
+    private var localUpNext: some View {
+        let items = appModel.localQueue.upcomingItems
+        if items.isEmpty {
+            EmptyView()
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Up Next")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text("\(items.count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 6)
+
+                VStack(spacing: 2) {
+                    ForEach(items) { item in
+                        localUpNextRow(item)
+                    }
+                }
+            }
+            .frame(maxWidth: 420)
+        }
+    }
+
+    private func localUpNextRow(_ item: LocalQueueController.Item) -> some View {
+        MediaRow(
+            artwork: nil,
+            title: item.title,
+            subtitle: item.artist.isEmpty ? nil : item.artist,
+            artworkSize: 40,
+            accessory: .play,
+            hoverActions: [
+                MediaRowAction(systemImage: "trash", help: "Remove from Queue") {
+                    appModel.removeFromLocalQueue(id: item.id)
+                }
+            ],
+            contextActions: [
+                MediaRowAction(systemImage: "play.fill", help: "Play Now") {
+                    skipToLocal(itemID: item.id)
+                },
+                MediaRowAction(systemImage: "trash", help: "Remove from Queue") {
+                    appModel.removeFromLocalQueue(id: item.id)
+                }
+            ]
+        ) {
+            skipToLocal(itemID: item.id)
+        }
+    }
+
+    private func skipToLocal(itemID: URL) {
+        guard let idx = appModel.localQueue.entries.firstIndex(where: { $0.id == itemID })
+        else { return }
+        Task { await appModel.skipToLocalQueueIndex(idx) }
+    }
+    #endif
 
     #if os(macOS)
     /// Row backed by MediaRow. Tap = jump to song (queue rebuild),

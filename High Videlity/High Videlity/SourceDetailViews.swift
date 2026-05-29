@@ -96,13 +96,6 @@ struct LocalSourceView: View {
     @State private var showFilePicker = false
     @State private var showLibraryBrowser = false
 
-    /// True when we have anything to surface in the "currently
-    /// loaded" card. Source-of-truth check kept centralized so the
-    /// header copy and the card both agree on whether to render.
-    private var hasLoadedTrack: Bool {
-        !appModel.currentTrackTitle.isEmpty || !appModel.currentTrackArtist.isEmpty
-    }
-
     var body: some View {
         let entries = appModel.library.entries
         ScrollView {
@@ -113,13 +106,13 @@ struct LocalSourceView: View {
                     // no folder has been scanned yet.
                     heroBlock
                     actionGrid
-                    if hasLoadedTrack { loadedCard }
                 } else {
                     // Content-forward layout — the user's music IS
-                    // the page. Toolbar at the top, currently-loaded
-                    // card next, then the actual library content.
+                    // the page. Currently-playing info lives on the
+                    // persistent GlobalNowPlayingFooter and the Now
+                    // Playing inspector; no need to duplicate it as
+                    // a card here.
                     libraryToolbar
-                    if hasLoadedTrack { loadedCard }
                     librarySections(entries: entries)
                 }
                 Spacer(minLength: 0)
@@ -277,22 +270,17 @@ struct LocalSourceView: View {
     private func albumRow(entries: [LibraryEntry]) -> some View {
         let groups = uniqueAlbums(from: entries)
         if groups.count >= 4 {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Albums")
-                    .font(.title3.weight(.semibold))
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 14) {
-                        ForEach(groups, id: \.key) { group in
-                            LocalAlbumCard(
-                                title: group.album ?? "Unknown Album",
-                                subtitle: group.artist.isEmpty ? "Unknown Artist" : group.artist,
-                                tracks: group.entries,
-                                appModel: appModel
-                            )
-                        }
-                    }
-                    .padding(.bottom, 4)
-                }
+            AlphabetIndexedRow(
+                title: "Albums",
+                items: groups,
+                firstLetter: { alphabetBucket($0.album ?? "") }
+            ) { group in
+                LocalAlbumCard(
+                    title: group.album ?? "Unknown Album",
+                    subtitle: group.artist.isEmpty ? "Unknown Artist" : group.artist,
+                    tracks: group.entries,
+                    appModel: appModel
+                )
             }
         }
     }
@@ -302,80 +290,51 @@ struct LocalSourceView: View {
     private func artistRow(entries: [LibraryEntry]) -> some View {
         let artists = uniqueArtists(from: entries)
         if artists.count >= 4 {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Artists")
-                    .font(.title3.weight(.semibold))
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 14) {
-                        ForEach(artists, id: \.name) { artist in
-                            LocalArtistCard(
-                                name: artist.name,
-                                trackCount: artist.entries.count,
-                                tracks: artist.entries,
-                                appModel: appModel
-                            )
-                        }
-                    }
-                    .padding(.bottom, 4)
-                }
+            AlphabetIndexedRow(
+                title: "Artists",
+                items: artists,
+                firstLetter: { alphabetBucket($0.name) }
+            ) { artist in
+                LocalArtistCard(
+                    name: artist.name,
+                    trackCount: artist.entries.count,
+                    tracks: artist.entries,
+                    appModel: appModel
+                )
             }
         }
     }
 
-    /// Vertical list of every entry in the library. Sorted by artist
-    /// then album then title — matches the library store's default.
+    /// Preview slice of the library + a "Show all" link that pushes
+    /// `LocalSongsListView` for the canonical sortable / filterable
+    /// table. The home page renders only the first handful of rows
+    /// so it stays light no matter how big the scanned folder gets;
+    /// big libraries route through the dedicated table.
     private func allSongsSection(entries: [LibraryEntry]) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let previewLimit = 6
+        let preview = Array(entries.prefix(previewLimit))
+        return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("All Songs")
                     .font(.title3.weight(.semibold))
                 Spacer()
+                if entries.count > previewLimit {
+                    NavigationLink {
+                        LocalSongsListView(entries: entries, appModel: appModel)
+                            .environment(appModel)
+                    } label: {
+                        Text("Show all (\(entries.count))")
+                            .font(.callout)
+                    }
+                    .buttonStyle(.borderless)
+                }
             }
             VStack(spacing: 2) {
-                ForEach(entries) { entry in
+                ForEach(preview) { entry in
                     LocalSongRow(entry: entry, appModel: appModel)
                 }
             }
             .frame(maxWidth: 720, alignment: .leading)
-        }
-    }
-
-    // MARK: - Currently loaded card
-
-    /// Material card showing the active local-playback track. Same
-    /// visual language as SettingsCard so the surface reads as
-    /// "status", not "form".
-    private var loadedCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "play.circle.fill")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-                Text("Currently loaded")
-                    .font(.caption.weight(.semibold))
-                    .tracking(0.6)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            Text(appModel.currentTrackTitle.isEmpty ? "Untitled track" : appModel.currentTrackTitle)
-                .font(.title3.weight(.semibold))
-                .lineLimit(2)
-            if !appModel.currentTrackArtist.isEmpty {
-                Text(appModel.currentTrackArtist)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-        }
-        .padding(18)
-        .frame(maxWidth: 720, alignment: .leading)
-        .background {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.quaternary.opacity(0.5))
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(.quaternary, lineWidth: 0.5)
         }
     }
 
@@ -417,16 +376,18 @@ struct LocalSourceView: View {
         return order.compactMap { byName[$0] }
     }
 
-    struct AlbumGroup {
+    struct AlbumGroup: Identifiable {
         let key: String
         let album: String?
         let artist: String
         var entries: [LibraryEntry]
+        var id: String { key }
     }
 
-    struct ArtistGroup {
+    struct ArtistGroup: Identifiable {
         let name: String
         var entries: [LibraryEntry]
+        var id: String { name }
     }
 }
 
@@ -443,14 +404,7 @@ private struct LocalSongRow: View {
 
     var body: some View {
         Button {
-            Task {
-                await appModel.loadSong(
-                    from: entry.fileURL,
-                    title: entry.title,
-                    artist: entry.artist,
-                    libraryEntry: entry.fileURL
-                )
-            }
+            Task { await appModel.playLocalEntry(entry) }
         } label: {
             HStack(spacing: 12) {
                 LocalArtTile(hashSeed: entry.title + entry.artist, size: 40, cornerRadius: 6)
@@ -465,6 +419,7 @@ private struct LocalSongRow: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 8)
+                ConflictBadge(entry: entry)
                 if appModel.library.cachedURLs.contains(entry.fileURL) {
                     Image(systemName: "checkmark.seal.fill")
                         .font(.system(size: 11))
@@ -487,6 +442,17 @@ private struct LocalSongRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovered = $0 }
+        .contextMenu {
+            Button {
+                Task { await appModel.playLocalEntry(entry) }
+            } label: { Label("Play Now", systemImage: "play.fill") }
+            Button {
+                Task { await appModel.queueNextLocal(entry) }
+            } label: { Label("Play Next", systemImage: "text.insert") }
+            Button {
+                Task { await appModel.queueLastLocal(entry) }
+            } label: { Label("Add to Queue", systemImage: "text.append") }
+        }
     }
 
     private func formatDuration(_ seconds: Double) -> String {
@@ -503,38 +469,56 @@ private struct LocalAlbumCard: View {
     let tracks: [LibraryEntry]
     let appModel: AppModel
 
+    @State private var showDetail = false
+
     var body: some View {
-        Button {
-            // Tap = load the first track of the album.
-            // Future enhancement: queue all tracks.
-            if let first = tracks.first {
-                Task {
-                    await appModel.loadSong(
-                        from: first.fileURL,
-                        title: first.title,
-                        artist: first.artist,
-                        libraryEntry: first.fileURL
-                    )
-                }
-            }
-        } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                LocalArtTile(hashSeed: title + subtitle, size: 140, cornerRadius: 6)
-                    .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
-                Text(title)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(2)
-                    .foregroundStyle(.primary)
-                    .frame(width: 140, alignment: .leading)
-                Text("\(subtitle) · \(tracks.count) track\(tracks.count == 1 ? "" : "s")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .frame(width: 140, alignment: .leading)
-            }
-            .frame(width: 140)
+        VStack(alignment: .leading, spacing: 6) {
+            LocalArtTile(hashSeed: title + subtitle, size: 140, cornerRadius: 6)
+                .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
+            Text(title)
+                .font(.subheadline.weight(.medium))
+                .lineLimit(2)
+                .foregroundStyle(.primary)
+                .frame(width: 140, alignment: .leading)
+            Text("\(subtitle) · \(tracks.count) track\(tracks.count == 1 ? "" : "s")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(width: 140, alignment: .leading)
         }
-        .buttonStyle(.plain)
+        .frame(width: 140)
+        .contentShape(Rectangle())
+        // Finder-style: single-click opens detail, double-click plays
+        // the whole album as a queue. `count: 2` first so SwiftUI
+        // defers `count: 1` past the double-click window — without
+        // that ordering, count:1 fires immediately and count:2 never
+        // gets a chance.
+        .onTapGesture(count: 2) {
+            playAlbum()
+        }
+        .onTapGesture(count: 1) {
+            showDetail = true
+        }
+        .contextMenu {
+            Button {
+                playAlbum()
+            } label: { Label("Play Album", systemImage: "play.fill") }
+            Button {
+                Task { await appModel.queueLastLocalEntries(tracks) }
+            } label: { Label("Add Album to Queue", systemImage: "text.append") }
+        }
+        .navigationDestination(isPresented: $showDetail) {
+            LocalAlbumDetailView(
+                title: title,
+                subtitle: subtitle,
+                tracks: tracks,
+                appModel: appModel
+            )
+        }
+    }
+
+    private func playAlbum() {
+        Task { await appModel.playLocalEntries(tracks, startAt: 0) }
     }
 }
 
@@ -544,36 +528,46 @@ private struct LocalArtistCard: View {
     let tracks: [LibraryEntry]
     let appModel: AppModel
 
+    @State private var showDetail = false
+
     var body: some View {
-        Button {
-            if let first = tracks.first {
-                Task {
-                    await appModel.loadSong(
-                        from: first.fileURL,
-                        title: first.title,
-                        artist: first.artist,
-                        libraryEntry: first.fileURL
-                    )
-                }
-            }
-        } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                LocalArtTile(hashSeed: name, size: 140, cornerRadius: 70)
-                    .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
-                Text(name)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(2)
-                    .foregroundStyle(.primary)
-                    .frame(width: 140, alignment: .leading)
-                Text("\(trackCount) song\(trackCount == 1 ? "" : "s")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .frame(width: 140, alignment: .leading)
-            }
-            .frame(width: 140)
+        VStack(alignment: .leading, spacing: 6) {
+            LocalArtTile(hashSeed: name, size: 140, cornerRadius: 70)
+                .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
+            Text(name)
+                .font(.subheadline.weight(.medium))
+                .lineLimit(2)
+                .foregroundStyle(.primary)
+                .frame(width: 140, alignment: .leading)
+            Text("\(trackCount) song\(trackCount == 1 ? "" : "s")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(width: 140, alignment: .leading)
         }
-        .buttonStyle(.plain)
+        .frame(width: 140)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            playArtist()
+        }
+        .onTapGesture(count: 1) {
+            showDetail = true
+        }
+        .contextMenu {
+            Button {
+                playArtist()
+            } label: { Label("Play Artist", systemImage: "play.fill") }
+            Button {
+                Task { await appModel.queueLastLocalEntries(tracks) }
+            } label: { Label("Add Artist to Queue", systemImage: "text.append") }
+        }
+        .navigationDestination(isPresented: $showDetail) {
+            LocalArtistDetailView(name: name, tracks: tracks, appModel: appModel)
+        }
+    }
+
+    private func playArtist() {
+        Task { await appModel.playLocalEntries(tracks, startAt: 0) }
     }
 }
 
@@ -581,7 +575,7 @@ private struct LocalArtistCard: View {
 /// hues from the seed string's hash so each (album / artist) gets a
 /// distinct but visually unified gradient. Music-note glyph overlays
 /// the gradient for instant recognizability.
-private struct LocalArtTile: View {
+struct LocalArtTile: View {
     let hashSeed: String
     let size: CGFloat
     var cornerRadius: CGFloat = 6
@@ -622,152 +616,186 @@ private struct LocalArtTile: View {
 
 // MARK: - Settings
 
+/// "Pick the visualizer that animates whatever audio is playing"
+/// surface. Used to live under Settings → Audio Input + Visualizer,
+/// but Settings had only this one functional thing left after Mac /
+/// Microphone moved to dedicated sidebar sources — so the whole
+/// surface became the Visualizers page.
 struct SettingsSourceView: View {
 
     @Environment(AppModel.self) private var appModel
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                SettingsCard(title: "Visualizer", systemImage: "sparkles") {
-                    visualizerContent
-                }
-                SettingsCard(title: "Audio Input", systemImage: "waveform") {
-                    audioInputContent
-                }
+            VStack(alignment: .leading, spacing: 24) {
+                hero
+                grid
+                Divider()
+                cycleToggleRow
+                Spacer(minLength: 0)
             }
-            .padding(20)
-            .frame(maxWidth: 600, alignment: .topLeading)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 24)
+            .frame(maxWidth: 880, alignment: .topLeading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .navigationTitle("Settings")
+        .navigationTitle("Visualizers")
     }
 
-    // MARK: Visualizer card content
-
-    private var visualizerContent: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            settingRow(label: "Mode", help: "Which animation drives the visualizer") {
-                Picker("", selection: Binding(
-                    get: { appModel.mode },
-                    set: { appModel.mode = $0 }
-                )) {
-                    ForEach(VisualizerMode.allCases) { m in
-                        Text(m.displayName).tag(m)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+    private var hero: some View {
+        HStack(spacing: 18) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.15))
+                    .frame(width: 64, height: 64)
+                Image(systemName: "sparkles")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
             }
-
-            if appModel.mode == .crystal {
-                Divider()
-                settingRow(
-                    label: "Additive beams",
-                    help: "Crystal v2 layered halo + core treatment"
-                ) {
-                    Toggle("", isOn: Binding(
-                        get: { appModel.useCrystalV2 },
-                        set: { appModel.useCrystalV2 = $0 }
-                    ))
-                    .labelsHidden()
-                }
-                settingRow(
-                    label: "Shard density",
-                    help: "Debug — keep at 1× for normal use"
-                ) {
-                    Picker("", selection: Binding(
-                        get: { CrystalVisualizerV2.synthShardMultiplier },
-                        set: { CrystalVisualizerV2.synthShardMultiplier = $0 }
-                    )) {
-                        Text("1×").tag(1)
-                        Text("2×").tag(2)
-                        Text("3×").tag(3)
-                        Text("5×").tag(5)
-                        Text("10×").tag(10)
-                        Text("20×").tag(20)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                }
-            }
-        }
-    }
-
-    // MARK: Audio input card content
-
-    private var audioInputContent: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
-                settingRow(
-                    label: "Listen to system audio",
-                    help: "Capture from Music, Spotify, browser, etc."
-                ) {
-                    Toggle("", isOn: Binding(
-                        get: { appModel.useSystemAudio },
-                        set: { appModel.useSystemAudio = $0 }
-                    ))
-                    .labelsHidden()
-                }
-                if appModel.useSystemAudio {
-                    SystemAudioSourcePicker()
-                        .padding(.leading, 2)
-                }
-                if appModel.useSystemAudio,
-                   let msg = appModel.systemAudio.errorMessage,
-                   appModel.systemAudio.isAuthorized == false {
-                    Text(msg)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-            }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                settingRow(
-                    label: "Listen with mic",
-                    help: "Use external speakers / vinyl / live audio"
-                ) {
-                    Toggle("", isOn: Binding(
-                        get: { appModel.useMic },
-                        set: { appModel.useMic = $0 }
-                    ))
-                    .labelsHidden()
-                }
-                if appModel.useMic, appModel.micListener.isAuthorized == false {
-                    Text("Microphone permission denied — enable in System Settings.")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-            }
-        }
-    }
-
-    // MARK: Row helper
-
-    /// Single row inside a settings card. Label + help text on the
-    /// left, control trailing-aligned. Helps each card read like a
-    /// clean form list rather than a stacked collection of widgets.
-    @ViewBuilder
-    private func settingRow<Control: View>(
-        label: String,
-        help: String?,
-        @ViewBuilder control: () -> Control
-    ) -> some View {
-        HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(label)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Visualizer modes")
+                    .font(.title2.weight(.semibold))
+                Text("Each mode is a different 3D scene that reacts to whatever audio is currently driving the analyzer. Tap to switch.")
                     .font(.callout)
-                if let help, !help.isEmpty {
-                    Text(help)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var grid: some View {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 200), spacing: 14)],
+            spacing: 14
+        ) {
+            ForEach(VisualizerMode.allCases) { mode in
+                VisualizerThumbnailCard(
+                    mode: mode,
+                    isSelected: appModel.mode == mode
+                ) {
+                    appModel.mode = mode
                 }
+            }
+        }
+    }
+
+    private var cycleToggleRow: some View {
+        // Read the tick so SwiftUI re-renders this row when the
+        // setter mutates UserDefaults — see [[AppModel.cycleVisualizersTick]].
+        let _ = appModel.cycleVisualizersTick
+        return HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Cycle on track change")
+                    .font(.callout)
+                Text("Advance to the next visualizer mode every time the song changes (manual skip, queue auto-advance, or AM next).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 16)
-            control()
-                .frame(maxWidth: 280, alignment: .trailing)
+            Toggle("", isOn: Binding(
+                get: { appModel.cycleVisualizersOnTrackChange },
+                set: { appModel.cycleVisualizersOnTrackChange = $0 }
+            ))
+            .labelsHidden()
+        }
+        .frame(maxWidth: 600, alignment: .leading)
+    }
+}
+
+// MARK: - Visualizer thumbnail card
+
+/// One card in the Visualizers grid. Renders an Asset-catalog image
+/// `viz-thumb-{mode.rawValue}` if it exists, otherwise a procedural
+/// gradient + SF Symbol fallback so the page is functional before
+/// real screenshots get dropped in.
+private struct VisualizerThumbnailCard: View {
+    let mode: VisualizerMode
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 8) {
+                thumbnail
+                    .frame(height: 130)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 3)
+                    }
+                HStack {
+                    Text(mode.displayName)
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.primary)
+                    Spacer(minLength: 4)
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var thumbnail: some View {
+        // Asset-catalog lookup first. NSImage(named:) returns nil for
+        // missing assets, so we can fall back gracefully to the
+        // procedural placeholder. Drop a PNG named e.g.
+        // "viz-thumb-crystal" into Assets.xcassets to replace.
+        let assetName = "viz-thumb-\(mode.rawValue)"
+        if let _ = NSImage(named: assetName) {
+            Image(assetName)
+                .resizable()
+                .scaledToFill()
+        } else {
+            placeholder
+        }
+    }
+
+    /// Hash-tinted gradient with the mode's representative glyph.
+    /// Each mode gets a distinct color theme so the grid is scannable
+    /// before real screenshots ship.
+    private var placeholder: some View {
+        let theme = Self.theme(for: mode)
+        return ZStack {
+            LinearGradient(
+                colors: theme.gradient,
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Image(systemName: theme.symbol)
+                .font(.system(size: 40, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.85))
+                .shadow(color: .black.opacity(0.3), radius: 6, y: 2)
+        }
+    }
+
+    private struct Theme {
+        let gradient: [Color]
+        let symbol: String
+    }
+
+    private static func theme(for mode: VisualizerMode) -> Theme {
+        switch mode {
+        case .crystal:
+            return Theme(gradient: [.purple, .pink], symbol: "diamond.fill")
+        case .clouds:
+            return Theme(gradient: [.cyan, .indigo], symbol: "cloud.fill")
+        case .rings:
+            return Theme(gradient: [.orange, .red], symbol: "circle.hexagongrid.fill")
+        case .slipstream:
+            return Theme(gradient: [.teal, .blue], symbol: "arrow.forward.circle.fill")
+        case .ambient:
+            return Theme(gradient: [.indigo, .purple], symbol: "sparkles")
+        case .dodecahedron:
+            return Theme(gradient: [.yellow, .red], symbol: "cube.transparent.fill")
+        case .fractal:
+            return Theme(gradient: [.pink, .green], symbol: "circle.dotted.circle.fill")
         }
     }
 }
@@ -918,5 +946,191 @@ struct ComingSoonView: View {
         }
     }
 }
+
+// MARK: - Microphone source
+
+/// "Listen to whatever's in the room via the built-in mic" surface.
+/// Owns the [[AppModel.useMic]] toggle that previously lived in
+/// Settings → Audio Input. Same hero + card vocabulary as the empty-
+/// state LocalSourceView.
+struct MicrophoneSourceView: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                hero
+                toggleCard
+                if appModel.useMic, appModel.micListener.isAuthorized == false {
+                    permissionWarning
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 24)
+            .frame(maxWidth: 760, alignment: .topLeading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .navigationTitle("Microphone")
+    }
+
+    private var hero: some View {
+        HStack(spacing: 18) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.15))
+                    .frame(width: 64, height: 64)
+                Image(systemName: "mic.fill")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Microphone input")
+                    .font(.title2.weight(.semibold))
+                Text("Capture live audio in the room — vinyl, an external speaker, an instrument — and visualize it as it plays.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var toggleCard: some View {
+        SettingsCard(title: "Listen", systemImage: "waveform") {
+            HStack(alignment: .center, spacing: 16) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Listen with mic")
+                        .font(.callout)
+                    Text("Stream the built-in microphone through the visualizer's live analyzer.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 16)
+                Toggle("", isOn: Binding(
+                    get: { appModel.useMic },
+                    set: { appModel.useMic = $0 }
+                ))
+                .labelsHidden()
+            }
+        }
+    }
+
+    private var permissionWarning: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text("Microphone permission denied — enable in System Settings → Privacy & Security → Microphone.")
+                .font(.callout)
+        }
+        .padding(12)
+        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .frame(maxWidth: 600, alignment: .leading)
+    }
+}
+
+// MARK: - Mac (system audio tap) source
+
+#if os(macOS)
+/// "Visualize whatever's making sound on this Mac" surface. Owns
+/// the [[AppModel.useSystemAudio]] toggle + the
+/// [[SystemAudioSourcePicker]] that previously lived in Settings →
+/// Audio Input. The picker is the "list of tappable processes" the
+/// user can choose — pinning to Music.app / Spotify / a browser /
+/// any other audio-emitting process.
+struct MacSourceView: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                hero
+                tapCard
+                if appModel.useSystemAudio,
+                   let msg = appModel.systemAudio.errorMessage,
+                   appModel.systemAudio.isAuthorized == false {
+                    permissionWarning(msg)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 24)
+            .frame(maxWidth: 760, alignment: .topLeading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .navigationTitle("Mac")
+    }
+
+    private var hero: some View {
+        HStack(spacing: 18) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.15))
+                    .frame(width: 64, height: 64)
+                Image(systemName: "desktopcomputer")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("System audio")
+                    .font(.title2.weight(.semibold))
+                Text("Tap any audio-emitting process on this Mac — Music.app, Spotify, a browser tab, anything — and visualize it without rerouting through Loopback or BlackHole.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var tapCard: some View {
+        SettingsCard(title: "Listen", systemImage: "speaker.wave.2.fill") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Tap system audio")
+                            .font(.callout)
+                        Text("CoreAudio process tap — no virtual driver required.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 16)
+                    Toggle("", isOn: Binding(
+                        get: { appModel.useSystemAudio },
+                        set: { appModel.useSystemAudio = $0 }
+                    ))
+                    .labelsHidden()
+                }
+                if appModel.useSystemAudio {
+                    Divider()
+                    HStack(alignment: .center, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Source")
+                                .font(.callout)
+                            Text("Which process to listen to.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 16)
+                        SystemAudioSourcePicker()
+                    }
+                }
+            }
+        }
+    }
+
+    private func permissionWarning(_ msg: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(msg)
+                .font(.callout)
+        }
+        .padding(12)
+        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .frame(maxWidth: 600, alignment: .leading)
+    }
+}
+#endif
 
 #endif

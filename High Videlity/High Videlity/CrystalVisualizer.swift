@@ -2,9 +2,22 @@
 //  CrystalVisualizer.swift
 //  High Videlity
 //
-//  Builds the Crystal visualization as RealityKit geometry.
-//  Increment 1: a static field of shard cones radiating from a center point —
-//  no audio, animation, or beams yet. Those layer in next.
+//  Shared infrastructure for the Crystal visualization. The V1
+//  builder (stacked cone shards) was retired with the Visualizers-
+//  page rebuild — [[CrystalVisualizerV2]] is the only Crystal
+//  implementation now. What's left here is the shared bits V2
+//  depends on:
+//
+//    • `ShardComponent` — per-shard data the animate loop reads
+//    • `BeamRole` — tags V2's shard / halo / core sub-entities so
+//      `animate` picks the right opacity curve per layer
+//    • `CrystalVisualizer.animate(...)` — per-frame transform +
+//      pop-in + breathing + camera inverse, called by both the
+//      windowed RealityView and the visionOS ImmersiveView paths
+//
+//  This file used to also host `makeCrystal(from:)` and
+//  `makeCrystal()` (the V1 builders). Those are gone; V2 owns
+//  scene construction now.
 //
 
 import RealityKit
@@ -37,134 +50,6 @@ struct BeamRole: Component {
 
 enum CrystalVisualizer {
 
-    /// Shard count for the synthetic placeholder structure.
-    private static let shardCount = 80
-
-    /// Builds the crystal from a real analyzed song — one shard per onset.
-    /// Direction comes from each onset's pitch-class hue (azimuth) and its
-    /// index (an even spread over the sphere); length comes from loudness.
-    static func makeCrystal(from frames: [FeatureFrame]) async -> Entity {
-        let onsets = frames.filter { $0.onset }
-        guard !onsets.isEmpty else { return makeCrystal() }   // fall back to synthetic
-
-        // One shared additive-blend program: beams add their light to the dark
-        // and stack toward white-hot where they overlap — the HTML's diffusion.
-        var descriptor = UnlitMaterial.Program.Descriptor()
-        descriptor.blendMode = .add
-        let additiveProgram = await UnlitMaterial.Program(descriptor: descriptor)
-
-        let root = Entity()
-        root.position = [0, 1.3, -1.5]
-        let n = onsets.count
-
-        for (i, frame) in onsets.enumerated() {
-            // Pitch class drives azimuth — matches the HTML reference exactly.
-            // Tonally consistent songs cluster into a fan; varied songs fill
-            // the sphere. The fan IS the faithful behavior.
-            let azimuth = frame.color.hue * 2 * .pi
-            let elevation = asin(1 - 2 * (Double(i) / Double(n)))   // even, pole to pole
-            let ce = cos(elevation)
-            let dir = SIMD3<Float>(
-                Float(ce * cos(azimuth)),
-                Float(sin(elevation)),
-                Float(ce * sin(azimuth))
-            )
-
-            let length = 0.14 + frame.loudness * 0.42              // loudness → length (m)
-            let baseRadius = 0.01 + length * 0.05
-            let mesh = MeshResource.generateCone(height: length, radius: baseRadius)
-
-            let saturation = min(1.0, 0.5 + Double(frame.loudness) * 1.6)
-            let brightness = min(1.0, 0.6 + frame.color.saturation * 1.2)
-            // HDR-boosted so the additive shard cones read as glowing
-            // wedges instead of flat dim slivers on the non-bloom-having
-            // macOS / iOS / tvOS pathway. On visionOS the same boost just
-            // pumps the OLED display past SDR for natural optical bloom.
-            let color = PlatformColor.hdrColor(
-                hue: CGFloat(frame.color.hue),
-                saturation: CGFloat(saturation),
-                brightness: CGFloat(brightness),
-                hdrBoost: 1.8
-            )
-            // Additive, like the beams — the cone glows and merges into the
-            // light instead of reading as a hard opaque spike.
-            var material = UnlitMaterial(program: additiveProgram)
-            material.color = .init(tint: color)
-            let shard = ModelEntity(mesh: mesh, materials: [material])
-
-            shard.orientation = simd_quatf(from: [0, 1, 0], to: dir)
-            shard.position = dir * (length / 2)
-            shard.scale = .zero                                    // hidden until its onset
-            shard.components.set(ShardComponent(
-                onsetTime: frame.time,
-                direction: dir,
-                length: length,
-                wobbleFreq: 0.6 + Double(i % 13) * 0.11,            // each shard its own rate
-                wobblePhase: Double(i) / Double(n) * 2 * .pi
-            ))
-
-            // Laser beam from the shard's tip: a bright thin white-hot core
-            // inside graded additive halos. All beam layers live under one
-            // beamGroup entity, so the loop can flare the whole beam with a
-            // single OpacityComponent rather than touching every material.
-            let beamLength = 0.6 + frame.loudness * 0.9
-            let beamBase = length / 2                          // where the beam starts
-            let beamY = beamBase + beamLength / 2              // core's center
-            let hue = CGFloat(frame.color.hue)
-            let beamGroup = Entity()
-
-            let coreMesh = MeshResource.generateCylinder(
-                height: beamLength,
-                radius: 0.012 + frame.loudness * 0.010         // bright filament — visible white-hot core
-            )
-            var coreMaterial = UnlitMaterial(program: additiveProgram)
-            // The brightest part of every beam — white-hot filament. Big
-            // HDR boost so it dominates the additive stack and reads as a
-            // pure-white line through the centre of each colored halo.
-            coreMaterial.color = .init(tint: PlatformColor.hdrColor(
-                hue: hue, saturation: 0.3, brightness: 1.0, hdrBoost: 3.5))
-            let core = ModelEntity(mesh: coreMesh, materials: [coreMaterial])
-            core.position = [0, beamY, 0]
-            beamGroup.addChild(core)
-
-            // Graded halo layers — concentric additive cylinders, each wider,
-            // dimmer, and longer than the core. The stacked additive falloff
-            // reads as soft diffusion both around the beam and past its tip.
-            let haloGrades: [(base: Float, loud: Float, brightness: CGFloat, extend: Float)] = [
-                (0.020, 0.015, 0.70, 0.07),
-                (0.035, 0.020, 0.45, 0.18),
-                (0.055, 0.025, 0.25, 0.38),
-            ]
-            for grade in haloGrades {
-                let haloLen = beamLength + grade.extend        // extends past the tip
-                let haloMesh = MeshResource.generateCylinder(
-                    height: haloLen,
-                    radius: grade.base + frame.loudness * grade.loud
-                )
-                var haloMaterial = UnlitMaterial(program: additiveProgram)
-                // Coloured halo layers — moderate HDR boost so they glow
-                // visibly around the core without overpowering it.
-                haloMaterial.color = .init(tint: PlatformColor.hdrColor(
-                    hue: hue, saturation: 1.0, brightness: grade.brightness, hdrBoost: 2.2))
-                let halo = ModelEntity(mesh: haloMesh, materials: [haloMaterial])
-                halo.position = [0, beamBase + haloLen / 2, 0] // base-aligned with the core
-                beamGroup.addChild(halo)
-            }
-
-            shard.addChild(beamGroup)
-            root.addChild(shard)
-        }
-        return root
-    }
-
-    /// Per-frame animation: each shard pops in when the clock passes its
-    /// onset, then "breathes" — stretching along its length with the music.
-    ///
-    /// `useHeadLockedCamera` switches between the visionOS pathway (cluster
-    /// carries an inverse-camera transform so a viewer at (0,1.5,0) sees the
-    /// HTML camera's orbital frame) and the windowed pathway (cluster stays
-    /// at the position its parent put it, real RealityKit camera looks at
-    /// it). The shard pop-in / breathing math is identical either way.
     static func animate(_ crystal: Entity, clock: Double, energy: Float, deltaTime: Double,
                         camPos: inout SIMD3<Float>, camLook: inout SIMD3<Float>,
                         useHeadLockedCamera: Bool = true,
@@ -374,42 +259,4 @@ enum CrystalVisualizer {
         }
     }
 
-    /// Builds the crystal root entity, positioned in front of the viewer.
-    static func makeCrystal() -> Entity {
-        let root = Entity()
-        root.position = [0, 1.3, -1.5]   // ~1.3 m up, 1.5 m in front of the user
-
-        for i in 0..<shardCount {
-            // Fibonacci sphere — evenly distributed directions over the sphere.
-            let t = Double(i) / Double(shardCount)
-            let elevation = asin(2 * t - 1)            // -90°...+90°
-            let azimuth = Double(i) * 2.399963229728   // golden angle
-            let ce = cos(elevation)
-            let dir = SIMD3<Float>(
-                Float(ce * cos(azimuth)),
-                Float(sin(elevation)),
-                Float(ce * sin(azimuth))
-            )
-
-            // Shard size in meters — varied so it reads as a crystal, not a ball.
-            let length = Float(0.18 + 0.30 * abs(sin(Double(i) * 1.7)))
-            let baseRadius = 0.012 + length * 0.05
-
-            let mesh = MeshResource.generateCone(height: length, radius: baseRadius)
-
-            // Hue cycles around the structure — stand-in for pitch class.
-            let hue = CGFloat((azimuth / (2 * .pi)).truncatingRemainder(dividingBy: 1))
-            let color = PlatformColor(hue: hue, saturation: 0.85, brightness: 1.0, alpha: 1.0)
-            let shard = ModelEntity(mesh: mesh, materials: [UnlitMaterial(color: color)])
-
-            // generateCone is centered on the origin with its axis along +Y.
-            // Rotate +Y onto the shard's direction, then push it out so the
-            // cone's base sits at the structure's center.
-            shard.orientation = simd_quatf(from: [0, 1, 0], to: dir)
-            shard.position = dir * (length / 2)
-
-            root.addChild(shard)
-        }
-        return root
-    }
 }

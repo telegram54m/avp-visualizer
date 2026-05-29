@@ -42,6 +42,18 @@ struct NowPlayingView: View {
     }
     @State private var tab: SecondaryTab = .upNext
 
+    /// True when the local AVAudioPlayer is the active source — drives
+    /// the local branch of the inspector so it doesn't read "Nothing
+    /// playing" while a local track is actually loaded into the
+    /// visualizer pipeline.
+    private var isLocalPlaybackActive: Bool {
+        #if os(macOS)
+        return appModel.hasLocalPlaybackSource || appModel.localQueue.currentItem != nil
+        #else
+        return appModel.hasLocalPlaybackSource
+        #endif
+    }
+
     var body: some View {
         // Reading `mk.nowPlaying` is fine in the outer body — it
         // only changes on track change, not 8 Hz. The scrubber and
@@ -80,6 +92,23 @@ struct NowPlayingView: View {
                 .pickerStyle(.segmented)
                 secondaryContent
                 Spacer(minLength: 0)
+            } else if isLocalPlaybackActive {
+                #if os(macOS)
+                LocalNowPlayingHeader(
+                    title: appModel.currentTrackTitle,
+                    artist: appModel.currentTrackArtist
+                )
+                LocalTransportRow()
+                Divider()
+                Picker("", selection: $tab) {
+                    ForEach(SecondaryTab.allCases) { t in
+                        Text(t.rawValue).tag(t)
+                    }
+                }
+                .pickerStyle(.segmented)
+                secondaryContent
+                Spacer(minLength: 0)
+                #endif
             } else {
                 Spacer()
                 VStack(spacing: 10) {
@@ -89,7 +118,7 @@ struct NowPlayingView: View {
                     Text("Nothing playing")
                         .font(.headline)
                         .foregroundStyle(.secondary)
-                    Text("Search Apple Music and tap a song to begin.")
+                    Text("Pick a song from Apple Music or your Local Library to begin.")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .multilineTextAlignment(.center)
@@ -151,6 +180,94 @@ private struct NowPlayingHeader: View {
         .frame(maxWidth: .infinity)
     }
 }
+
+// MARK: - Local-playback header + transport (macOS only)
+
+#if os(macOS)
+/// Local-file equivalent of [[NowPlayingHeader]]. No MusicKit
+/// artwork — the visual anchor falls back to the same hash-tinted
+/// gradient tile used elsewhere on the Local Library surfaces, so
+/// the inspector reads as a continuation of those rather than a
+/// separate-looking screen.
+private struct LocalNowPlayingHeader: View {
+    let title: String
+    let artist: String
+
+    var body: some View {
+        let resolvedTitle = title.isEmpty ? "Untitled track" : title
+        VStack(spacing: 10) {
+            LocalArtTile(hashSeed: resolvedTitle + artist, size: 220, cornerRadius: 10)
+                .shadow(radius: 8, y: 4)
+            VStack(spacing: 2) {
+                Text(resolvedTitle)
+                    .font(.title3)
+                    .bold()
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                if !artist.isEmpty {
+                    Text(artist)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Text("Local Library")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+/// Local-file transport row — prev / play-pause / next mapped to
+/// AppModel's local queue + AVAudioPlayer methods. Prev/next disable
+/// at the queue boundaries; play-pause reads `isLocalPlaybackPlaying`
+/// (which AVAudioPlayer doesn't publish, so a 1 Hz heartbeat on
+/// `appModel.localQueueTick` would keep this fresh — for now the
+/// inspector re-evaluates on user input and on track changes which
+/// covers the common cases).
+private struct LocalTransportRow: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        HStack(spacing: 20) {
+            Button {
+                Task { await appModel.localPlayerSkipToPrevious() }
+            } label: {
+                Image(systemName: "backward.fill").imageScale(.large)
+            }
+            .buttonStyle(.borderless)
+            .disabled(!appModel.localQueue.hasPrevious)
+            .help("Previous")
+
+            Button {
+                if appModel.isLocalPlaybackPlaying {
+                    appModel.pauseLocalPlayback()
+                } else {
+                    appModel.resumeLocalPlayback()
+                }
+            } label: {
+                Image(systemName: appModel.isLocalPlaybackPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 28))
+            }
+            .buttonStyle(.borderless)
+            .help(appModel.isLocalPlaybackPlaying ? "Pause" : "Play")
+
+            Button {
+                Task { await appModel.localPlayerSkipToNext() }
+            } label: {
+                Image(systemName: "forward.fill").imageScale(.large)
+            }
+            .buttonStyle(.borderless)
+            .disabled(!appModel.localQueue.hasNext)
+            .help("Next")
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+    }
+}
+#endif
 
 // MARK: - Transport (invalidates only on isPlaying / sleepTimer changes)
 

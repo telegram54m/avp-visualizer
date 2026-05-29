@@ -127,31 +127,10 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 320)
 
-                if appModel.mode == .crystal {
-                    Toggle("Crystal v2 — additive beams", isOn: Binding(
-                        get: { appModel.useCrystalV2 },
-                        set: { appModel.useCrystalV2 = $0 }
-                    ))
-                    .frame(maxWidth: 320)
-
-                    // DEBUG: shard density saturation test. Re-open the
-                    // visualizer after changing to see the new count.
-                    // Default 1 = real onset count (~30-50 for a 30s preview).
-                    // Reset to 1 before shipping.
-                    Picker("Density ×", selection: Binding(
-                        get: { CrystalVisualizerV2.synthShardMultiplier },
-                        set: { CrystalVisualizerV2.synthShardMultiplier = $0 }
-                    )) {
-                        Text("1×").tag(1)
-                        Text("2×").tag(2)
-                        Text("3×").tag(3)
-                        Text("5×").tag(5)
-                        Text("10×").tag(10)
-                        Text("20×").tag(20)
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(maxWidth: 320)
-                }
+                // Crystal v1/v2 toggle removed — V2 is the only
+                // implementation now. The shard-density debug picker
+                // also retired; bump CrystalVisualizerV2.synthShardMultiplier
+                // directly if you need it for testing.
 
                 #if os(iOS)
                 // iOS-recommended path: observe Music.app's now-playing

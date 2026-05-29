@@ -129,17 +129,18 @@ struct VisualizerView: View {
 
             switch appModel.mode {
             case .crystal:
+                // V2 only. The legacy v1 (stacked cylinders) was
+                // retired with the Visualizers-page rebuild —
+                // CrystalVisualizer.swift is dead code now, kept on
+                // disk for diff context only.
                 let crystal: Entity
-                if isLive && appModel.useCrystalV2 {
+                if isLive {
                     crystal = await CrystalVisualizerV2.makeCrystalLive(
                         startingFrameIndex: liveStartIndex,
                         startingResetCounter: liveStartResetCounter
                     )
-                } else if appModel.useCrystalV2 {
-                    crystal = await CrystalVisualizerV2.makeCrystal(from: appModel.frames)
                 } else {
-                    // v1 has no live-mode path; fall back to preview build.
-                    crystal = await CrystalVisualizer.makeCrystal(from: appModel.frames)
+                    crystal = await CrystalVisualizerV2.makeCrystal(from: appModel.frames)
                 }
                 crystal.position = .zero
                 content.add(crystal)
@@ -148,7 +149,7 @@ struct VisualizerView: View {
                     to: SceneEvents.Update.self
                 ) { event in
                     appModel.recordFrameDelta(event.deltaTime)
-                    if isLive && appModel.useCrystalV2 {
+                    if isLive {
                         CrystalVisualizerV2.scanForNewOnsets(
                             crystal,
                             frames: appModel.frames,
@@ -575,8 +576,21 @@ struct VisualizerView: View {
         // bright pill over the visualizer's lower edge.
         .persistentSystemOverlays(.hidden)
         #endif
+        // `.onAppear { startPlayback() }` is the legacy entry point
+        // for the iOS / ContentView flow where picking a song calls
+        // `loadSong` (features only) and then opening the visualizer
+        // kicks audio. On macOS the queue paths already start audio
+        // via `loadAndPlayLocalFast`; the re-entry guard inside
+        // `startPlayback` no-ops the duplicate call here.
+        //
+        // **No matching `.onDisappear { stopPlayback() }`** — that
+        // fired on every `.id(appModel.mode)` remount (mode-cycle),
+        // releasing the live player mid-song and the next `onAppear`
+        // would rebuild a fresh player from 00:00 (audible as a
+        // song restart on every mode swap). Audio is now owned by
+        // the queue / source layer and survives closing the
+        // visualizer — matches Music.app behavior.
         .onAppear { appModel.startPlayback() }
-        .onDisappear { appModel.stopPlayback() }
         #if os(macOS)
         // Mirror ContentView's Now-Playing inspector here so the
         // panel can be opened/closed without backing out of the

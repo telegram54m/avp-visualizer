@@ -36,7 +36,7 @@ struct LyricsView: View {
     /// Currently-active line ID — derived per render from playbackTime.
     /// Drives both the highlight + the auto-scroll trigger.
     private var activeLineID: UUID? {
-        let t = appModel.musicKit.playbackTime
+        let t = currentPlaybackTime
         // Walk forward until we find the first line whose end is past
         // playbackTime. Linear scan is fine for typical 50-200-line
         // lyrics; binary search not worth the complexity.
@@ -57,30 +57,91 @@ struct LyricsView: View {
         return candidate?.id
     }
 
+    /// Unified "what's playing" descriptor — built from AM if a
+    /// MusicKit song is active, otherwise from local-playback state.
+    /// `lookupKey` is whatever the task should re-fire on (catalog
+    /// ID for AM, file URL for local); `playbackTime` selects which
+    /// clock drives the highlight.
+    private struct LyricsContext: Equatable {
+        let title: String
+        let artist: String
+        let album: String?
+        let duration: TimeInterval?
+        let lookupKey: String
+        let isAppleMusic: Bool
+    }
+
+    private var context: LyricsContext? {
+        if let song = appModel.musicKit.nowPlaying {
+            return LyricsContext(
+                title: song.title,
+                artist: song.artistName,
+                album: song.albumTitle,
+                duration: song.duration,
+                lookupKey: "am:" + song.id.rawValue,
+                isAppleMusic: true
+            )
+        }
+        #if os(macOS)
+        if appModel.hasLocalPlaybackSource || appModel.localQueue.currentItem != nil {
+            let title = appModel.currentTrackTitle
+            let artist = appModel.currentTrackArtist
+            // Need at least title + artist for lrclib to have a
+            // shot; otherwise treat as no-lyrics-context.
+            guard !title.isEmpty, !artist.isEmpty else { return nil }
+            let key = appModel.currentLibraryEntryURL?.absoluteString
+                ?? "local:\(title)|\(artist)"
+            return LyricsContext(
+                title: title,
+                artist: artist,
+                album: nil, // LibraryEntry's album doesn't flow through here yet
+                duration: appModel.localPlaybackDuration,
+                lookupKey: "local:" + key,
+                isAppleMusic: false
+            )
+        }
+        #endif
+        return nil
+    }
+
+    /// Active playback time in seconds. AM uses MusicKit's polled
+    /// `playbackTime`; local uses AVAudioPlayer's `currentTime`
+    /// surfaced via [[AppModel.localPlaybackCurrentTime]].
+    private var currentPlaybackTime: TimeInterval {
+        if appModel.musicKit.nowPlaying != nil {
+            return appModel.musicKit.playbackTime
+        }
+        #if os(macOS)
+        return appModel.localPlaybackCurrentTime ?? 0
+        #else
+        return 0
+        #endif
+    }
+
     var body: some View {
-        let song = appModel.musicKit.nowPlaying
+        let ctx = context
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Lyrics").font(.headline)
-                if let song {
+                if let ctx {
                     Spacer()
-                    Text(song.title)
+                    Text(ctx.title)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
             }
-            content
+            content(ctx: ctx)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .task(id: song?.id) {
-            await loadLyrics()
+        .task(id: ctx?.lookupKey) {
+            await loadLyrics(ctx: ctx)
         }
     }
 
     @ViewBuilder
-    private var content: some View {
-        if appModel.musicKit.nowPlaying == nil {
+    private func content(ctx: LyricsContext?) -> some View {
+        if ctx == nil {
             placeholder("No song playing.")
         } else if isLoading {
             HStack { ProgressView().controlSize(.small); Text("Loading lyrics…").font(.caption).foregroundStyle(.secondary) }
@@ -101,7 +162,12 @@ struct LyricsView: View {
     }
 
     private var syncedLyricsView: some View {
-        ScrollViewReader { proxy in
+        // Only AM supports seek-on-tap right now (AVAudioPlayer has
+        // `currentTime` but the local audio session + visualizer
+        // timeline aren't wired for jumps yet). Local lyrics still
+        // scroll-track passively; tapping just doesn't do anything.
+        let canSeek = appModel.musicKit.nowPlaying != nil
+        return ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(lines) { line in
@@ -112,7 +178,9 @@ struct LyricsView: View {
                             .id(line.id)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .onTapGesture {
-                                appModel.musicKit.seek(to: line.begin)
+                                if canSeek {
+                                    appModel.musicKit.seek(to: line.begin)
+                                }
                             }
                     }
                 }
@@ -140,11 +208,11 @@ struct LyricsView: View {
 
     // MARK: - Loading
 
-    private func loadLyrics() async {
+    private func loadLyrics(ctx: LyricsContext?) async {
         lines = []
         rawLyrics = nil
         loadError = nil
-        guard let song = appModel.musicKit.nowPlaying else { return }
+        guard let ctx else { return }
         isLoading = true
         defer { isLoading = false }
 
@@ -155,20 +223,22 @@ struct LyricsView: View {
         // both /songs/{id}/lyrics and /songs/{id}?include=lyrics.
         // Pivot to lrclib.net (community-maintained, free, no API
         // key) which serves LRC-format time-synced lyrics for most
-        // mainstream catalog.
+        // mainstream catalog. Same endpoint covers local-file
+        // lookups too — lrclib doesn't care about catalog IDs,
+        // just title + artist (+ optional album / duration).
 
         var components = URLComponents(string: "https://lrclib.net/api/get")!
         var queryItems: [URLQueryItem] = [
-            URLQueryItem(name: "artist_name", value: song.artistName),
-            URLQueryItem(name: "track_name", value: song.title)
+            URLQueryItem(name: "artist_name", value: ctx.artist),
+            URLQueryItem(name: "track_name", value: ctx.title)
         ]
-        if let album = song.albumTitle, !album.isEmpty {
+        if let album = ctx.album, !album.isEmpty {
             queryItems.append(URLQueryItem(name: "album_name", value: album))
         }
         // Duration helps lrclib disambiguate covers / live versions
         // / remixes that share title + artist. Sub-second mismatches
         // are tolerated by their fuzzy matcher.
-        if let dur = song.duration, dur > 0 {
+        if let dur = ctx.duration, dur > 0 {
             queryItems.append(URLQueryItem(name: "duration", value: String(Int(dur.rounded()))))
         }
         components.queryItems = queryItems
@@ -176,7 +246,7 @@ struct LyricsView: View {
             lyricsLog.info("HV-LYRICS url construction failed")
             return
         }
-        lyricsLog.info("HV-LYRICS song=\"\(song.title, privacy: .public)\" by \"\(song.artistName, privacy: .public)\"")
+        lyricsLog.info("HV-LYRICS song=\"\(ctx.title, privacy: .public)\" by \"\(ctx.artist, privacy: .public)\" source=\(ctx.isAppleMusic ? "AM" : "local", privacy: .public)")
         lyricsLog.info("HV-LYRICS GET \(url.absoluteString, privacy: .public)")
 
         var request = URLRequest(url: url)

@@ -32,6 +32,9 @@ struct LocalPlaybackHUD: View {
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 6) {
+            #if os(macOS)
+            inspectorRow
+            #endif
             sourceLine
             transportRow
         }
@@ -47,6 +50,31 @@ struct LocalPlaybackHUD: View {
             tickerTrigger = Date()
         }
     }
+
+    #if os(macOS)
+    /// Inspector toggle + "Local Library" tag, matching the
+    /// system-audio NowPlayingBadge's top row. Lets the user open
+    /// the Up Next / inspector panel from inside the visualizer
+    /// without leaving the full-bleed view.
+    private var inspectorRow: some View {
+        HStack(spacing: 6) {
+            Button {
+                appModel.showNowPlayingInspector = true
+            } label: {
+                Image(systemName: "sidebar.right")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.7))
+            }
+            .buttonStyle(.plain)
+            .help("Open Now Playing panel")
+            .accessibilityLabel("Open Now Playing panel")
+
+            Text("Local Library")
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.white.opacity(0.55))
+        }
+    }
+    #endif
 
     /// Title — Artist when both are known; just title or "Local file"
     /// fallback otherwise. Caps at one line to keep the HUD compact.
@@ -73,14 +101,25 @@ struct LocalPlaybackHUD: View {
 
     private var transportRow: some View {
         HStack(spacing: 10) {
+            // Previous: jumps to the prior queue entry when the
+            // local queue has one; otherwise restarts the current
+            // track (familiar dual-action pattern from Music.app).
             Button {
+                #if os(macOS)
+                if appModel.localQueue.hasPrevious {
+                    Task { await appModel.localPlayerSkipToPrevious() }
+                } else {
+                    appModel.restartLocalPlayback()
+                }
+                #else
                 appModel.restartLocalPlayback()
+                #endif
                 tickerTrigger = Date()
             } label: {
                 Image(systemName: "backward.end.fill")
                     .frame(width: 24, height: 24)
             }
-            .help("Restart from beginning")
+            .help(previousButtonHelp)
 
             Button {
                 if appModel.isLocalPlaybackPlaying {
@@ -95,23 +134,38 @@ struct LocalPlaybackHUD: View {
             }
             .help(appModel.isLocalPlaybackPlaying ? "Pause" : "Play")
 
-            // Next-track is library-only. Hidden for one-off file
-            // imports since "next" has no defined meaning there.
+            // Next: prefers the queue when populated, falls back to
+            // walking the LibraryStore's sort order (the original
+            // behavior for one-off library plays with no queue).
             #if os(macOS)
-            if appModel.currentLibraryEntryURL != nil {
+            if appModel.localQueue.hasNext || appModel.currentLibraryEntryURL != nil {
                 Button {
-                    playNextLibraryEntry()
+                    if appModel.localQueue.hasNext {
+                        Task { await appModel.localPlayerSkipToNext() }
+                    } else {
+                        playNextLibraryEntry()
+                    }
                 } label: {
                     Image(systemName: "forward.end.fill")
                         .frame(width: 24, height: 24)
                 }
-                .help("Next track in library")
+                .help(appModel.localQueue.hasNext ? "Next in queue" : "Next track in library")
             }
             #endif
         }
         .buttonStyle(.borderless)
         .font(.title3)
         .foregroundStyle(.white)
+    }
+
+    /// Help text for the prev/restart button. Distinguishes the two
+    /// modes so the tooltip matches what'll actually happen.
+    private var previousButtonHelp: String {
+        #if os(macOS)
+        return appModel.localQueue.hasPrevious ? "Previous in queue" : "Restart from beginning"
+        #else
+        return "Restart from beginning"
+        #endif
     }
 
     #if os(macOS)

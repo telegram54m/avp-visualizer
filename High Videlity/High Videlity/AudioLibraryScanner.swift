@@ -46,6 +46,14 @@ struct LibraryEntry: Identifiable, Hashable, Sendable {
     let genre: String?
     let durationSeconds: Double
     let fileSize: Int64
+    // Tier 1 enrichment — small scalar fields lifted from ID3 /
+    // iTunes metadata at scan time. All optional so the field-add
+    // is backward-compatible: rows that don't have tagged values
+    // just render without them.
+    let trackNumber: Int?
+    let discNumber: Int?
+    let year: Int?
+    let composer: String?
 }
 
 enum AudioLibraryScanner {
@@ -165,7 +173,7 @@ enum AudioLibraryScanner {
         var artist: String?
         var album: String?
         var genre: String?
-        var hasTrackNumber = false
+        var composer: String?
         for item in metadata {
             guard let common = item.commonKey?.rawValue else { continue }
             let stringValue = item.stringValue
@@ -179,17 +187,68 @@ enum AudioLibraryScanner {
             case "type":
                 // Common key "type" maps to genre across formats.
                 if let s = stringValue, !s.isEmpty { genre = s }
+            case "creator":
+                // Common-key "creator" maps to composer on QuickTime/
+                // iTunes-tagged files. ID3 TCOM lives outside common
+                // space; we read it from the ID3 key below.
+                if let s = stringValue, !s.isEmpty { composer = s }
             default:
                 break
             }
         }
-        // Track number lives outside the common key space. Check the
-        // ID3 + iTunes specific spaces.
-        for item in metadata {
-            let key = item.key as? String ?? ""
-            if key == "trkn" || key.contains("track") {
+        // Track / disc number + year + composer live outside the
+        // common key space. Use AVMetadataIdentifier — Apple's
+        // canonical cross-format lookup — instead of raw `item.key`,
+        // because for QuickTime atoms the key comes back as an
+        // NSNumber containing the FourCC packed as bytes, not as
+        // the human-readable atom string. Empirically this missed
+        // every `trkn` value on m4a files.
+        var trackNumber: Int?
+        var discNumber: Int?
+        var year: Int?
+        var hasTrackNumber = false
+        // iTunes (m4a / QuickTime) identifiers + ID3 identifiers,
+        // both checked. Most files only carry one set.
+        let trackIdentifiers: [AVMetadataIdentifier] = [
+            .iTunesMetadataTrackNumber,
+            .id3MetadataTrackNumber,
+        ]
+        let discIdentifiers: [AVMetadataIdentifier] = [
+            .iTunesMetadataDiscNumber,
+            .id3MetadataPartOfASet,
+        ]
+        let yearIdentifiers: [AVMetadataIdentifier] = [
+            .iTunesMetadataReleaseDate,
+            .id3MetadataYear,
+            .id3MetadataRecordingTime,
+            .id3MetadataReleaseTime,
+            .commonIdentifierCreationDate,
+        ]
+        let composerIdentifiers: [AVMetadataIdentifier] = [
+            .iTunesMetadataComposer,
+            .id3MetadataComposer,
+        ]
+        for ident in trackIdentifiers {
+            for item in AVMetadataItem.metadataItems(from: metadata, filteredByIdentifier: ident) {
                 hasTrackNumber = true
-                break
+                if trackNumber == nil { trackNumber = Self.parseTrackOrDisc(item) }
+            }
+        }
+        for ident in discIdentifiers {
+            for item in AVMetadataItem.metadataItems(from: metadata, filteredByIdentifier: ident) {
+                if discNumber == nil { discNumber = Self.parseTrackOrDisc(item) }
+            }
+        }
+        for ident in yearIdentifiers {
+            for item in AVMetadataItem.metadataItems(from: metadata, filteredByIdentifier: ident) {
+                guard year == nil, let raw = item.stringValue else { continue }
+                let prefix = String(raw.prefix(4))
+                if let n = Int(prefix), n > 1900, n < 2200 { year = n }
+            }
+        }
+        for ident in composerIdentifiers {
+            for item in AVMetadataItem.metadataItems(from: metadata, filteredByIdentifier: ident) {
+                if composer == nil, let s = item.stringValue, !s.isEmpty { composer = s }
             }
         }
 
@@ -215,8 +274,33 @@ enum AudioLibraryScanner {
             album: album,
             genre: genre,
             durationSeconds: duration,
-            fileSize: fileSize
+            fileSize: fileSize,
+            trackNumber: trackNumber,
+            discNumber: discNumber,
+            year: year,
+            composer: composer
         )
+    }
+
+    /// iTunes / QuickTime `trkn` and `disk` items wrap the (number,
+    /// total) pair as 8 binary bytes. ID3 TRCK / TPOS use strings
+    /// like "3/12". Returns just the leading number (we ignore the
+    /// "of N" half for now).
+    private static func parseTrackOrDisc(_ item: AVMetadataItem) -> Int? {
+        if let n = item.numberValue?.intValue, n > 0 {
+            return n
+        }
+        if let raw = item.stringValue {
+            return Int(raw.split(separator: "/").first ?? "")
+        }
+        // iTunes `trkn` dataValue: [0, 0, trackHi, trackLo, totalHi, totalLo, 0, 0]
+        if let data = item.dataValue, data.count >= 4 {
+            let hi = Int(data[2])
+            let lo = Int(data[3])
+            let combined = (hi << 8) | lo
+            if combined > 0 { return combined }
+        }
+        return nil
     }
 }
 

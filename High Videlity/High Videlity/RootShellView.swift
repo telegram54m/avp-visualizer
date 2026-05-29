@@ -89,6 +89,24 @@ struct RootShellView: View {
                 sidebar
             } detail: {
                 detail
+                    // Now-Playing inspector slides in from the right of
+                    // the detail column. Visibility lives on AppModel so
+                    // both the footer toggle and the visualizer's badge
+                    // can drive it from anywhere in the shell. Mount
+                    // conditionally — NowPlayingView's 8 Hz
+                    // playbackTime invalidations keep firing while
+                    // mounted, which would shave fps off the viz even
+                    // after the user collapses the panel.
+                    .inspector(isPresented: Binding(
+                        get: { appModel.showNowPlayingInspector },
+                        set: { appModel.showNowPlayingInspector = $0 }
+                    )) {
+                        if appModel.showNowPlayingInspector {
+                            NowPlayingView()
+                                .environment(appModel)
+                                .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
+                        }
+                    }
             }
             // Persistent footer below the SplitView, spanning both
             // columns. Match the macOS chrome with a thin material
@@ -109,13 +127,17 @@ struct RootShellView: View {
             Section {
                 row(.appleMusic)
                 row(.local)
+                #if os(macOS)
+                row(.mac)
+                #endif
+                row(.microphone)
                 row(.spotify)
                 row(.youTubeMusic)
             } header: {
                 sectionHeader("SOURCES")
             }
             Section {
-                row(.settings)
+                row(.visualizers)
             } header: {
                 sectionHeader("APP")
             }
@@ -187,11 +209,19 @@ struct RootShellView: View {
             NavigationStack { AppleMusicSourceView() }
         case .local:
             NavigationStack { LocalSourceView() }
+        case .mac:
+            #if os(macOS)
+            NavigationStack { MacSourceView() }
+            #else
+            NavigationStack { ComingSoonView(source: .mac) }
+            #endif
+        case .microphone:
+            NavigationStack { MicrophoneSourceView() }
         case .spotify:
             NavigationStack { ComingSoonView(source: .spotify) }
         case .youTubeMusic:
             NavigationStack { ComingSoonView(source: .youTubeMusic) }
-        case .settings:
+        case .visualizers:
             NavigationStack { SettingsSourceView() }
         }
     }
@@ -239,10 +269,17 @@ struct GlobalNowPlayingFooter: View {
             HStack(spacing: 16) {
                 sourceBlock
                 Spacer(minLength: 16)
-                if appModel.musicKit.isPlaying || appModel.musicKit.nowPlaying != nil {
+                // Pick the transport that matches the active source.
+                // Local wins if local playback is current (the queue
+                // owns the audio path); otherwise AM if AM is loaded.
+                if isLocalPlaybackActive {
+                    LocalMiniTransport()
+                        .environment(appModel)
+                } else if appModel.musicKit.isPlaying || appModel.musicKit.nowPlaying != nil {
                     MiniTransport(musicKit: appModel.musicKit)
                 }
                 Spacer(minLength: 16)
+                nowPlayingInspectorToggle
                 openVisualizerButton
             }
             .padding(.horizontal, 20)
@@ -271,6 +308,13 @@ struct GlobalNowPlayingFooter: View {
         .animation(.easeInOut(duration: 0.4), value: appModel.musicKit.nowPlaying?.id)
     }
 
+    /// True when the local-file player owns the audio path. Local
+    /// playback isn't reflected on `musicKit.nowPlaying`, so the
+    /// footer needs an explicit check to render its source block.
+    private var isLocalPlaybackActive: Bool {
+        appModel.hasLocalPlaybackSource || appModel.localQueue.currentItem != nil
+    }
+
     // Left side: source-agnostic now-playing block. When MusicKit has
     // a track, lean into the artwork — that's the visual anchor of the
     // whole footer. Otherwise show a quieter status row.
@@ -294,6 +338,32 @@ struct GlobalNowPlayingFooter: View {
                             .foregroundStyle(.tertiary)
                             .lineLimit(1)
                     }
+                }
+            }
+        } else if isLocalPlaybackActive {
+            // Local file. No MusicKit artwork — fall back to the
+            // same hash-tinted gradient placeholder used elsewhere in
+            // the Local Library surfaces so the visual vocabulary
+            // stays consistent across the source's cards/rows/footer.
+            let title = appModel.currentTrackTitle.isEmpty ? "Untitled track" : appModel.currentTrackTitle
+            let artist = appModel.currentTrackArtist
+            HStack(spacing: 12) {
+                LocalArtTile(hashSeed: title + artist, size: 52, cornerRadius: 6)
+                    .shadow(color: .black.opacity(0.25), radius: 4, x: 0, y: 2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.callout.weight(.semibold))
+                        .lineLimit(1)
+                    if !artist.isEmpty {
+                        Text(artist)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Text("Local Library")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
                 }
             }
         } else if appModel.useSystemAudio {
@@ -378,6 +448,75 @@ struct GlobalNowPlayingFooter: View {
         }
         .buttonStyle(.plain)
         .shadow(color: .accentColor.opacity(0.35), radius: 6, x: 0, y: 2)
+    }
+
+    /// Toggle for the Now Playing inspector panel (slides in from
+    /// the right of the detail column). Mirrors the toolbar button
+    /// the legacy ContentView shell exposes; lives here so the new
+    /// RootShellView gets the same affordance.
+    private var nowPlayingInspectorToggle: some View {
+        Button {
+            appModel.showNowPlayingInspector.toggle()
+        } label: {
+            Image(systemName: appModel.showNowPlayingInspector ? "sidebar.right" : "music.note.list")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 32, height: 32)
+                .background {
+                    Circle().fill(.quaternary.opacity(0.5))
+                }
+        }
+        .buttonStyle(.plain)
+        .help(appModel.showNowPlayingInspector ? "Hide Now Playing panel" : "Show Now Playing panel")
+    }
+}
+
+// MARK: - Local mini transport
+
+/// Mirror of [[MiniTransport]] for the local AVAudioPlayer pipeline.
+/// Lives separately because the local source has its own queue +
+/// transport methods on AppModel (`localPlayerSkipTo…`,
+/// `pauseLocalPlayback`, etc.) and its own "is playing" signal
+/// (`isLocalPlaybackPlaying`) — there's no shared transport
+/// protocol yet, just two parallel shapes.
+private struct LocalMiniTransport: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Button {
+                Task { await appModel.localPlayerSkipToPrevious() }
+            } label: {
+                Image(systemName: "backward.fill")
+            }
+            .buttonStyle(.plain)
+            .disabled(!appModel.localQueue.hasPrevious)
+            .help("Previous")
+
+            Button {
+                if appModel.isLocalPlaybackPlaying {
+                    appModel.pauseLocalPlayback()
+                } else {
+                    appModel.resumeLocalPlayback()
+                }
+            } label: {
+                Image(systemName: appModel.isLocalPlaybackPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 18))
+            }
+            .buttonStyle(.plain)
+            .help(appModel.isLocalPlaybackPlaying ? "Pause" : "Play")
+
+            Button {
+                Task { await appModel.localPlayerSkipToNext() }
+            } label: {
+                Image(systemName: "forward.fill")
+            }
+            .buttonStyle(.plain)
+            .disabled(!appModel.localQueue.hasNext)
+            .help("Next")
+        }
+        .font(.system(size: 14, weight: .semibold))
+        .foregroundStyle(.primary)
     }
 }
 

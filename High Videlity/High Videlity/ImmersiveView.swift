@@ -20,9 +20,9 @@ struct ImmersiveView: View {
             // the visualizer synchronously per the selected mode.
             switch appModel.mode {
             case .crystal:
-                let crystal = appModel.useCrystalV2
-                    ? await CrystalVisualizerV2.makeCrystal(from: appModel.frames)
-                    : await CrystalVisualizer.makeCrystal(from: appModel.frames)
+                // V2 only — legacy v1 retired with the Visualizers-
+                // page rebuild.
+                let crystal = await CrystalVisualizerV2.makeCrystal(from: appModel.frames)
                 content.add(crystal)
                 appModel.sceneUpdateSubscription = content.subscribe(
                     to: SceneEvents.Update.self

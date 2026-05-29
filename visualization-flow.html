@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>High Videlity — Visualization Data Flow</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: #0f1117;
+    --bg-elev: #181b25;
+    --bg-table: #14171f;
+    --fg: #e8eaf2;
+    --fg-dim: #9ba0b3;
+    --fg-mute: #6b7185;
+    --accent: #7aa8ff;
+    --accent-soft: #2b3a5e;
+    --border: #2a2e3c;
+    --pill: #1d2434;
+    --code-bg: #11141c;
+    --warn: #ffb86c;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #fafbfc;
+      --bg-elev: #ffffff;
+      --bg-table: #ffffff;
+      --fg: #1c1e26;
+      --fg-dim: #4c5160;
+      --fg-mute: #8088a0;
+      --accent: #2454c4;
+      --accent-soft: #dde6fa;
+      --border: #e1e4ec;
+      --pill: #eef1f7;
+      --code-bg: #f1f3f7;
+      --warn: #b06a00;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); }
+  body {
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    padding: 32px 28px 80px;
+  }
+  .wrap {
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 18px;
+    margin-bottom: 28px;
+  }
+  h1 {
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 6px;
+  }
+  .subtitle { color: var(--fg-dim); font-size: 14px; }
+  h2 {
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    margin: 40px 0 14px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 16px; font-weight: 600; margin: 24px 0 8px; }
+  p { color: var(--fg); margin: 0 0 12px; }
+  p.lede { color: var(--fg-dim); }
+  ul, ol { padding-left: 22px; margin: 8px 0 12px; }
+  li { margin-bottom: 4px; }
+  li > strong { color: var(--fg); }
+  code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    font-size: 13px;
+  }
+  .pill {
+    display: inline-block;
+    background: var(--pill);
+    color: var(--fg-dim);
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 12px;
+    margin-right: 4px;
+  }
+  .diagram-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    margin: 16px 0 24px;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    background: var(--bg-table);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin: 12px 0 18px;
+    font-size: 14px;
+  }
+  thead th {
+    background: var(--bg-elev);
+    color: var(--fg-dim);
+    text-align: left;
+    padding: 10px 12px;
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--border);
+  }
+  tbody td {
+    padding: 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody td:first-child {
+    font-weight: 600;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  .cache-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin: 12px 0 18px;
+  }
+  @media (max-width: 700px) {
+    .cache-grid { grid-template-columns: 1fr; }
+    body { padding: 20px 16px 60px; }
+  }
+  .cache-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .cache-card h4 {
+    margin: 0 0 8px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .cache-card ul { margin: 6px 0 0; padding-left: 18px; }
+  .cache-card li { font-size: 13px; color: var(--fg-dim); }
+  .invariant-card {
+    background: var(--bg-elev);
+    border-left: 3px solid var(--warn);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin: 8px 0;
+    font-size: 14px;
+  }
+  .invariant-card strong { color: var(--warn); }
+  .files {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    font-size: 13px;
+  }
+  .files ul { margin: 0; }
+  .files code { font-size: 12px; }
+
+  /* Mermaid styling */
+  .mermaid {
+    text-align: center;
+    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+  }
+  .mermaid svg { max-width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>High Videlity — Visualization Data Flow</h1>
+  <div class="subtitle">How audio reaches the visualizer across every playback mode. Generated 2026-05-29.</div>
+</header>
+
+<p class="lede">There are three orthogonal axes to keep straight when reasoning about how a song ends up animating: <strong>audio source</strong> (what's making sound), <strong>feature source</strong> (what's filling <code>frames[]</code>), and <strong>clock source</strong> (what <code>playbackTime</code> the visualizer indexes into <code>frames</code> with). Each playback mode wires these three differently. Mixing them up is the most common source of <em>"the visualizer is animating but audio is silent"</em> / <em>"audio plays but viz is frozen"</em> bugs.</p>
+
+<h2>The visualizer side (constant across modes)</h2>
+<p>Every render frame, the visualizer reads:</p>
+<ul>
+  <li><code>frames[ playbackTime * 30 ]</code> → per-time <code>FeatureFrame</code> (FFT-derived loudness / chromagram / onset / bands)</li>
+  <li><code>stemFeatures?.frame(at: playbackTime)</code> → per-time stem-separated features (drums / bass / vocals / other) when available</li>
+  <li><code>shazam*Override</code> properties → song-level overrides (BPM, key, danceability, mood, time-sig…) from the external metadata pipeline</li>
+  <li><code>bandLoudness</code> / <code>bandChromagram</code> / <code>bandOnset</code> (inside the FeatureFrame) → 4-band full-mix split, used when stems aren't available</li>
+</ul>
+<p>The visualizer doesn't care <em>how</em> these got populated — that's the per-mode logic below.</p>
+
+<h2>Top-level flow</h2>
+<div class="diagram-card">
+<pre class="mermaid">
+flowchart TD
+    User([User action])
+
+    %% Local
+    User -->|click song / play album / queue advance| LocalPath[loadAndPlayLocalFast]
+    LocalPath -->|sync| AVPlayer[AVAudioPlayer.play]
+    LocalPath -->|sync, may cache-hit| FrameCacheL[FrameFeatureCache lookup]
+    LocalPath -.->|background, cache miss| Analyze[AnalysisTimeline.analyze]
+    Analyze --> FrameCacheW[FrameFeatureCache.storeFrames]
+    LocalPath --> StemMeta[kickoffMetadataAndStemsForLocalFile]
+    StemMeta --> Tunebat[BPM / key / mood overrides<br/>TunebatBpmFetcher]
+    StemMeta --> StemLookup[Stem features<br/>local SQLite -> CloudKit public DB]
+
+    %% AM in-app — sound + feature shapes differ by platform.
+    %% macOS: AM plays through RemotePlayerService and we tap THAT,
+    %%        so the feature pipeline is the streaming analyzer.
+    %% iOS:   no CATap, so we fall back to iTunes-preview frames.
+    User -->|tap AM song / album / playlist / station / queue advance| AMPath[playAppleMusic* / musicKit.play*]
+    AMPath --> AMPlayer[ApplicationMusicPlayer.play]
+    AMPath --> OnTrackChange[musicKit.onTrackChange]
+    OnTrackChange --> KickoffPipeline[kickoffTrackPipeline]
+    KickoffPipeline --> EnsureMacAM[ensureMacOSAMPlaybackPath<br/>macOS only]
+    KickoffPipeline --> Tunebat
+    KickoffPipeline --> StemLookup
+    KickoffPipeline -->|iOS only| AMPreview[SongLoader.load on preview]
+    AMPreview --> FrameCacheL
+
+    %% System-audio path macOS — same code as AM-in-app on macOS
+    User -->|tap system-audio toggle| SysTap[SystemAudioTap]
+    EnsureMacAM -->|wires tap to RemotePlayerService| SysTap
+    SysTap --> StreamAn[StreamingAnalyzer]
+    StreamAn -->|30 Hz append| FramesArr[(frames array)]
+    SysTap --> ShazamID[ShazamController.match]
+    ShazamID -->|onMatch| SongLoad[SongLoader.load by term]
+    SongLoad --> FrameCacheL
+    SongLoad --> Tunebat
+    SongLoad --> StemLookup
+
+    %% Mic
+    User -->|tap mic| MicEng[AVAudioEngine input]
+    MicEng --> StreamAn
+
+    %% iOS system music
+    User -->|iOS external AM playback| SysMusic[SystemMusicNowPlaying observer]
+    SysMusic --> SongLoad
+
+    %% Outputs
+    AVPlayer --> Speakers([Speakers])
+    AMPlayer --> Speakers
+    SysTap -.->|passthrough| Speakers
+    SysMusic -.->|external app owns audio| Speakers
+
+    FrameCacheL --> FramesArr
+    Analyze --> FramesArr
+    StemLookup --> StemArr[(stemFeatures)]
+    Tunebat --> Overrides[(shazam*Override)]
+
+    FramesArr --> Viz{{Visualizer}}
+    StemArr --> Viz
+    Overrides --> Viz
+    Clock[playbackTime] --> Viz
+
+    classDef sink fill:#1f2742,stroke:#3a4d7c,color:#e8eaf2;
+    classDef store fill:#162028,stroke:#34495a,color:#9bc2cf,font-style:italic;
+    classDef bg fill:#1a1f2c,stroke:#2a3144,color:#e8eaf2;
+    class Viz sink;
+    class FramesArr,StemArr,Overrides,Clock store;
+    class LocalPath,AMPath,SysTap,MicEng,SysMusic,SongLoad,AMPreview,FrameCacheL,FrameCacheW,Analyze,StemMeta,Tunebat,StemLookup,OnTrackChange,KickoffPipeline,EnsureMacAM,StreamAn,ShazamID,AVPlayer,AMPlayer bg;
+</pre>
+</div>
+
+<h2>Per-mode breakdown</h2>
+<table>
+<thead>
+  <tr><th>Mode</th><th>Audio source</th><th>Feature source</th><th>Clock source</th><th>Notes</th></tr>
+</thead>
+<tbody>
+  <tr>
+    <td>Local file<br><span class="pill">queue or one-off</span></td>
+    <td><code>AVAudioPlayer</code> (private, on AppModel)</td>
+    <td><code>FrameFeatureCache</code> hit, else background <code>AnalysisTimeline.analyze</code></td>
+    <td><code>audioPlayer.currentTime</code></td>
+    <td><code>loadAndPlayLocalFast</code> is the fast queue path. End-of-track → <code>LocalQueueController.audioPlayerDidFinishPlaying</code> → auto-advance.</td>
+  </tr>
+  <tr>
+    <td>AM in-app — macOS<br><span class="pill">song / album / playlist / station / advance</span></td>
+    <td><code>ApplicationMusicPlayer</code> rendering through <code>RemotePlayerService</code></td>
+    <td><code>StreamingAnalyzer</code> taps RemotePlayerService → appends to <code>frames[]</code> at 30 Hz. The Shazam → preview-load chain also fires so the full-song pre-analyzed timeline can mix in.</td>
+    <td>Wall-clock + Shazam-aligned <code>previewStartInSong</code> (NOT <code>musicKit.playbackTime</code>, despite AM driving the audio)</td>
+    <td><code>kickoffTrackPipeline</code> → <code>ensureMacOSAMPlaybackPath</code> auto-engages the tap on EVERY AM track change. Same downstream code as the system-audio-tap mode.</td>
+  </tr>
+  <tr>
+    <td>AM in-app — iOS / iPadOS / visionOS<br><span class="pill">no CATap</span></td>
+    <td><code>ApplicationMusicPlayer</code> (MusicKit)</td>
+    <td><code>SongLoader.load(term)</code> from iTunes preview clip + frame cache</td>
+    <td><code>musicKit.playbackTime</code> (polled ~8 Hz)</td>
+    <td>Visualizer sees PREVIEW frames (~30 s), modulo-wrapped by the alignment system to match the live AM playhead. <code>onTrackChange</code> re-runs the kickoff pipeline.</td>
+  </tr>
+  <tr>
+    <td>macOS system-audio tap</td>
+    <td>External process (Music.app, Spotify, browser) — we just <em>listen</em></td>
+    <td><code>StreamingAnalyzer</code> appends to <code>frames[]</code> at 30 Hz from live audio buffers</td>
+    <td>Wall-clock from tap start, plus Shazam-driven <code>previewStartInSong</code> once aligned</td>
+    <td>Crystal + Architecture do additive scene-building from streaming frames. Shazam-match triggers preview load + alignment so the rest of the song's pre-analyzed frames can be used too.</td>
+  </tr>
+  <tr>
+    <td>Mic mode</td>
+    <td>External speakers captured via <code>AVAudioEngine</code> input</td>
+    <td>Same as system-audio: <code>StreamingAnalyzer</code> → <code>frames[]</code></td>
+    <td>Wall-clock + Shazam-aligned preview offset</td>
+    <td>Same code path as system-audio downstream of capture.</td>
+  </tr>
+  <tr>
+    <td>iOS system-music observer</td>
+    <td>External AM playback (iOS Control Center / lock screen)</td>
+    <td><code>SongLoader.load(term)</code> from iTunes preview, aligned via cached <code>previewStartInSong</code></td>
+    <td><code>systemMusic.currentPlaybackTime</code> + computed offset into preview</td>
+    <td>Phase-3 alignment: cached calibration from prior plays gives frame-accurate iOS playback without needing live mic capture.</td>
+  </tr>
+</tbody>
+</table>
+
+<h2>Cache hierarchy</h2>
+<div class="cache-grid">
+  <div class="cache-card">
+    <h4>Frame cache</h4>
+    <p style="margin:0 0 8px;color:var(--fg-dim);">Basic audio analysis (FFT / chromagram / onset / loudness / beat).</p>
+    <ul>
+      <li>Per-Mac only, <code>~/Library/Caches/HighVidelity/frames/&lt;sha256&gt;.bin.gz</code></li>
+      <li>Auto-populated on every uncached play</li>
+      <li>~900 KB per 5-min song (HVFF v2 format)</li>
+      <li>Looked up first; on miss, frames computed in background and written</li>
+    </ul>
+  </div>
+  <div class="cache-card">
+    <h4>Stem cache</h4>
+    <p style="margin:0 0 8px;color:var(--fg-dim);">Demucs source-separated features (drums / bass / vocals / other).</p>
+    <ul>
+      <li><strong>Tier 1:</strong> local SQLite</li>
+      <li><strong>Tier 2:</strong> CloudKit <em>public</em> DB — shared across all users</li>
+      <li><strong>Tier 3:</strong> fresh Demucs compute via Python sidecar — <em>only</em> triggered by explicit "Cache Features" batch action; never auto on play</li>
+      <li>~6× realtime on M1 Pro, hence the deliberate gating</li>
+    </ul>
+  </div>
+</div>
+<p>Per-song overrides (BPM / key / mood / time-sig) come from a <em>separate</em> lookup chain (external-metadata-pipeline) — more a lookup-with-UserDefaults-memoization wrapping GetSongBPM + AcousticBrainz than a cache in the same shape.</p>
+
+<h2>Invariants worth not breaking</h2>
+<div class="invariant-card"><strong>Frames must be loaded before the viz can show anything time-aligned.</strong> For modes with a pre-analyzed timeline (local + AM), this is <code>frames[]</code> set at song-load. For streaming modes, frames grow 30 Hz from <code>appendLiveFrames</code>.</div>
+<div class="invariant-card"><strong>The <code>playbackTime</code> source MUST match the audio source.</strong> Flipping AM to local mid-song without updating which clock is read will index nonsensical frames.</div>
+<div class="invariant-card"><strong><code>frames</code> is <code>@ObservationIgnored</code>.</strong> Reading it from a SwiftUI body causes a 30 Hz invalidation cascade that halves FPS. Use the <code>framesCount</code> mirror for "is anything loaded yet" gating.</div>
+<div class="invariant-card"><strong><code>stopPlayback()</code> releases the AVAudioPlayer and clears its delegate.</strong> Any code path that creates a new player must re-call <code>localQueue.attach(to: player)</code> to re-establish the auto-advance delegate. <code>loadAndPlayLocalFast</code> does this implicitly via <code>startPlayback</code>.</div>
+<div class="invariant-card"><strong><code>registerPreviewForAlignment</code> is for Shazam-driven preview-catalog matching.</strong> Load-bearing for AM / system-audio / mic paths (they need the preview signature to align live audio to pre-analyzed frames). <em>Not</em> load-bearing for local files — they have the full source on disk.</div>
+<div class="invariant-card"><strong>Cross-source handoff is symmetric on macOS.</strong> Both directions need an explicit teardown of the other source.
+  <br><strong>Local → AM:</strong> every AM entry point flows through <code>kickoffTrackPipeline</code> (<code>playAppleMusicSong</code>; <code>musicKit.play(album:)</code> / <code>play(playlist:)</code> / <code>play(station:)</code>; queue auto-advance via <code>musicKit.onTrackChange</code>). That calls <code>ensureMacOSAMPlaybackPath</code>: stops any <code>AVAudioPlayer</code> and engages the system tap on <code>RemotePlayerService</code> with the load-bearing 800 ms delay.
+  <br><strong>AM → local:</strong> <code>loadAndPlayLocalFast</code> calls <code>ensureLocalPlaybackPath</code>: stops <code>ApplicationMusicPlayer</code> (which also clears <code>musicKit.nowPlaying</code>) and flips <code>useSystemAudio</code> off. Without this, <code>startPlayback</code>'s guards silently fail.
+  <br>Don't add a new entry point that bypasses these.</div>
+
+<h2>Key files</h2>
+<div class="files">
+<ul>
+  <li><code>AppModel.swift</code> — <code>loadSong</code>, <code>loadAndPlayLocalFast</code>, <code>startPlayback</code>, <code>stopPlayback</code>, queue ops</li>
+  <li><code>LocalQueueController.swift</code> — queue state + AVAudioPlayer delegate auto-advance</li>
+  <li><code>MusicKitController.swift</code> — AM playback, <code>onTrackChange</code>, AM queue</li>
+  <li><code>SongLoader.swift</code> — load + analyze pipeline + frame cache lookup</li>
+  <li><code>StreamingAnalyzer.swift</code> — live frame appending for system-audio / mic</li>
+  <li><code>StemFeatureProvider.swift</code> — 3-tier stem cache + Demucs sidecar</li>
+  <li><code>FrameFeatureCache.swift</code> — local frame cache (HVFF v2 format)</li>
+  <li><code>VisualizerView.swift</code> — the consumer; reads frames / stems / overrides / clock</li>
+</ul>
+</div>
+
+</div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: dark ? 'dark' : 'default',
+    themeVariables: dark ? {
+      fontFamily: '-apple-system, BlinkMacSystemFont, system-ui, sans-serif',
+      primaryColor: '#1f2742',
+      primaryTextColor: '#e8eaf2',
+      primaryBorderColor: '#3a4d7c',
+      lineColor: '#5a6580',
+      secondaryColor: '#2a3144',
+      tertiaryColor: '#1a1f2c',
+      background: '#181b25',
+    } : {
+      fontFamily: '-apple-system, BlinkMacSystemFont, system-ui, sans-serif',
+    },
+    flowchart: { curve: 'basis', padding: 20, nodeSpacing: 50, rankSpacing: 70 },
+  });
+</script>
+</body>
+</html>

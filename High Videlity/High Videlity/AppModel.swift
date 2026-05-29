@@ -67,9 +67,11 @@ enum FrameTier: Int, Sendable {
 enum SidebarSource: String, Identifiable, CaseIterable, Hashable {
     case appleMusic
     case local
+    case mac           // macOS only — system-audio tap (Music.app / Spotify / browser / etc.)
+    case microphone    // all platforms — live external audio via mic
     case spotify
     case youTubeMusic
-    case settings
+    case visualizers   // formerly "settings" — the page is now a visualizer-mode picker
 
     var id: String { rawValue }
 
@@ -77,9 +79,11 @@ enum SidebarSource: String, Identifiable, CaseIterable, Hashable {
         switch self {
         case .appleMusic:    return "Apple Music"
         case .local:         return "Local Library"
+        case .mac:           return "Mac"
+        case .microphone:    return "Microphone"
         case .spotify:       return "Spotify"
         case .youTubeMusic:  return "YouTube Music"
-        case .settings:      return "Settings"
+        case .visualizers:   return "Visualizers"
         }
     }
 
@@ -87,23 +91,27 @@ enum SidebarSource: String, Identifiable, CaseIterable, Hashable {
         switch self {
         case .appleMusic:    return "applelogo"
         case .local:         return "music.note.house.fill"
+        case .mac:           return "desktopcomputer"
+        case .microphone:    return "mic.fill"
         case .spotify:       return "music.note"
         case .youTubeMusic:  return "play.rectangle.fill"
-        case .settings:      return "gearshape.fill"
+        case .visualizers:   return "sparkles"
         }
     }
 
     /// Brand-ish tint used in the sidebar so each source has a small
     /// visual identity without requiring real logos. Apple Music
     /// borrows the signature red-pink; Spotify gets green; YouTube
-    /// Music gets red. Local + Settings use the system accent so they
-    /// don't compete with the third-party brand cues.
+    /// Music gets red. Local / Mac / Microphone / Visualizers use
+    /// the system accent so they don't compete with the third-party
+    /// brand cues.
     var tintColorRGB: (r: Double, g: Double, b: Double)? {
         switch self {
         case .appleMusic:    return (0.98, 0.18, 0.36)  // AM red-pink
         case .spotify:       return (0.11, 0.73, 0.33)  // Spotify green
         case .youTubeMusic:  return (1.00, 0.00, 0.00)  // YT red
-        case .local, .settings: return nil  // use system accent
+        case .local, .mac, .microphone, .visualizers:
+            return nil  // use system accent
         }
     }
 
@@ -112,7 +120,7 @@ enum SidebarSource: String, Identifiable, CaseIterable, Hashable {
     /// "coming soon" placeholder rather than a working surface.
     var isImplemented: Bool {
         switch self {
-        case .appleMusic, .local, .settings: return true
+        case .appleMusic, .local, .mac, .microphone, .visualizers: return true
         case .spotify, .youTubeMusic: return false
         }
     }
@@ -788,10 +796,43 @@ class AppModel {
     /// ⌘F wouldn't re-focus. Monotonic int keeps every press distinct.
     var focusSearchRequest: Int = 0
 
-    /// Within Crystal mode: v1 (stacked cylinders) or v2 (HTML-faithful
-    /// translucent shard + additive halo/core beams). v2 is the canonical
-    /// implementation; v1 is kept around as the safety-net legacy path.
-    var useCrystalV2 = true
+    // useCrystalV2 retired with the Visualizers-page rebuild — V2 is
+    // the only Crystal implementation. CrystalVisualizer.swift (V1)
+    // is dead code, kept on disk for diff context until the next
+    // cleanup pass.
+
+    /// When true, every track change (AM auto-advance / local queue
+    /// advance / explicit play of a new song) advances the
+    /// visualizer to the next mode in `VisualizerMode.allCases`,
+    /// wrapping at the end. Set from the Visualizers page; persisted
+    /// across launches via UserDefaults.
+    var cycleVisualizersOnTrackChange: Bool {
+        get { UserDefaults.standard.bool(forKey: "cycleVisualizersOnTrackChange") }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "cycleVisualizersOnTrackChange")
+            // Bump the observable mirror so SwiftUI views reading
+            // this property re-render when it changes.
+            cycleVisualizersTick &+= 1
+        }
+    }
+    /// Observable mirror — SwiftUI views toggling the setting need
+    /// something to track since UserDefaults isn't @Observable. Read
+    /// just to participate in the observation graph.
+    @ObservationIgnored private var _cycleTick: Int = 0
+    private(set) var cycleVisualizersTick: Int {
+        get { _cycleTick }
+        set { _cycleTick = newValue }
+    }
+
+    /// Advance `mode` to the next case in `VisualizerMode.allCases`,
+    /// wrapping. Called from the track-change handlers when
+    /// `cycleVisualizersOnTrackChange` is on.
+    func cycleVisualizerMode() {
+        let modes = VisualizerMode.allCases
+        guard let idx = modes.firstIndex(of: mode) else { return }
+        let nextIdx = (idx + 1) % modes.count
+        mode = modes[nextIdx]
+    }
 
     /// "Listen with mic" mode — when on, internal AVAudioPlayer is paused
     /// and the visualizer is driven by live mic input instead of the loaded
@@ -859,6 +900,12 @@ class AppModel {
     /// HUD needs the sort + entry list to compute "next track" when
     /// the user hits skip-forward during library playback.
     let library = LibraryStore()
+
+    /// AM-style queue layer for local-file playback. Owns the
+    /// entries + current pointer; AppModel owns the AVAudioPlayer.
+    /// Wired to `loadSong` via `onAdvance` so end-of-track + manual
+    /// skip-next both flow through the same load + play pipeline.
+    let localQueue = LocalQueueController()
     #endif
 
     /// File URL of the library entry currently loaded for playback,
@@ -1182,8 +1229,31 @@ class AppModel {
         // Without this, songs 2..N of a queue play audio but the
         // visualizer stays stuck on song 1's frames — silently broken.
         musicKit.onTrackChange = { [weak self] song in
-            self?.kickoffTrackPipeline(for: song)
+            guard let self = self else { return }
+            self.kickoffTrackPipeline(for: song)
+            if self.cycleVisualizersOnTrackChange {
+                self.cycleVisualizerMode()
+            }
         }
+        #if os(macOS)
+        // Local queue auto-advance: when the AVAudioPlayer finishes
+        // a track, LocalQueueController hops to MainActor and calls
+        // back here with the next entry. Routes through
+        // `loadAndPlayLocalFast` so audio starts immediately and the
+        // visualizer analysis runs in the background — the prior
+        // path went through `loadSong` which blocked playback on a
+        // full DSP analysis pass (30-60s on uncached tracks, which
+        // looked indistinguishable from "playback just stopped").
+        localQueue.onAdvance = { [weak self] entry in
+            guard let self = self else { return }
+            Task {
+                await self.loadAndPlayLocalFast(entry)
+                if self.cycleVisualizersOnTrackChange {
+                    self.cycleVisualizerMode()
+                }
+            }
+        }
+        #endif
     }
 
     private func handleShazamMatch(_ item: SHMatchedMediaItem) {
@@ -1886,6 +1956,16 @@ class AppModel {
         let artist = song.artistName
         let term = "\(title) \(artist)"
 
+        #if os(macOS)
+        // 0. Wire the macOS AM playback path on every track change —
+        //    covers single-song / album / playlist / station entry
+        //    points AND queue auto-advance. Previously this lived
+        //    inline in playAppleMusicSong only, so album / playlist
+        //    plays would silently land with no system tap and show
+        //    "no song loaded" in the visualizer.
+        ensureMacOSAMPlaybackPath()
+        #endif
+
         // 1. Visualizer state reset.
         frames = []
         publishFramesCountNow()
@@ -2009,6 +2089,57 @@ class AppModel {
     ///
     /// On other platforms (iOS/visionOS/tvOS) CATap is unavailable, so
     /// we keep the original fetch-the-30s-preview path for tonal data.
+    #if os(macOS)
+    /// Wire the macOS pipeline for AM playback: tear down any
+    /// competing local AVAudioPlayer and engage the system-audio
+    /// tap on RemotePlayerService (the audio service that
+    /// ApplicationMusicPlayer renders through). Called from
+    /// `kickoffTrackPipeline` so every AM-play entry point —
+    /// single-song, album, playlist, station, queue auto-advance —
+    /// gets the same handoff without each call site having to
+    /// remember. Idempotent: no-op when tap is already on.
+    ///
+    /// The 800 ms delay before flipping `useSystemAudio` is
+    /// load-bearing — RemotePlayerService only appears in
+    /// CoreAudio's process list once AM is actively emitting, so
+    /// the picker can't find it earlier.
+    private func ensureMacOSAMPlaybackPath() {
+        if hasLocalPlaybackSource { stopPlayback() }
+        guard !useSystemAudio else { return }
+        preferredSystemAudioProcessName = "RemotePlayerService"
+        Task {
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            if !self.useSystemAudio {
+                self.useSystemAudio = true
+            } else {
+                self.switchSystemAudioSource(toName: "RemotePlayerService")
+            }
+        }
+    }
+
+    /// Symmetric to [[ensureMacOSAMPlaybackPath]]: tear down the AM
+    /// audio path so local playback can claim the audio session.
+    /// Called from `loadAndPlayLocalFast` before `startPlayback`,
+    /// which would otherwise bail at its `useSystemAudio` /
+    /// `musicKit.nowPlaying != nil` guards (both still set from the
+    /// prior AM track).
+    ///
+    /// Idempotent: no-op when AM isn't loaded and the tap is off.
+    private func ensureLocalPlaybackPath() {
+        // Drop the system tap so startPlayback's guard passes. The
+        // didSet on useSystemAudio also tears down the streaming
+        // analyzer + Shazam wiring.
+        if useSystemAudio { useSystemAudio = false }
+        // Stop ApplicationMusicPlayer so it isn't producing sound
+        // in parallel with the AVAudioPlayer, and clear nowPlaying
+        // so `if musicKit.nowPlaying != nil { return }` in
+        // startPlayback passes.
+        if musicKit.isPlaying || musicKit.nowPlaying != nil {
+            musicKit.stop()
+        }
+    }
+    #endif
+
     func playAppleMusicSong(_ song: MusicKit.Song) async {
         // Tear down any other audio sources so the visualizer clock cleanly
         // hands off to ApplicationMusicPlayer.
@@ -2043,35 +2174,14 @@ class AppModel {
         await musicKit.play(song, context: musicKit.searchResults)
 
         // The per-track pipeline (visualizer state reset, metadata
-        // lookup, iOS preview chain) runs for ALL track changes
-        // including queue auto-advance via `musicKit.onTrackChange`.
-        // For the initial user-tap we fire it explicitly here — the
-        // polling-loop's diff check `s.id != nowPlaying?.id` won't
-        // fire because `musicKit.play(_:)` already set nowPlaying
-        // eagerly before our polling cycles.
+        // lookup, iOS preview chain, **macOS system-tap engage**)
+        // runs for ALL track changes including queue auto-advance
+        // via `musicKit.onTrackChange`. For the initial user-tap we
+        // fire it explicitly here — the polling-loop's diff check
+        // `s.id != nowPlaying?.id` won't fire because
+        // `musicKit.play(_:)` already set nowPlaying eagerly before
+        // our polling cycles.
         kickoffTrackPipeline(for: song)
-
-        #if os(macOS)
-        // ApplicationMusicPlayer renders through `RemotePlayerService`,
-        // a macOS-side audio service — NOT through our own process and
-        // NOT through Music.app. Empirically verified: refreshAvailable's
-        // playingList included `RemotePlayerService` alongside other UI-
-        // sound emitters like `backboardd`. Pin the tap to that process
-        // explicitly; auto-pick alone would frequently grab the wrong
-        // playing candidate (e.g. backboardd for system click sounds).
-        preferredSystemAudioProcessName = "RemotePlayerService"
-        // Brief delay so RemotePlayerService has time to register as
-        // a process in CoreAudio's process list (only appears once AM
-        // is actively emitting). Without this the picker can't find it.
-        try? await Task.sleep(nanoseconds: 800_000_000)  // 0.8s
-        if !useSystemAudio {
-            useSystemAudio = true   // didSet wires Shazam + streaming analyzer
-        } else {
-            // Toggle is already on but tapping the wrong process — restart
-            // with the RemotePlayerService preference.
-            switchSystemAudioSource(toName: "RemotePlayerService")
-        }
-        #endif
     }
 
     /// Loads and analyzes a full-length local audio file picked via
@@ -2243,6 +2353,19 @@ class AppModel {
     /// AM playback in progress) still get the local AVAudioPlayer.
     func startPlayback() {
         guard let url = audioURL else { return }
+        // Re-entry guard: if we already have a local player alive
+        // for the current audioURL, don't tear it down and recreate.
+        // VisualizerView's `.onAppear` re-fires on every mount —
+        // including mode cycles (which use `.id(appModel.mode)` to
+        // remount the RealityView) and inspector open/close — so
+        // without this guard each visualizer mount would assign a
+        // fresh `AVAudioPlayer(contentsOf: url)` over the existing
+        // one, releasing the live player mid-playback and starting
+        // the song from 00:00. Queue-driven `loadAndPlayLocalFast`
+        // explicitly calls `stopPlayback()` before this, so its
+        // audioPlayer is nil when it lands here and the guard
+        // doesn't bite.
+        if audioPlayer != nil { return }
         heldClock = 0
         if musicKit.isPlaying { return }
         // MusicKit's `isPlaying` is polled at 30 Hz from
@@ -2285,6 +2408,12 @@ class AppModel {
             try AVAudioSession.sharedInstance().setActive(true)
             #endif
             let player = try AVAudioPlayer(contentsOf: url)
+            #if os(macOS)
+            // Attach the queue controller as delegate so end-of-track
+            // auto-advances. No-op when the queue is empty (delegate
+            // just fires onAdvance with nothing to do).
+            localQueue.attach(to: player)
+            #endif
             player.play()
             audioPlayer = player
             hasLocalPlaybackSource = true
@@ -2306,6 +2435,21 @@ class AppModel {
     /// playback modes (none of which use audioPlayer).
     var isLocalPlaybackPlaying: Bool {
         audioPlayer?.isPlaying ?? false
+    }
+
+    /// Current play-head time of the local AVAudioPlayer in seconds,
+    /// or nil when no local playback. Used by [[LyricsView]] to
+    /// drive synced-line highlighting for local files in the same
+    /// shape `musicKit.playbackTime` drives it for AM.
+    var localPlaybackCurrentTime: TimeInterval? {
+        audioPlayer?.currentTime
+    }
+
+    /// Duration of the loaded local track, or nil. Helps lrclib
+    /// disambiguate covers / live versions of the same title+artist.
+    var localPlaybackDuration: TimeInterval? {
+        guard let dur = audioPlayer?.duration, dur > 0 else { return nil }
+        return dur
     }
 
     /// Observable mirror of `audioPlayer != nil`. We can't observe
@@ -2343,6 +2487,214 @@ class AppModel {
         player.currentTime = 0
         if wasPlaying { player.play() }
     }
+
+    // MARK: - Local-playback fast load
+
+    #if os(macOS)
+    /// Fast-path local load used by the queue ops. Starts audio
+    /// playback immediately from the entry's existing on-disk URL
+    /// and runs the visualizer analysis pass in the background, so
+    /// auto-advance / skip-next doesn't pause for 30-60s of DSP
+    /// before the next track's audio starts. Cached frames (if
+    /// available via [[FrameFeatureCache]]) light up the visualizer
+    /// in lockstep with audio; uncached entries get an empty
+    /// `frames` array initially and the visualizer fills in once
+    /// analysis lands. Metadata + stem lookups fire after analysis.
+    private func loadAndPlayLocalFast(_ entry: LibraryEntry) async {
+        guard !isLoadingSong else { return }
+        if useMic { useMic = false }
+        // Symmetric to ensureMacOSAMPlaybackPath: tear down AM /
+        // system-tap state so startPlayback's guards
+        // (useSystemAudio == false, musicKit.nowPlaying == nil) pass.
+        // Without this, switching from an AM track to a local track
+        // silently bails at the guards and the user sees "no song
+        // loaded" with no audio.
+        ensureLocalPlaybackPath()
+
+        // Try to grab cached frames up front so the visualizer
+        // doesn't show a blank timeline. Cheap — hash + SQLite
+        // lookup, all on the calling actor.
+        let cachedFrames: [FeatureFrame]?
+        if let hash = FrameFeatureCache.hashForFile(entry.fileURL) {
+            cachedFrames = FrameFeatureCache.cachedFrames(forHash: hash)
+        } else {
+            cachedFrames = nil
+        }
+
+        // Reset playback state for the new song.
+        stopPlayback()
+        frames = cachedFrames ?? []
+        publishFramesCountNow()
+        audioURL = entry.fileURL
+        heldClock = 0
+        smoothedLoudness = 0
+        camPos  = SIMD3<Float>(0, 0.5, 1)
+        camLook = SIMD3<Float>(0, 0, 0)
+        currentLibraryEntryURL = entry.fileURL
+        currentTrackTitle = entry.title
+        currentTrackArtist = entry.artist
+
+        // Audio starts NOW. Visualizer catches up when analysis lands.
+        startPlayback()
+
+        // Kick off an opportunistic Shazam identity check for this
+        // file. Cheap if cached; runs a one-shot signature+match
+        // in the background otherwise. Result lands in
+        // [[LocalShazamMatcher]]'s disk cache where the UI can
+        // read it for the conflict badge. Fire-and-forget — neither
+        // the audio path nor the visualizer wait on it.
+        Task {
+            _ = await LocalShazamMatcher.resolve(fileURL: entry.fileURL)
+        }
+
+        // If the cache had what we needed, fire the metadata /
+        // stems pipeline immediately and we're done.
+        if cachedFrames != nil {
+            if !entry.title.isEmpty, !entry.artist.isEmpty {
+                kickoffMetadataAndStemsForLocalFile(
+                    fileURL: entry.fileURL,
+                    title: entry.title,
+                    artist: entry.artist
+                )
+            }
+            return
+        }
+
+        // Cache miss → analyze in background. The MainActor hop at
+        // the end gates the frames update on "is this still the
+        // current track?" so a fast user double-skip doesn't end up
+        // painting stale features over the new current.
+        let url = entry.fileURL
+        let title = entry.title
+        let artist = entry.artist
+        Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                let audio = try AudioFileDecoder.decode(contentsOf: url)
+                let analyzed = AnalysisTimeline.analyze(audio)
+                if let hash = FrameFeatureCache.hashForFile(url) {
+                    FrameFeatureCache.storeFrames(analyzed, forHash: hash)
+                }
+                await MainActor.run {
+                    guard let self else { return }
+                    // Only apply if the user hasn't moved on to
+                    // another track. currentLibraryEntryURL is the
+                    // active-load identity; comparing here keeps us
+                    // race-safe against rapid skip-next clicks.
+                    if self.currentLibraryEntryURL == url {
+                        self.frames = analyzed
+                        self.publishFramesCountNow()
+                        if !title.isEmpty, !artist.isEmpty {
+                            self.kickoffMetadataAndStemsForLocalFile(
+                                fileURL: url,
+                                title: title,
+                                artist: artist
+                            )
+                        }
+                    }
+                }
+            } catch {
+                print("[HighVidelity] background analysis failed for \(url.lastPathComponent): \(error)")
+            }
+        }
+    }
+    #endif
+
+    // MARK: - Local-playback queue ops
+    //
+    // Thin facade around [[LocalQueueController]] so call sites in
+    // the Local Library UI don't have to know about the controller
+    // directly. Each op rebuilds / mutates the queue then drives
+    // loadSong for the resulting current entry — matching the
+    // AM-side `playAppleMusicSong` / `queueNext` / `queueLast`
+    // shape.
+
+    #if os(macOS)
+    /// Play a single local entry, replacing any existing queue. Use
+    /// for one-off plays (single-song row tap, double-click on an
+    /// album/artist card with no other context).
+    func playLocalEntry(_ entry: LibraryEntry) async {
+        localQueue.replace(with: [entry], startAt: 0)
+        await loadAndPlayLocalFast(entry)
+    }
+
+    /// Play a list of local entries starting at `startAt`. Used by
+    /// album / artist "Play" buttons and by detail-view track rows
+    /// (which queue the rest of the album after the tapped track so
+    /// the album plays through on auto-advance).
+    func playLocalEntries(_ entries: [LibraryEntry], startAt: Int = 0) async {
+        guard !entries.isEmpty else { return }
+        localQueue.replace(with: entries, startAt: startAt)
+        let current = localQueue.currentItem?.entry ?? entries[max(0, min(startAt, entries.count - 1))]
+        await loadAndPlayLocalFast(current)
+    }
+
+    /// Insert one entry directly after the current track. Becomes
+    /// the next auto-advance target. If nothing is playing, seeds
+    /// the queue and starts playback immediately so the user gets
+    /// instant feedback that "next" did something.
+    func queueNextLocal(_ entry: LibraryEntry) async {
+        if localQueue.currentItem == nil {
+            await playLocalEntry(entry)
+            return
+        }
+        localQueue.insertNext(entry)
+    }
+
+    /// Append one entry to the end of the queue. Same empty-queue
+    /// fallback as queueNextLocal — if there's nothing playing yet,
+    /// "Add to Queue" turns into "Play Now" so the action isn't
+    /// silently invisible.
+    func queueLastLocal(_ entry: LibraryEntry) async {
+        if localQueue.currentItem == nil {
+            await playLocalEntry(entry)
+            return
+        }
+        localQueue.appendTail([entry])
+    }
+
+    /// Bulk "Add album / artist to Queue". If nothing is playing,
+    /// starts playback at the first entry; otherwise appends.
+    func queueLastLocalEntries(_ entries: [LibraryEntry]) async {
+        guard !entries.isEmpty else { return }
+        if localQueue.currentItem == nil {
+            await playLocalEntries(entries, startAt: 0)
+            return
+        }
+        localQueue.appendTail(entries)
+    }
+
+    /// Jump to an arbitrary upcoming entry. UpNext rows / context-
+    /// menu "Play Now" on an upcoming row both flow through here.
+    func skipToLocalQueueIndex(_ index: Int) async {
+        guard localQueue.entries.indices.contains(index) else { return }
+        localQueue.jump(to: index)
+        guard let item = localQueue.currentItem else { return }
+        await loadAndPlayLocalFast(item.entry)
+    }
+
+    /// Manual skip-next from a transport HUD. Same path as auto-
+    /// advance but driven by the user; if the queue is exhausted
+    /// this just stops playback rather than wrapping.
+    func localPlayerSkipToNext() async {
+        let nextIdx = localQueue.currentIndex + 1
+        guard localQueue.entries.indices.contains(nextIdx) else { return }
+        await skipToLocalQueueIndex(nextIdx)
+    }
+
+    /// Manual skip-prev. Walks back one entry; no-op at the head of
+    /// the queue.
+    func localPlayerSkipToPrevious() async {
+        let prevIdx = localQueue.currentIndex - 1
+        guard localQueue.entries.indices.contains(prevIdx) else { return }
+        await skipToLocalQueueIndex(prevIdx)
+    }
+
+    /// Remove an upcoming entry. Current entry is rejected — UI
+    /// should use skipToNext instead.
+    func removeFromLocalQueue(id: URL) {
+        localQueue.remove(id: id)
+    }
+    #endif
 
     // MARK: - Apple Music transport controls (for the visualizer overlay)
 
