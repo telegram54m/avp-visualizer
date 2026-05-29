@@ -58,6 +58,66 @@ enum FrameTier: Int, Sendable {
     case none = 99
 }
 
+/// Phase 7 — top-level sources surfaced in the macOS sidebar.
+/// Local + Apple Music are real today; Spotify and YouTube Music are
+/// stubs ("coming soon") so the user can SEE the eventual shape
+/// without us building a speculative abstraction against them. The
+/// real `MusicSource` protocol-or-not decision is deferred until a
+/// second SDK actually lands.
+enum SidebarSource: String, Identifiable, CaseIterable, Hashable {
+    case appleMusic
+    case local
+    case spotify
+    case youTubeMusic
+    case settings
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .appleMusic:    return "Apple Music"
+        case .local:         return "Local Library"
+        case .spotify:       return "Spotify"
+        case .youTubeMusic:  return "YouTube Music"
+        case .settings:      return "Settings"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .appleMusic:    return "applelogo"
+        case .local:         return "music.note.house.fill"
+        case .spotify:       return "music.note"
+        case .youTubeMusic:  return "play.rectangle.fill"
+        case .settings:      return "gearshape.fill"
+        }
+    }
+
+    /// Brand-ish tint used in the sidebar so each source has a small
+    /// visual identity without requiring real logos. Apple Music
+    /// borrows the signature red-pink; Spotify gets green; YouTube
+    /// Music gets red. Local + Settings use the system accent so they
+    /// don't compete with the third-party brand cues.
+    var tintColorRGB: (r: Double, g: Double, b: Double)? {
+        switch self {
+        case .appleMusic:    return (0.98, 0.18, 0.36)  // AM red-pink
+        case .spotify:       return (0.11, 0.73, 0.33)  // Spotify green
+        case .youTubeMusic:  return (1.00, 0.00, 0.00)  // YT red
+        case .local, .settings: return nil  // use system accent
+        }
+    }
+
+    /// True when this source has a real, functional UI today.
+    /// `false` for Spotify / YouTube Music — they render as a
+    /// "coming soon" placeholder rather than a working surface.
+    var isImplemented: Bool {
+        switch self {
+        case .appleMusic, .local, .settings: return true
+        case .spotify, .youTubeMusic: return false
+        }
+    }
+}
+
 enum VisualizerMode: String, CaseIterable, Identifiable {
     case crystal
     case clouds
@@ -694,6 +754,39 @@ class AppModel {
 
     /// Which visualizer the immersive view should show.
     var mode: VisualizerMode = .crystal
+
+    /// Shared state for the macOS Now-Playing inspector. Lifted from
+    /// ContentView so VisualizerView can also toggle / observe it —
+    /// without this, pushing the visualizer hides ContentView's
+    /// toolbar button and the user has to back out to access the
+    /// panel. Both views attach matching `.inspector` modifiers
+    /// bound to this property, so toggling from either screen
+    /// updates both.
+    var showNowPlayingInspector: Bool = false
+
+    /// Phase 7 shell flag. When true, the macOS `RootShellView` swaps
+    /// the entire window contents for the full-bleed VisualizerView.
+    /// When false, the sidebar + detail + GlobalNowPlayingFooter is
+    /// shown. A property on AppModel rather than View-local @State so
+    /// the GlobalNowPlayingFooter button (which lives outside the
+    /// shell) and the visualizer's own close affordance can flip the
+    /// same switch.
+    var showVisualizer: Bool = false
+
+    /// Which top-level Source is selected in the Phase 7 sidebar.
+    /// Persisted only in memory for v1; UserDefaults persistence
+    /// could be added later if users complain about losing selection
+    /// across launches. Default `.appleMusic` because that's the
+    /// best-supported source today.
+    var selectedSource: SidebarSource = .appleMusic
+
+    /// Counter incremented by ⌘F. SearchResultsView observes via
+    /// `.onChange` and focuses its TextField on every change.
+    /// A counter rather than a Bool because SwiftUI's @Observable
+    /// only fires onChange when the value DIFFERS — if we used a
+    /// Bool and the user already had the field focused, a second
+    /// ⌘F wouldn't re-focus. Monotonic int keeps every press distinct.
+    var focusSearchRequest: Int = 0
 
     /// Within Crystal mode: v1 (stacked cylinders) or v2 (HTML-faithful
     /// translucent shard + additive halo/core beams). v2 is the canonical
@@ -2445,6 +2538,135 @@ class AppModel {
             await MainActor.run { [weak self] in
                 self?.stemStatus = status
             }
+        }
+
+        // 0. Shazam-keyed cache pre-check — runs BEFORE the Music.app
+        // AppleScript query because the most common cache-hit case
+        // for in-app Apple Music playback (ApplicationMusicPlayer
+        // routing through RemotePlayerService) has Music.app sitting
+        // idle, so the query at step 1 returns .noTrack and the
+        // historical code path bailed without ever consulting the
+        // local SQLite cache. The user's mental model is "I already
+        // cached this song on disk; why isn't it picking up?" —
+        // because we never looked. Fix: when we have a Shazam ID,
+        // try the shazam-{id} row first. Hits cover:
+        //   • songs previously cached on THIS device via
+        //     LibraryBrowserView (shazam-keyed at scan time)
+        //   • songs cached on ANOTHER device of this Apple ID and
+        //     synced via CloudKit private DB (not implemented yet
+        //     for stems; placeholder for future)
+        //   • songs another user fresh-computed and pushed to the
+        //     CloudKit public DB
+        // Misses fall through to the Music.app + fresh-compute path
+        // unchanged, so users who DO play via Music.app and want
+        // fresh stems still get them.
+        if let shazamID, !shazamID.isEmpty {
+            let provider = await self.ensureStemFeatureProvider()
+            let shazamKey = "shazam-\(shazamID)"
+
+            // Tier 1 — local SQLite. Sub-100ms.
+            if let localHit = try? await provider.cachedFeatures(forKey: shazamKey) {
+                await setStatus(.computing(fraction: nil))
+                let placeholder = MusicAppTrack(
+                    fileURL: nil,
+                    title: title,
+                    artist: artist,
+                    album: "",
+                    persistentID: shazamID,
+                    durationSeconds: localHit.durationSeconds ?? 0,
+                    playerPositionSeconds: 0,
+                    isPlaying: true
+                )
+                await self.applyStemResult(
+                    localHit,
+                    nowPlaying: placeholder,
+                    generation: generation,
+                    originLabel: "shazam-local"
+                )
+                return
+            }
+
+            // Tier 2 — CloudKit public DB. Round-trip is slower
+            // (~1–3s) so we only consult it after the local miss.
+            if let cloudHit = await CloudCacheSync.shared.fetchStemFeatures(shazamID: shazamID) {
+                // Persist into local SQLite so the next play of this
+                // song on this device hits Tier 1.
+                if let blob = cloudHit.rawFeaturesBlob,
+                   let metaJSON = cloudHit.rawStemsMetaJSON {
+                    let metaArray = Self.decodeMetaArray(metaJSON)
+                    Task.detached(priority: .background) {
+                        try? await provider.putCachedFeatures(
+                            forKey: shazamKey,
+                            featuresBlob: blob,
+                            stemsMeta: metaArray,
+                            durationSeconds: cloudHit.durationSeconds,
+                            title: title,
+                            artist: artist
+                        )
+                    }
+                }
+                await setStatus(.computing(fraction: nil))
+                let placeholder = MusicAppTrack(
+                    fileURL: nil,
+                    title: title,
+                    artist: artist,
+                    album: "",
+                    persistentID: shazamID,
+                    durationSeconds: cloudHit.durationSeconds ?? 0,
+                    playerPositionSeconds: 0,
+                    isPlaying: true
+                )
+                await self.applyStemResult(
+                    cloudHit,
+                    nowPlaying: placeholder,
+                    generation: generation,
+                    originLabel: "shazam-cloud"
+                )
+                return
+            }
+            // Tier 1b — title+artist fallback. The user's cache may
+            // hold this song under `hash-<sha256>` (LibraryBatchCacher
+            // fallback when its own Shazam-ID attempt didn't yield an
+            // ID at scan time) or `musicapp-pid-<id>` (pre-shazam-
+            // primary-key migration). Look it up by clean
+            // (title, artist) — Shazam just gave us authoritative
+            // values for both — and if found, alias to shazam-key so
+            // every subsequent play hits Tier 1 instantly.
+            if !title.isEmpty && !artist.isEmpty,
+               let foundKey = try? await provider.findCacheKey(title: title, artist: artist),
+               foundKey != shazamKey,
+               let metadataHit = try? await provider.cachedFeatures(forKey: foundKey) {
+                // Forward-alias so Tier 1 hits next time.
+                Task.detached(priority: .background) {
+                    _ = try? await provider.alias(primaryKey: foundKey, aliasKey: shazamKey)
+                }
+                await setStatus(.computing(fraction: nil))
+                let placeholder = MusicAppTrack(
+                    fileURL: nil,
+                    title: title,
+                    artist: artist,
+                    album: "",
+                    persistentID: shazamID,
+                    durationSeconds: metadataHit.durationSeconds ?? 0,
+                    playerPositionSeconds: 0,
+                    isPlaying: true
+                )
+                await self.applyStemResult(
+                    metadataHit,
+                    nowPlaying: placeholder,
+                    generation: generation,
+                    originLabel: "shazam-meta(\(foundKey.prefix(20)))"
+                )
+                return
+            }
+
+            // Miss on all tiers — fall through to the Music.app +
+            // fresh-compute path below. For in-app AM playback that
+            // path will itself bail at step 1 (Music.app reports
+            // no track), and the visualizer continues on band-split.
+            // That's correct: we don't have a file URL to compute
+            // stems from when AM is streaming through
+            // RemotePlayerService.
         }
 
         // 1. Find the local file path via Music.app. Synchronous

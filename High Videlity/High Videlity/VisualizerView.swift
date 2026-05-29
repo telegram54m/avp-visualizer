@@ -503,12 +503,19 @@ struct VisualizerView: View {
         // Small "now playing" badge in the lower-right — only when system
         // audio is the source. Shows which app we're tapping + the Shazam-
         // identified song so the user always has context for what the
-        // cluster is reacting to.
+        // cluster is reacting to. Hidden while the Now-Playing inspector
+        // is open — the drawer carries the same info (and more) and the
+        // badge's expand-button is redundant when the drawer is already
+        // up. Reappears the moment the drawer is dismissed.
         .overlay(alignment: .bottomTrailing) {
-            NowPlayingBadge()
-                .environment(appModel)
-                .padding(16)
+            if !appModel.showNowPlayingInspector {
+                NowPlayingBadge()
+                    .environment(appModel)
+                    .padding(16)
+                    .transition(.opacity)
+            }
         }
+        .animation(.easeInOut(duration: 0.15), value: appModel.showNowPlayingInspector)
         #endif
         // Local-file transport HUD (play/pause/restart + next-track
         // for library mode) — visible only when a local AVAudioPlayer
@@ -570,6 +577,36 @@ struct VisualizerView: View {
         #endif
         .onAppear { appModel.startPlayback() }
         .onDisappear { appModel.stopPlayback() }
+        #if os(macOS)
+        // Mirror ContentView's Now-Playing inspector here so the
+        // panel can be opened/closed without backing out of the
+        // visualizer. Same AppModel state drives both, so toggling
+        // from either screen keeps things in sync — and a panel
+        // left open in ContentView stays open when the user pushes
+        // into the visualizer.
+        //
+        // Toggle is a floating overlay rather than a toolbar item:
+        // the NavigationStack title bar would only carry it on
+        // macOS, and even there it competes with the user's "this
+        // should feel like an immersive viz" expectation. A small
+        // bezel-matched button overlay survives platform changes
+        // (iOS fullScreenCover, future hidden-toolbar viz modes,
+        // visionOS Phase 7 reshape) without ever depending on
+        // chrome that may not exist.
+        .inspector(isPresented: Binding(
+            get: { appModel.showNowPlayingInspector },
+            set: { appModel.showNowPlayingInspector = $0 }
+        )) {
+            // See ContentView's matching site for the rationale on
+            // the conditional mount. The viz is even more sensitive
+            // to spurious invalidations than the main screen.
+            if appModel.showNowPlayingInspector {
+                NowPlayingView()
+                    .environment(appModel)
+                    .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
+            }
+        }
+        #endif
     }
 
     /// Free-look gesture for Ambient. Drag right → look right (yaw +);
@@ -988,10 +1025,27 @@ private struct NowPlayingBadge: View {
     var body: some View {
         if appModel.useSystemAudio {
             VStack(alignment: .trailing, spacing: 4) {
-                if let source = appModel.systemAudio.tappedProcessName {
-                    Label(source, systemImage: "speaker.wave.2.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    // Opens the full Now-Playing inspector. The badge
+                    // hides while the inspector is up (see
+                    // VisualizerView's bottom-trailing overlay), so
+                    // this button only ever needs the "open"
+                    // affordance. Left-aligned so it pairs visually
+                    // with the source label that follows it.
+                    Button {
+                        appModel.showNowPlayingInspector = true
+                    } label: {
+                        Image(systemName: "sidebar.right")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open Now Playing panel")
+                    .accessibilityLabel("Open Now Playing panel")
+
+                    if let source = appModel.systemAudio.tappedProcessName {
+                        sourceLabel(for: source)
+                    }
                 }
                 Text(nowPlayingLabel)
                     .font(.caption.weight(.medium))
@@ -1074,6 +1128,29 @@ private struct NowPlayingBadge: View {
             return msg
         case .idle:
             return ""
+        }
+    }
+
+    /// Friendly source label for the tap-process row. Special-cases
+    /// `RemotePlayerService` — the macOS helper process Apple Music
+    /// uses to render audio — to the Apple-logo + "Music" treatment
+    /// so the badge matches the user's mental model. Other sources
+    /// keep the speaker glyph + raw process name (Spotify renders as
+    /// "Spotify", Safari as "Safari", etc.).
+    @ViewBuilder
+    private func sourceLabel(for raw: String) -> some View {
+        if raw == "RemotePlayerService" {
+            Label {
+                Text("Music")
+            } icon: {
+                Image(systemName: "applelogo")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        } else {
+            Label(raw, systemImage: "speaker.wave.2.fill")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
     }
 }

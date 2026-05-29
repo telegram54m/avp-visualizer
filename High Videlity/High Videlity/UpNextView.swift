@@ -3,23 +3,16 @@
 //  High Videlity
 //
 //  Lists the upcoming queue entries from ApplicationMusicPlayer.
-//  Tap a row to jump to that song (queue-replace); right-click for
-//  Remove. Hidden when the queue has nothing queued ahead of the
-//  current track — no point taking up vertical space.
+//  Tap a row to jump to that song; hover to reveal the remove
+//  action; right-click for the same actions.
 //
 //  Reads `appModel.musicKit.upcomingItems`, which the MusicKit
 //  polling loop refreshes whenever the queue's signature actually
-//  changes. See `MusicKitController.refreshUpcoming`.
+//  changes (see `MusicKitController.refreshUpcoming`).
 //
-//  Rows render using `Queue.Entry.title` / `subtitle` directly so
-//  they appear immediately on insert, even before MusicKit finishes
-//  resolving the underlying Song. Tap-to-jump is enabled only when
-//  the Song has resolved (needed for the queue rebuild that
-//  skipToQueuedSong does).
-//
-//  Phase 1 cut: list + tap-to-jump + remove. Reorder via drag is
-//  deferred (needs richer queue mutation API on MusicKit's side
-//  than `entries.removeAll` and re-inserting).
+//  Rows render via the shared `MediaRow` component on macOS for
+//  consistency with search results; visionOS still uses the
+//  bordered-button fallback because MediaRow is macOS-only.
 //
 
 import SwiftUI
@@ -33,28 +26,73 @@ struct UpNextView: View {
         if mk.upcomingItems.isEmpty {
             EmptyView()
         } else {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Up Next")
-                        .font(.headline)
+                        .font(.subheadline.weight(.semibold))
                     Spacer()
                     Text("\(mk.upcomingItems.count)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 4)
+                .padding(.horizontal, 6)
 
-                VStack(spacing: 4) {
-                    ForEach(Array(mk.upcomingItems.enumerated()), id: \.element.id) { idx, item in
-                        upNextRow(item, position: idx + 1)
+                #if os(macOS)
+                VStack(spacing: 2) {
+                    ForEach(Array(mk.upcomingItems.enumerated()), id: \.element.id) { _, item in
+                        upNextRow(item)
                     }
                 }
+                #else
+                VStack(spacing: 4) {
+                    ForEach(Array(mk.upcomingItems.enumerated()), id: \.element.id) { idx, item in
+                        legacyRow(item, position: idx + 1)
+                    }
+                }
+                #endif
             }
-            .frame(maxWidth: 380)
+            .frame(maxWidth: 420)
         }
     }
 
-    private func upNextRow(_ item: MusicKitController.UpNextItem, position: Int) -> some View {
+    #if os(macOS)
+    /// Row backed by MediaRow. Tap = jump to song (queue rebuild),
+    /// hover trash glyph = remove from queue.
+    private func upNextRow(_ item: MusicKitController.UpNextItem) -> some View {
+        let song = item.song
+        let canPlay = song != nil
+        return MediaRow(
+            artwork: song?.artwork,
+            title: item.title,
+            subtitle: item.artist.isEmpty ? nil : item.artist,
+            artworkSize: 40,
+            accessory: canPlay ? .play : .none,
+            hoverActions: [
+                MediaRowAction(systemImage: "trash", help: "Remove from Queue") {
+                    appModel.musicKit.removeFromQueue(entryID: item.id)
+                    appModel.musicKit.refreshUpcoming()
+                }
+            ],
+            contextActions: canPlay ? [
+                MediaRowAction(systemImage: "play.fill", help: "Play Now") {
+                    if let song { Task { await appModel.musicKit.skipToQueuedSong(song) } }
+                },
+                MediaRowAction(systemImage: "trash", help: "Remove from Queue") {
+                    appModel.musicKit.removeFromQueue(entryID: item.id)
+                    appModel.musicKit.refreshUpcoming()
+                }
+            ] : [
+                MediaRowAction(systemImage: "trash", help: "Remove from Queue") {
+                    appModel.musicKit.removeFromQueue(entryID: item.id)
+                    appModel.musicKit.refreshUpcoming()
+                }
+            ]
+        ) {
+            if let song { Task { await appModel.musicKit.skipToQueuedSong(song) } }
+        }
+    }
+    #else
+    private func legacyRow(_ item: MusicKitController.UpNextItem, position: Int) -> some View {
         Button {
             if let song = item.song {
                 Task { await appModel.musicKit.skipToQueuedSong(song) }
@@ -97,4 +135,5 @@ struct UpNextView: View {
             } label: { Label("Remove from Queue", systemImage: "trash") }
         }
     }
+    #endif
 }

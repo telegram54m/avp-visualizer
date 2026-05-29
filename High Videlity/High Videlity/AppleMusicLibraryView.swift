@@ -23,7 +23,6 @@ import MusicKit
 
 struct AppleMusicLibraryView: View {
     let appModel: AppModel
-    @Environment(\.dismiss) private var dismiss
 
     enum Category: String, CaseIterable, Identifiable {
         case songs = "Songs"
@@ -48,44 +47,41 @@ struct AppleMusicLibraryView: View {
     @State private var loadedOnce: Set<Category> = []
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                Picker("Category", selection: $selected) {
-                    ForEach(Category.allCases) { c in
-                        Text(c.rawValue).tag(c)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .padding()
-
-                Divider()
-
-                Group {
-                    switch selected {
-                    case .songs:     songsList
-                    case .albums:    albumsList
-                    case .artists:   artistsList
-                    case .playlists: playlistsList
-                    }
+        VStack(spacing: 0) {
+            Picker("Category", selection: $selected) {
+                ForEach(Category.allCases) { c in
+                    Text(c.rawValue).tag(c)
                 }
             }
-            .navigationTitle("My Library")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        loadedOnce.remove(selected)
-                        Task { await loadIfNeeded(selected, force: true) }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .help("Reload")
+            .pickerStyle(.segmented)
+            .padding()
+
+            Divider()
+
+            Group {
+                switch selected {
+                case .songs:     songsList
+                case .albums:    albumsList
+                case .artists:   artistsList
+                case .playlists: playlistsList
                 }
             }
         }
-        .frame(minWidth: 480, minHeight: 520)
+        .navigationTitle("My Library")
+        // Lives inside the AM source's NavigationStack now (rather
+        // than as a modal sheet), so the reload action sits in the
+        // shared toolbar instead of a Close-pair.
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    loadedOnce.remove(selected)
+                    Task { await loadIfNeeded(selected, force: true) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Reload")
+            }
+        }
         .task { await loadIfNeeded(selected) }
         .onChange(of: selected) { _, new in
             Task { await loadIfNeeded(new) }
@@ -97,13 +93,15 @@ struct AppleMusicLibraryView: View {
     @ViewBuilder
     private var songsList: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
+            LazyVStack(alignment: .leading, spacing: 2) {
                 if loading.contains(.songs) && songs.isEmpty {
                     ProgressView().padding()
                 } else if songs.isEmpty {
-                    Text("No songs in your library yet.")
-                        .foregroundStyle(.secondary)
-                        .padding()
+                    EmptyPlaceholder(
+                        systemImage: "music.note.list",
+                        title: "No songs yet",
+                        message: "Songs you save to your Apple Music library will appear here."
+                    )
                 } else {
                     ForEach(songs, id: \.id) { song in
                         songRow(song)
@@ -117,13 +115,15 @@ struct AppleMusicLibraryView: View {
     @ViewBuilder
     private var albumsList: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
+            LazyVStack(alignment: .leading, spacing: 2) {
                 if loading.contains(.albums) && albums.isEmpty {
                     ProgressView().padding()
                 } else if albums.isEmpty {
-                    Text("No albums in your library yet.")
-                        .foregroundStyle(.secondary)
-                        .padding()
+                    EmptyPlaceholder(
+                        systemImage: "square.stack",
+                        title: "No albums yet",
+                        message: "Albums you add to your library will appear here."
+                    )
                 } else {
                     ForEach(albums, id: \.id) { album in
                         albumRow(album)
@@ -137,13 +137,15 @@ struct AppleMusicLibraryView: View {
     @ViewBuilder
     private var artistsList: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
+            LazyVStack(alignment: .leading, spacing: 2) {
                 if loading.contains(.artists) && artists.isEmpty {
                     ProgressView().padding()
                 } else if artists.isEmpty {
-                    Text("No artists in your library yet.")
-                        .foregroundStyle(.secondary)
-                        .padding()
+                    EmptyPlaceholder(
+                        systemImage: "person.2",
+                        title: "No artists yet",
+                        message: "Artists from your saved music will appear here."
+                    )
                 } else {
                     ForEach(artists, id: \.id) { artist in
                         artistRow(artist)
@@ -157,13 +159,15 @@ struct AppleMusicLibraryView: View {
     @ViewBuilder
     private var playlistsList: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
+            LazyVStack(alignment: .leading, spacing: 2) {
                 if loading.contains(.playlists) && playlists.isEmpty {
                     ProgressView().padding()
                 } else if playlists.isEmpty {
-                    Text("No playlists in your library yet.")
-                        .foregroundStyle(.secondary)
-                        .padding()
+                    EmptyPlaceholder(
+                        systemImage: "music.note.list",
+                        title: "No playlists yet",
+                        message: "Playlists you create or follow will appear here."
+                    )
                 } else {
                     ForEach(playlists, id: \.id) { pl in
                         playlistRow(pl)
@@ -177,37 +181,33 @@ struct AppleMusicLibraryView: View {
     // MARK: - Rows
 
     private func songRow(_ song: Song) -> some View {
-        Button {
-            Task { await appModel.playAppleMusicSong(song) }
-        } label: {
-            HStack(spacing: 10) {
-                artwork(song.artwork, size: 44)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(song.title).lineLimit(1)
-                    Text(song.artistName)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+        MediaRow(
+            artwork: song.artwork,
+            title: song.title,
+            subtitle: song.artistName,
+            artworkSize: 44,
+            accessory: .play,
+            hoverActions: [
+                MediaRowAction(systemImage: "text.insert", help: "Play Next") {
+                    Task { await appModel.musicKit.queueNext(song) }
+                },
+                MediaRowAction(systemImage: "text.append", help: "Add to Queue") {
+                    Task { await appModel.musicKit.queueLast(song) }
                 }
-                Spacer()
-                Image(systemName: "play.fill")
-                    .imageScale(.small)
-                    .foregroundStyle(.secondary)
-            }
-            .contentShape(Rectangle())
-            .padding(.horizontal, 10).padding(.vertical, 4)
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button { Task { await appModel.playAppleMusicSong(song) } } label: {
-                Label("Play Now", systemImage: "play.fill")
-            }
-            Button { Task { await appModel.musicKit.queueNext(song) } } label: {
-                Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
-            }
-            Button { Task { await appModel.musicKit.queueLast(song) } } label: {
-                Label("Add to Queue", systemImage: "text.line.last.and.arrowtriangle.forward")
-            }
+            ],
+            contextActions: [
+                MediaRowAction(systemImage: "play.fill", help: "Play Now") {
+                    Task { await appModel.playAppleMusicSong(song) }
+                },
+                MediaRowAction(systemImage: "text.insert", help: "Play Next") {
+                    Task { await appModel.musicKit.queueNext(song) }
+                },
+                MediaRowAction(systemImage: "text.append", help: "Add to Queue") {
+                    Task { await appModel.musicKit.queueLast(song) }
+                }
+            ]
+        ) {
+            Task { await appModel.playAppleMusicSong(song) }
         }
     }
 
@@ -215,47 +215,41 @@ struct AppleMusicLibraryView: View {
         NavigationLink {
             AlbumDetailView(album: album)
         } label: {
-            HStack(spacing: 10) {
-                artwork(album.artwork, size: 56)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(album.title).lineLimit(1)
-                    Text(album.artistName)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .imageScale(.small)
-                    .foregroundStyle(.tertiary)
-            }
-            .contentShape(Rectangle())
-            .padding(.horizontal, 10).padding(.vertical, 4)
+            MediaRow(
+                artwork: album.artwork,
+                title: album.title,
+                subtitle: album.artistName,
+                artworkSize: 52,
+                accessory: .chevron,
+                tappable: false,
+                hoverActions: [
+                    MediaRowAction(systemImage: "play.fill", help: "Play Album") {
+                        Task { await appModel.musicKit.play(album: album) }
+                    }
+                ],
+                contextActions: [
+                    MediaRowAction(systemImage: "play.fill", help: "Play Album") {
+                        Task { await appModel.musicKit.play(album: album) }
+                    }
+                ]
+            ) {}
         }
         .buttonStyle(.plain)
-        .contextMenu {
-            Button { Task { await appModel.musicKit.play(album: album) } } label: {
-                Label("Play Album", systemImage: "play.fill")
-            }
-        }
     }
 
     private func artistRow(_ artist: Artist) -> some View {
         NavigationLink {
             ArtistDetailView(artist: artist)
         } label: {
-            HStack(spacing: 10) {
-                artwork(artist.artwork, size: 44)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(artist.name).lineLimit(1)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .imageScale(.small)
-                    .foregroundStyle(.tertiary)
-            }
-            .contentShape(Rectangle())
-            .padding(.horizontal, 10).padding(.vertical, 4)
+            MediaRow(
+                artwork: artist.artwork,
+                title: artist.name,
+                subtitle: nil,
+                artworkSize: 44,
+                artworkCornerRadius: 22,
+                accessory: .chevron,
+                tappable: false
+            )
         }
         .buttonStyle(.plain)
     }
@@ -264,55 +258,26 @@ struct AppleMusicLibraryView: View {
         NavigationLink {
             PlaylistDetailView(playlist: playlist)
         } label: {
-            HStack(spacing: 10) {
-                artwork(playlist.artwork, size: 56)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(playlist.name).lineLimit(1)
-                    if let curator = playlist.curatorName, !curator.isEmpty {
-                        Text(curator)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+            MediaRow(
+                artwork: playlist.artwork,
+                title: playlist.name,
+                subtitle: playlist.curatorName,
+                artworkSize: 52,
+                accessory: .chevron,
+                tappable: false,
+                hoverActions: [
+                    MediaRowAction(systemImage: "play.fill", help: "Play Playlist") {
+                        Task { await appModel.musicKit.play(playlist: playlist) }
                     }
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .imageScale(.small)
-                    .foregroundStyle(.tertiary)
-            }
-            .contentShape(Rectangle())
-            .padding(.horizontal, 10).padding(.vertical, 4)
+                ],
+                contextActions: [
+                    MediaRowAction(systemImage: "play.fill", help: "Play Playlist") {
+                        Task { await appModel.musicKit.play(playlist: playlist) }
+                    }
+                ]
+            ) {}
         }
         .buttonStyle(.plain)
-        .contextMenu {
-            Button { Task { await appModel.musicKit.play(playlist: playlist) } } label: {
-                Label("Play Playlist", systemImage: "play.fill")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func artwork(_ art: Artwork?, size: CGFloat) -> some View {
-        if let art, let url = art.url(width: Int(size * 2), height: Int(size * 2)) {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let img):
-                    img.resizable().scaledToFill()
-                default:
-                    Rectangle().fill(Color.secondary.opacity(0.15))
-                }
-            }
-            .frame(width: size, height: size)
-            .clipShape(RoundedRectangle(cornerRadius: 4))
-        } else {
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color.secondary.opacity(0.15))
-                .frame(width: size, height: size)
-                .overlay(
-                    Image(systemName: "music.note")
-                        .foregroundStyle(.secondary)
-                )
-        }
     }
 
     // MARK: - Loading

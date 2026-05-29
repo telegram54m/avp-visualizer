@@ -35,6 +35,14 @@ struct High_VidelityApp: App {
             #if os(visionOS)
             ContentView()
                 .environment(appModel)
+            #elseif os(macOS)
+            // Phase 7 — sidebar shell with persistent now-playing
+            // footer. RootShellView swaps the entire window for
+            // the full-bleed VisualizerView when
+            // appModel.showVisualizer is true, so the visualizer
+            // doesn't need its own NavigationStack push anymore.
+            RootShellView()
+                .environment(appModel)
             #else
             NavigationStack {
                 ContentView()

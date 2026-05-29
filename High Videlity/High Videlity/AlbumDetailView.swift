@@ -28,12 +28,31 @@ struct AlbumDetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                header
-                actionButtons
-                trackList
+                DetailHero(
+                    eyebrow: "ALBUM",
+                    title: album.title,
+                    subtitle: album.artistName,
+                    metadata: metadataLine,
+                    artwork: album.artwork,
+                    tintColor: album.artwork?.backgroundColor,
+                    primaryAction: (
+                        label: "Play",
+                        systemImage: "play.fill",
+                        perform: { Task { await appModel.musicKit.play(album: album) } }
+                    ),
+                    secondaryAction: (
+                        label: "Add to Queue",
+                        systemImage: "text.append",
+                        perform: { Task { await addAlbumToQueue() } }
+                    )
+                )
+                VStack(alignment: .leading, spacing: 16) {
+                    trackList
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 24)
             }
-            .padding()
-            .frame(maxWidth: 600)
+            .frame(maxWidth: 760)
             .frame(maxWidth: .infinity)
         }
         .task {
@@ -41,39 +60,33 @@ struct AlbumDetailView: View {
         }
     }
 
-    private var header: some View {
-        HStack(alignment: .top, spacing: 16) {
-            ArtworkView(artwork: album.artwork, size: 140, cornerRadius: 6)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(album.title).font(.title2).bold().lineLimit(2)
-                Text(album.artistName).font(.subheadline).foregroundStyle(.secondary)
-                if let year = albumYear {
-                    Text(year).font(.caption).foregroundStyle(.secondary)
-                }
-                if let count = detailed?.tracks?.count, count > 0 {
-                    Text("\(count) tracks").font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            Spacer()
+    /// Dot-separated metadata line under the artist row in the hero —
+    /// year, track count, total duration when known. Skips any
+    /// segment with no data so the line stays clean.
+    private var metadataLine: String {
+        var parts: [String] = []
+        if let year = albumYear { parts.append(year) }
+        if let count = detailed?.tracks?.count, count > 0 {
+            parts.append("\(count) tracks")
         }
+        if let totalSeconds = totalDurationSeconds, totalSeconds > 0 {
+            parts.append(formatTotalDuration(totalSeconds))
+        }
+        return parts.joined(separator: " · ")
     }
 
-    private var actionButtons: some View {
-        HStack(spacing: 10) {
-            Button {
-                Task { await appModel.musicKit.play(album: album) }
-            } label: {
-                Label("Play Album", systemImage: "play.fill")
-            }
-            .buttonStyle(.borderedProminent)
+    private var totalDurationSeconds: TimeInterval? {
+        guard let tracks = detailed?.tracks else { return nil }
+        let total = tracks.compactMap { $0.duration }.reduce(0, +)
+        return total > 0 ? total : nil
+    }
 
-            Button {
-                Task { await addAlbumToQueue() }
-            } label: {
-                Label("Add to Queue", systemImage: "text.append")
-            }
-            .buttonStyle(.bordered)
-        }
+    private func formatTotalDuration(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds.rounded())
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        if h > 0 { return "\(h) hr \(m) min" }
+        return "\(m) min"
     }
 
     @ViewBuilder
@@ -93,42 +106,39 @@ struct AlbumDetailView: View {
 
     private func trackRow(_ track: Track, position: Int) -> some View {
         let song = songFromTrack(track)
-        return Button {
+        let actions: [MediaRowAction] = song.map { s in
+            [
+                MediaRowAction(systemImage: "text.insert", help: "Play Next") {
+                    Task { await appModel.musicKit.queueNext(s) }
+                },
+                MediaRowAction(systemImage: "text.append", help: "Add to Queue") {
+                    Task { await appModel.musicKit.queueLast(s) }
+                }
+            ]
+        } ?? []
+        let contextActions: [MediaRowAction] = song.map { s in
+            [
+                MediaRowAction(systemImage: "play.fill", help: "Play Now") {
+                    Task { await appModel.playAppleMusicSong(s) }
+                },
+                MediaRowAction(systemImage: "text.insert", help: "Play Next") {
+                    Task { await appModel.musicKit.queueNext(s) }
+                },
+                MediaRowAction(systemImage: "text.append", help: "Add to Queue") {
+                    Task { await appModel.musicKit.queueLast(s) }
+                }
+            ]
+        } ?? []
+        return TrackRow(
+            position: position,
+            title: track.title,
+            subtitle: nil,
+            durationSeconds: track.duration,
+            hoverActions: actions,
+            contextActions: contextActions,
+            isDisabled: song == nil
+        ) {
             if let song { Task { await appModel.playAppleMusicSong(song) } }
-        } label: {
-            HStack(spacing: 10) {
-                Text("\(position)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 22, alignment: .trailing)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(track.title).lineLimit(1)
-                }
-                Spacer()
-                if let dur = track.duration {
-                    Text(formatDuration(dur))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(.horizontal, 10).padding(.vertical, 4)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.bordered)
-        .frame(maxWidth: .infinity)
-        .disabled(song == nil)
-        .contextMenu {
-            if let song {
-                Button {
-                    Task { await appModel.playAppleMusicSong(song) }
-                } label: { Label("Play Now", systemImage: "play.fill") }
-                Button {
-                    Task { await appModel.musicKit.queueNext(song) }
-                } label: { Label("Play Next", systemImage: "text.insert") }
-                Button {
-                    Task { await appModel.musicKit.queueLast(song) }
-                } label: { Label("Add to Queue", systemImage: "text.append") }
-            }
         }
     }
 

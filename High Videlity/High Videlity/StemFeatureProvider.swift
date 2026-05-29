@@ -752,6 +752,29 @@ public actor StemFeatureProvider {
         return try await sendRequest(action: "cache_alias", payload: payload)
     }
 
+    /// Look up an existing cache row by (title, artist) — case-
+    /// insensitive exact match on both fields. Returns the most
+    /// recently created matching cache_key, or nil. Used when a song
+    /// is identified by Shazam (so we have a clean title+artist) but
+    /// no shazam-keyed row exists yet — typically because the song
+    /// was previously cached under `hash-<sha256>` by
+    /// LibraryBatchCacher's fallback path when its own Shazam
+    /// identification didn't yield an ID for the file. Callers
+    /// usually pair this with `alias(...)` to mint a shazam-keyed
+    /// row pointing at the found content for instant lookups next
+    /// time.
+    public func findCacheKey(title: String, artist: String, model: String = "htdemucs") async throws -> String? {
+        struct LookupEnvelope: Decodable {
+            let found: Bool
+            let cache_key: String?
+        }
+        let env: LookupEnvelope = try await sendRequest(
+            action: "cache_find_by_metadata",
+            payload: ["title": title, "artist": artist, "model": model]
+        )
+        return env.found ? env.cache_key : nil
+    }
+
     /// Local-only cache lookup. Returns the cached result if present
     /// + protocol-compatible, nil otherwise. Used by AppModel to
     /// decide whether to skip the Demucs run in favor of the CloudKit
@@ -1050,6 +1073,10 @@ public actor StemFeatureProvider {
     }
 
     public func cachedFeatures(forKey key: String, model: String = "htdemucs") async throws -> StemSeparationResult? {
+        return nil
+    }
+
+    public func findCacheKey(title: String, artist: String, model: String = "htdemucs") async throws -> String? {
         return nil
     }
 

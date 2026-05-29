@@ -24,6 +24,16 @@ private let mkLog = Logger(subsystem: "com.jessegriffith.HighVidelity", category
 @Observable
 final class MusicKitController {
 
+    init() {
+        // Auto-start the subscription observer when authorization was
+        // already granted on a previous launch — without this, the
+        // UI would never learn whether the user can actually play
+        // catalog content until they re-tap "Connect Apple Music."
+        if authStatus == .authorized {
+            startSubscriptionObserver()
+        }
+    }
+
     // MARK: - Auth
 
     /// Current authorization status. Reflects `MusicAuthorization.currentStatus`
@@ -33,6 +43,59 @@ final class MusicKitController {
 
     func requestAuthorization() async {
         authStatus = await MusicAuthorization.request()
+        if isAuthorized { startSubscriptionObserver() }
+    }
+
+    // MARK: - Subscription state
+    //
+    // `MusicSubscription.subscriptionUpdates` is an AsyncSequence that
+    // emits the user's current subscription state any time it changes
+    // (initial fetch, subscription expiry, renewal, sign-in/out). We
+    // mirror the latest snapshot into `@Observable` so SwiftUI views
+    // can show "Apple Music subscription required" CTAs when the user
+    // is authorized but can't actually play catalog content (e.g.,
+    // subscription lapsed or they're on a free Apple ID).
+    //
+    // `canPlayCatalogContent` is the boolean the AM source view cares
+    // about — it's true when the user has an active subscription that
+    // covers full-track playback (not just preview clips).
+
+    /// Latest snapshot of the user's Apple Music subscription state,
+    /// nil before the first emit. Use `canPlayCatalogContent` for the
+    /// "are catalog full-tracks playable?" boolean rather than reading
+    /// fields off this directly — Apple has added fields here over the
+    /// MusicKit versions and the convenience computed property
+    /// insulates callers from those churn moments.
+    var currentSubscription: MusicSubscription?
+
+    /// True iff the user has authorized AND has an active subscription
+    /// that can play catalog content. False also covers the
+    /// "loading subscription state" pre-emit window — UI should treat
+    /// nil as "unknown, don't show CTA yet" rather than "no
+    /// subscription, show CTA now."
+    var canPlayCatalogContent: Bool {
+        currentSubscription?.canPlayCatalogContent ?? false
+    }
+
+    /// True iff the subscription has been resolved at least once
+    /// (either positive or negative). Lets the UI distinguish
+    /// "still loading" from "definitely no subscription."
+    var hasResolvedSubscription: Bool { currentSubscription != nil }
+
+    @ObservationIgnored private var subscriptionObserverTask: Task<Void, Never>?
+
+    /// Subscribe to the `MusicSubscription.subscriptionUpdates` async
+    /// sequence on first authorization. The sequence runs for the
+    /// lifetime of the app — cancellation only happens on Task
+    /// cancellation (e.g., re-init when re-authorizing).
+    func startSubscriptionObserver() {
+        subscriptionObserverTask?.cancel()
+        subscriptionObserverTask = Task { @MainActor [weak self] in
+            for await sub in MusicSubscription.subscriptionUpdates {
+                guard let self else { return }
+                self.currentSubscription = sub
+            }
+        }
     }
 
     // MARK: - Search
@@ -101,6 +164,21 @@ final class MusicKitController {
 
     /// The song currently queued/playing via ApplicationMusicPlayer.
     var nowPlaying: Song?
+
+    /// Human-readable error message from the most recent failed
+    /// playback operation, nil when the last attempt succeeded.
+    /// AppleMusicSourceView shows this as a banner with a retry
+    /// affordance so the user isn't left with silent failures.
+    /// Set by `play(_:)` / queue / album / playlist paths on error,
+    /// cleared by the next successful `play(_:)`.
+    var lastPlayError: String?
+
+    /// Song the user last attempted to play, kept around so the
+    /// retry button can re-invoke `play(_:)` with the same input.
+    /// nil when the last attempt succeeded, when the last attempt
+    /// was a non-song path (album, playlist), or when there's been
+    /// no attempt yet.
+    @ObservationIgnored var lastPlayAttemptSong: Song?
     /// Mirror of `ApplicationMusicPlayer.shared.playbackTime`, refreshed at
     /// ~30 Hz by the polling task. This is what the visualizer reads — exact
     /// playback position inside the full song, frame-accurate, no DRM issue.
@@ -122,18 +200,25 @@ final class MusicKitController {
     /// initial track-change event.
     var onTrackChange: ((Song) -> Void)?
 
-    /// Queue and start playback. If `context` is provided AND contains
-    /// `song`, the full set is queued (with `song` as the starting
-    /// entry) so prev/next controls + auto-advance walk through it.
-    /// Falls back to single-song queue otherwise.
+    /// Queue and start playback. When `context` is provided, the
+    /// other songs are appended after `song` so prev/next + auto-
+    /// advance walk through them.
     ///
-    /// Historical note: an earlier attempt at multi-song queues via
-    /// `Queue(for:startingAt:)` failed prepareToPlay with
-    /// `MPMusicPlayerControllerErrorDomain.6` ("Failed to prepare to
-    /// play"). Re-tested 2026-05-28; behavior on the current MusicKit
-    /// build is TBD. Keep a single-song fallback path so a regression
-    /// degrades gracefully to today's behavior instead of breaking
-    /// playback entirely.
+    /// **Why two phases:** the direct `Queue(for:startingAt:)` form
+    /// fails `prepareToPlay` with `MPMusicPlayerControllerErrorDomain.6`
+    /// ("Failed to prepare to play") on the current MusicKit build
+    /// (re-verified 2026-05-28 with the auto-advance bug report —
+    /// the log line is still firing, the fallback to single-song
+    /// queue was masking the failure). Workaround:
+    ///   1. Queue the starting song alone (this form prepares
+    ///      reliably).
+    ///   2. After `play()` succeeds, append the rest of the context
+    ///      via `queue.insert(_, position: .tail)` — the same path
+    ///      `queueLast` uses, which is known to work.
+    ///
+    /// Without this fix, auto-advance never fires (single-song queue
+    /// has nothing after the current entry), which also breaks the
+    /// Phase 6 crossfade trigger.
     func play(_ song: Song, context: [Song] = []) async {
         if !isAuthorized {
             await requestAuthorization()
@@ -141,32 +226,36 @@ final class MusicKitController {
         }
 
         nowPlaying = song
-
-        // Prefer multi-song queue when caller passed a valid context
-        // (>1 item, includes the starting song). Single-song queue is
-        // the fallback.
-        let preferMulti = context.count > 1 && context.contains(where: { $0.id == song.id })
-
-        if preferMulti {
-            do {
-                player.queue = ApplicationMusicPlayer.Queue(for: context, startingAt: song)
-                try await player.prepareToPlay()
-                try await player.play()
-                startPolling()
-                return
-            } catch {
-                print("[MusicKit] multi-song queue prepareToPlay failed (\(error)); falling back to single-song queue")
-                // Fall through to single-song path.
-            }
-        }
+        lastPlayAttemptSong = song
 
         player.queue = [song]
         do {
             try await player.prepareToPlay()
             try await player.play()
+            // Clear any prior error banner now that this attempt
+            // succeeded. lastPlayAttemptSong also nils so the retry
+            // affordance disappears.
+            lastPlayError = nil
+            lastPlayAttemptSong = nil
             startPolling()
         } catch {
             print("[MusicKit] play failed: \(error)")
+            lastPlayError = Self.friendlyPlaybackError(error)
+            return
+        }
+
+        // Phase 2 — append tail context so the queue has somewhere
+        // to auto-advance to. De-dupe the starting song from the
+        // tail, and skip when the caller passed no/empty context.
+        let tail = context.filter { $0.id != song.id }
+        guard !tail.isEmpty else { return }
+        do {
+            try await player.queue.insert(tail, position: .tail)
+            // Refresh upcoming items eagerly so UpNextView reflects
+            // the new queue contents before the next 125ms poll.
+            refreshUpcoming()
+        } catch {
+            print("[MusicKit] tail context insert failed: \(error)")
         }
     }
 
@@ -443,6 +532,94 @@ final class MusicKitController {
         nowPlaying = nil
     }
 
+    /// Translate MusicKit / MPMusicPlayerController playback errors
+    /// into messages the user can act on. The raw NSError descriptions
+    /// expose internal domain names ("MPMusicPlayerControllerErrorDomain.6")
+    /// which read as scary-but-unactionable to the user — this layer
+    /// catches the common cases we recognize and explains them in
+    /// plain language, falling back to the raw description for novel
+    /// errors so we don't lose information.
+    private static func friendlyPlaybackError(_ error: Error) -> String {
+        let ns = error as NSError
+        // Subscription / entitlement family. These all collapse to a
+        // single "subscription needed" message — the user doesn't care
+        // about the exact distinction.
+        if ns.domain.contains("MusicKit") || ns.domain.contains("MPMusicPlayerController") {
+            let desc = ns.localizedDescription.lowercased()
+            if desc.contains("subscription") || desc.contains("not subscribed") {
+                return "Apple Music subscription required to play this track."
+            }
+            if desc.contains("network") || desc.contains("internet") {
+                return "Network error — check your connection and try again."
+            }
+            if desc.contains("permission") || desc.contains("authorized") {
+                return "Apple Music permission isn't granted. Open Settings and try again."
+            }
+        }
+        return ns.localizedDescription
+    }
+
+    // MARK: - Phase 6 — Sleep Timer
+    //
+    // Acts only on the in-app Apple Music player. The mic and macOS
+    // system-audio capture paths bypass ApplicationMusicPlayer entirely,
+    // so a sleep timer fire has no effect on those sources —
+    // SessionControlsView calls that out in its footer.
+    //
+    // MusicKit limitation: ApplicationMusicPlayer exposes no per-stream
+    // volume API, so true audio fade-out isn't possible. The timer
+    // does a hard pause at expiry. (Crossfade was prototyped here but
+    // removed — without two-stream overlap, "early advance" was just
+    // a track ending early, strictly worse than the default.)
+
+    /// Date the sleep timer is set to expire, or nil when no timer is
+    /// running. The UI reads this directly to render "sleep at 10:42 PM"
+    /// and to drive the moon-button glyph state.
+    var sleepTimerFireDate: Date?
+
+    /// Seconds remaining until the sleep timer fires, refreshed every
+    /// second by the tick task. UI renders this as a countdown.
+    var sleepTimerRemainingSeconds: Int = 0
+
+    /// True iff a sleep timer is currently armed.
+    var sleepTimerActive: Bool { sleepTimerFireDate != nil }
+
+    @ObservationIgnored private var sleepTimerTask: Task<Void, Never>?
+
+    /// Arm a sleep timer for `minutes` minutes from now. Replaces any
+    /// existing timer. At expiry, pauses the player and clears state.
+    /// No fade — see top-of-section note on MusicKit's volume API gap.
+    func startSleepTimer(minutes: Int) {
+        cancelSleepTimer()
+        let seconds = max(1, minutes) * 60
+        let fire = Date().addingTimeInterval(TimeInterval(seconds))
+        sleepTimerFireDate = fire
+        sleepTimerRemainingSeconds = seconds
+        sleepTimerTask = Task { @MainActor [weak self] in
+            while let self = self, let fire = self.sleepTimerFireDate {
+                let now = Date()
+                if now >= fire {
+                    self.pause()
+                    self.sleepTimerFireDate = nil
+                    self.sleepTimerRemainingSeconds = 0
+                    self.sleepTimerTask = nil
+                    return
+                }
+                self.sleepTimerRemainingSeconds = max(0, Int(fire.timeIntervalSince(now).rounded()))
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+            }
+        }
+    }
+
+    /// Cancel any running sleep timer. Safe to call when none is armed.
+    func cancelSleepTimer() {
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        sleepTimerFireDate = nil
+        sleepTimerRemainingSeconds = 0
+    }
+
     /// Drain the player's non-Observable scalar state into @Observable
     /// properties at ~30 Hz. The visualizer reads `playbackTime` once per
     /// frame; this polling frequency is plenty for that.
@@ -553,6 +730,67 @@ final class MusicKitController {
         } catch {
             print("[MusicKit] libraryPlaylists failed: \(error)")
             return []
+        }
+    }
+
+    // MARK: - Library full-paginated loaders
+    //
+    // MusicLibraryRequest's per-call `limit` caps at 100 server-side
+    // (values above are silently clamped). To surface the whole
+    // library, page through `MusicItemCollection.nextBatch()` until
+    // exhausted. The `onPage` callback receives each batch as it
+    // arrives so callers can append-as-loaded and the UI stays
+    // responsive on big libraries.
+
+    /// Stream the user's library songs in 100-item pages. Each page
+    /// is delivered via `onPage` on the calling actor; the awaited
+    /// return resolves only when the full library has been loaded
+    /// (or a network error stops the iteration).
+    func libraryAllSongs(onPage: @escaping ([Song]) -> Void) async {
+        await streamLibrary(type: Song.self, onPage: onPage)
+    }
+
+    func libraryAllAlbums(onPage: @escaping ([Album]) -> Void) async {
+        await streamLibrary(type: Album.self, onPage: onPage)
+    }
+
+    func libraryAllArtists(onPage: @escaping ([Artist]) -> Void) async {
+        await streamLibrary(type: Artist.self, onPage: onPage)
+    }
+
+    func libraryAllPlaylists(onPage: @escaping ([Playlist]) -> Void) async {
+        await streamLibrary(type: Playlist.self, onPage: onPage)
+    }
+
+    /// Shared pagination loop. Generic over the MusicLibrary-eligible
+    /// resource type. Uses `MusicItemCollection.hasNextBatch` +
+    /// `nextBatch()` for cursor-style iteration — the canonical
+    /// MusicKit way to walk through a library without a manual
+    /// offset (which `MusicLibraryRequest` doesn't expose).
+    private func streamLibrary<T>(
+        type: T.Type,
+        onPage: @escaping ([T]) -> Void
+    ) async where T: MusicLibraryRequestable {
+        if !isAuthorized {
+            await requestAuthorization()
+            guard isAuthorized else { return }
+        }
+        do {
+            var request = MusicLibraryRequest<T>()
+            request.limit = 100
+            let response = try await request.response()
+            var batch = response.items
+            if !batch.isEmpty { onPage(Array(batch)) }
+            while batch.hasNextBatch {
+                if let next = try await batch.nextBatch() {
+                    batch = next
+                    if !batch.isEmpty { onPage(Array(batch)) }
+                } else {
+                    break
+                }
+            }
+        } catch {
+            print("[MusicKit] streamLibrary<\(T.self)> failed: \(error)")
         }
     }
 

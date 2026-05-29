@@ -94,9 +94,11 @@ struct BrowseView: View {
                 if loading.contains(.forYou) && recommendations.isEmpty {
                     ProgressView().padding()
                 } else if recommendations.isEmpty {
-                    Text("No recommendations available right now.")
-                        .foregroundStyle(.secondary)
-                        .padding()
+                    EmptyPlaceholder(
+                        systemImage: "sparkles",
+                        title: "No recommendations yet",
+                        message: "Apple Music builds these from your listening history. Come back after you've played a few tracks."
+                    )
                 } else {
                     ForEach(recommendations, id: \.id) { rec in
                         recommendationSection(rec)
@@ -221,9 +223,11 @@ struct BrowseView: View {
                 if loading.contains(tab) && items.isEmpty {
                     ProgressView().padding()
                 } else if items.isEmpty {
-                    Text("No chart data available right now.")
-                        .foregroundStyle(.secondary)
-                        .padding()
+                    EmptyPlaceholder(
+                        systemImage: "chart.bar",
+                        title: "Charts unavailable",
+                        message: "No chart data for this region right now."
+                    )
                 } else {
                     ForEach(items) { item in
                         row(item)
@@ -234,40 +238,36 @@ struct BrowseView: View {
         }
     }
 
-    // MARK: - Row builders (same actions as Phase 1 / Phase 4)
+    // MARK: - Row builders (MediaRow)
 
     private func songRow(_ song: Song) -> some View {
-        Button {
-            Task { await appModel.playAppleMusicSong(song) }
-        } label: {
-            HStack(spacing: 10) {
-                artwork(song.artwork, size: 44)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(song.title).lineLimit(1)
-                    Text(song.artistName)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+        MediaRow(
+            artwork: song.artwork,
+            title: song.title,
+            subtitle: song.artistName,
+            artworkSize: 44,
+            accessory: .play,
+            hoverActions: [
+                MediaRowAction(systemImage: "text.insert", help: "Play Next") {
+                    Task { await appModel.musicKit.queueNext(song) }
+                },
+                MediaRowAction(systemImage: "text.append", help: "Add to Queue") {
+                    Task { await appModel.musicKit.queueLast(song) }
                 }
-                Spacer()
-                Image(systemName: "play.fill")
-                    .imageScale(.small)
-                    .foregroundStyle(.secondary)
-            }
-            .contentShape(Rectangle())
-            .padding(.horizontal, 10).padding(.vertical, 4)
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button { Task { await appModel.playAppleMusicSong(song) } } label: {
-                Label("Play Now", systemImage: "play.fill")
-            }
-            Button { Task { await appModel.musicKit.queueNext(song) } } label: {
-                Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
-            }
-            Button { Task { await appModel.musicKit.queueLast(song) } } label: {
-                Label("Add to Queue", systemImage: "text.line.last.and.arrowtriangle.forward")
-            }
+            ],
+            contextActions: [
+                MediaRowAction(systemImage: "play.fill", help: "Play Now") {
+                    Task { await appModel.playAppleMusicSong(song) }
+                },
+                MediaRowAction(systemImage: "text.insert", help: "Play Next") {
+                    Task { await appModel.musicKit.queueNext(song) }
+                },
+                MediaRowAction(systemImage: "text.append", help: "Add to Queue") {
+                    Task { await appModel.musicKit.queueLast(song) }
+                }
+            ]
+        ) {
+            Task { await appModel.playAppleMusicSong(song) }
         }
     }
 
@@ -275,60 +275,52 @@ struct BrowseView: View {
         NavigationLink {
             AlbumDetailView(album: album)
         } label: {
-            HStack(spacing: 10) {
-                artwork(album.artwork, size: 56)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(album.title).lineLimit(1)
-                    Text(album.artistName)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .imageScale(.small)
-                    .foregroundStyle(.tertiary)
-            }
-            .contentShape(Rectangle())
-            .padding(.horizontal, 10).padding(.vertical, 4)
+            MediaRow(
+                artwork: album.artwork,
+                title: album.title,
+                subtitle: album.artistName,
+                artworkSize: 52,
+                accessory: .chevron,
+                tappable: false,
+                hoverActions: [
+                    MediaRowAction(systemImage: "play.fill", help: "Play Album") {
+                        Task { await appModel.musicKit.play(album: album) }
+                    }
+                ],
+                contextActions: [
+                    MediaRowAction(systemImage: "play.fill", help: "Play Album") {
+                        Task { await appModel.musicKit.play(album: album) }
+                    }
+                ]
+            ) {}
         }
         .buttonStyle(.plain)
-        .contextMenu {
-            Button { Task { await appModel.musicKit.play(album: album) } } label: {
-                Label("Play Album", systemImage: "play.fill")
-            }
-        }
     }
 
     private func playlistRow(_ playlist: Playlist) -> some View {
         NavigationLink {
             PlaylistDetailView(playlist: playlist)
         } label: {
-            HStack(spacing: 10) {
-                artwork(playlist.artwork, size: 56)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(playlist.name).lineLimit(1)
-                    if let curator = playlist.curatorName, !curator.isEmpty {
-                        Text(curator)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+            MediaRow(
+                artwork: playlist.artwork,
+                title: playlist.name,
+                subtitle: playlist.curatorName,
+                artworkSize: 52,
+                accessory: .chevron,
+                tappable: false,
+                hoverActions: [
+                    MediaRowAction(systemImage: "play.fill", help: "Play Playlist") {
+                        Task { await appModel.musicKit.play(playlist: playlist) }
                     }
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .imageScale(.small)
-                    .foregroundStyle(.tertiary)
-            }
-            .contentShape(Rectangle())
-            .padding(.horizontal, 10).padding(.vertical, 4)
+                ],
+                contextActions: [
+                    MediaRowAction(systemImage: "play.fill", help: "Play Playlist") {
+                        Task { await appModel.musicKit.play(playlist: playlist) }
+                    }
+                ]
+            ) {}
         }
         .buttonStyle(.plain)
-        .contextMenu {
-            Button { Task { await appModel.musicKit.play(playlist: playlist) } } label: {
-                Label("Play Playlist", systemImage: "play.fill")
-            }
-        }
     }
 
     @ViewBuilder

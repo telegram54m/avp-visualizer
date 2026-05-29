@@ -51,7 +51,7 @@ def Xform "Root"
             uniform token info:id = "ND_UsdPreviewSurface_surfaceshader"
             color3f inputs:diffuseColor.connect = </Root/DiscoBallMaterial/DiffuseSelector.outputs:out>
             color3f inputs:emissiveColor.connect = </Root/DiscoBallMaterial/MixFinal.outputs:out>
-            float inputs:metallic.connect = </Root/DiscoBallMaterial/Mask.outputs:out>
+            float inputs:metallic.connect = </Root/DiscoBallMaterial/MaskedByPole.outputs:out>
             float inputs:roughness.connect = </Root/DiscoBallMaterial/RoughnessSelector.outputs:out>
             token outputs:out
         }
@@ -64,7 +64,7 @@ def Xform "Root"
         def Shader "DiffuseSelector"
         {
             uniform token info:id = "ND_ifgreater_color3"
-            float inputs:value1.connect = </Root/DiscoBallMaterial/Mask.outputs:out>
+            float inputs:value1.connect = </Root/DiscoBallMaterial/MaskedByPole.outputs:out>
             float inputs:value2 = 0.5
             color3f inputs:in1.connect = </Root/DiscoBallMaterial.inputs:LitColor>
             color3f inputs:in2 = (0, 0, 0)
@@ -80,7 +80,7 @@ def Xform "Root"
         def Shader "RoughnessSelector"
         {
             uniform token info:id = "ND_ifgreater_float"
-            float inputs:value1.connect = </Root/DiscoBallMaterial/Mask.outputs:out>
+            float inputs:value1.connect = </Root/DiscoBallMaterial/MaskedByPole.outputs:out>
             float inputs:value2 = 0.5
             float inputs:in1.connect = </Root/DiscoBallMaterial.inputs:LitRoughness>
             float inputs:in2 = 1.0
@@ -222,6 +222,65 @@ def Xform "Root"
             float outputs:out
         }
 
+        # ----- Pole singularity guard -----
+        # `MeshResource.generateSphere`'s UV has a singularity at each
+        # pole — all longitudes collapse to one cell, so a SINGLE
+        # triangle near the pole spans many longitude cells and gets
+        # rendered as one giant misshapen tile in whatever color the
+        # triangle's barycentric UV samples. Pre-Phase-7 the visualizer
+        # frustum's aspect ratio kept both poles outside the visible
+        # area; Phase 7's wider full-window aspect shows the upper
+        # pole as a bright blob in the upper corner whenever that
+        # blob lands on a lit cell.
+        #
+        # Fix: zero the Mask whenever UV.y is within ~1.5 cell rows of
+        # either pole, so polar samples ALWAYS take the MirrorColor
+        # branch (which Swift sets to pure black) — the giant blob
+        # melts into the dark background. With LatCells = 14, 1.5/14
+        # ≈ 0.107 from each end is enough to cover the singular row
+        # plus the visibly-distorted neighbor row.
+        def Shader "GuardBottom"
+        {
+            uniform token info:id = "ND_ifgreater_float"
+            float inputs:value1.connect = </Root/DiscoBallMaterial/SplitUV.outputs:outy>
+            float inputs:value2 = 0.107
+            float inputs:in1 = 1.0
+            float inputs:in2 = 0.0
+            float outputs:out
+        }
+
+        def Shader "GuardTop"
+        {
+            uniform token info:id = "ND_ifgreater_float"
+            float inputs:value1 = 0.893
+            float inputs:value2.connect = </Root/DiscoBallMaterial/SplitUV.outputs:outy>
+            float inputs:in1 = 1.0
+            float inputs:in2 = 0.0
+            float outputs:out
+        }
+
+        def Shader "PoleGuard"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial/GuardBottom.outputs:out>
+            float inputs:in2.connect = </Root/DiscoBallMaterial/GuardTop.outputs:out>
+            float outputs:out
+        }
+
+        # MaskedByPole = Mask × PoleGuard. Pole rows get forced to 0
+        # (mirror); everywhere else keeps the original parity mask.
+        # All downstream selectors (DiffuseSelector, RoughnessSelector,
+        # MixFinal, PreviewSurface.metallic) read MaskedByPole instead
+        # of Mask so the pole singularity is uniformly suppressed
+        # across albedo, metallic, roughness, and emissive.
+        def Shader "MaskedByPole"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/DiscoBallMaterial/Mask.outputs:out>
+            float inputs:in2.connect = </Root/DiscoBallMaterial/PoleGuard.outputs:out>
+            float outputs:out
+        }
+
         # ----- Lit-cell emissive: Baseline + (Peak − Baseline) × BeatPulse -----
         def Shader "PulseRange"
         {
@@ -274,7 +333,7 @@ def Xform "Root"
         def Shader "MixFinal"
         {
             uniform token info:id = "ND_ifgreater_color3"
-            float inputs:value1.connect = </Root/DiscoBallMaterial/Mask.outputs:out>
+            float inputs:value1.connect = </Root/DiscoBallMaterial/MaskedByPole.outputs:out>
             float inputs:value2 = 0.5
             color3f inputs:in1.connect = </Root/DiscoBallMaterial/LitContrib.outputs:out>
             color3f inputs:in2.connect = </Root/DiscoBallMaterial.inputs:MirrorColor>

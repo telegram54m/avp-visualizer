@@ -839,6 +839,39 @@ def action_cache_lookup_only(req: dict[str, Any]) -> dict[str, Any]:
     return {"hit": True, "envelope": cached}
 
 
+def action_cache_find_by_metadata(req: dict[str, Any]) -> dict[str, Any]:
+    """Case-insensitive exact match on (title, artist). Used when AM
+    playback identifies a song via Shazam but the cache has no
+    shazam-keyed row — the song may still be in cache under a
+    different key shape (typically `hash-<sha256>` when an earlier
+    `LibraryBatchCacher` scan couldn't Shazam-ID the file at scan
+    time, or `musicapp-pid-<id>` for Music.app-tagged rows from
+    before the shazam-first migration).
+
+    Returns the most-recently-created matching key so the caller can
+    alias it to `shazam-<id>` for instant lookups next time. Falls
+    back to {found: false} when no metadata is unique enough.
+    Requires both fields non-empty — single-field matching would
+    false-positive on common titles (e.g. "Intro").
+    """
+    title = (req.get("title") or "").strip()
+    artist = (req.get("artist") or "").strip()
+    model = req.get("model", "htdemucs")
+    if not title or not artist:
+        return {"found": False}
+    conn = _ensure_cache()
+    row = conn.execute(
+        "SELECT cache_key FROM stem_features "
+        "WHERE LOWER(title) = LOWER(?) AND LOWER(artist) = LOWER(?) "
+        "AND model = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (title, artist, model),
+    ).fetchone()
+    if row is None:
+        return {"found": False}
+    return {"found": True, "cache_key": row[0]}
+
+
 def action_cache_put_binary(req: dict[str, Any]) -> dict[str, Any]:
     """Insert pre-computed binary features into the local SQLite cache.
     Used when the Swift side fetches features from the CloudKit public
@@ -880,6 +913,7 @@ ACTIONS = {
     "cache_lookup_only": action_cache_lookup_only,
     "cache_put_binary": action_cache_put_binary,
     "cache_clear_all": action_cache_clear_all,
+    "cache_find_by_metadata": action_cache_find_by_metadata,
 }
 
 

@@ -29,12 +29,10 @@ struct ContentView: View {
     #if os(iOS)
     @State private var showVisualizer = false
     #endif
-    /// macOS now-playing inspector visibility. Toggled via the toolbar
-    /// button + the small icon next to the now-playing label. Default
-    /// is closed so the user can finish setup steps without the panel
-    /// stealing screen width on first launch.
+    /// macOS now-playing inspector visibility lives on AppModel so
+    /// VisualizerView can toggle and observe the same state — see
+    /// AppModel.showNowPlayingInspector for the rationale.
     #if os(macOS)
-    @State private var showNowPlayingInspector = false
     @State private var showAppleMusicLibrary = false
     @State private var showBrowse = false
     #endif
@@ -55,20 +53,33 @@ struct ContentView: View {
         #if os(macOS)
         // Inspector panel — slides in from the right of the NavigationStack
         // hosting this view, doesn't dim the main content. Width is
-        // user-resizable in the standard SwiftUI way.
-        .inspector(isPresented: $showNowPlayingInspector) {
-            NowPlayingView()
-                .environment(appModel)
-                .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
+        // user-resizable in the standard SwiftUI way. State is shared
+        // with VisualizerView via AppModel so the panel and its
+        // toolbar button remain accessible after navigating into the
+        // visualizer.
+        .inspector(isPresented: Binding(
+            get: { appModel.showNowPlayingInspector },
+            set: { appModel.showNowPlayingInspector = $0 }
+        )) {
+            // Conditional mount — without it, the inspector keeps
+            // NowPlayingView in the view hierarchy after collapse and
+            // its 8 Hz playbackTime-driven invalidations continue
+            // costing the viz cycles (~80 fps cap post-close instead
+            // of the 100+ pre-open baseline).
+            if appModel.showNowPlayingInspector {
+                NowPlayingView()
+                    .environment(appModel)
+                    .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
+            }
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    showNowPlayingInspector.toggle()
+                    appModel.showNowPlayingInspector.toggle()
                 } label: {
-                    Label("Now Playing", systemImage: showNowPlayingInspector ? "sidebar.right" : "music.note")
+                    Label("Now Playing", systemImage: appModel.showNowPlayingInspector ? "sidebar.right" : "music.note")
                 }
-                .help(showNowPlayingInspector ? "Hide Now Playing panel" : "Show Now Playing panel")
+                .help(appModel.showNowPlayingInspector ? "Hide Now Playing panel" : "Show Now Playing panel")
             }
         }
         #endif
