@@ -147,7 +147,8 @@ struct VisualizerView: View {
                 appModel.debugSceneRoot = crystal
                 appModel.sceneUpdateSubscription = content.subscribe(
                     to: SceneEvents.Update.self
-                ) { event in
+                ) { [weak crystal] event in
+                    guard let crystal else { return }
                     appModel.recordFrameDelta(event.deltaTime)
                     if isLive {
                         CrystalVisualizerV2.scanForNewOnsets(
@@ -196,7 +197,8 @@ struct VisualizerView: View {
                 appModel.debugSceneRoot = clouds
                 appModel.sceneUpdateSubscription = content.subscribe(
                     to: SceneEvents.Update.self
-                ) { event in
+                ) { [weak clouds] event in
+                    guard let clouds else { return }
                     appModel.recordFrameDelta(event.deltaTime)
                     CloudVisualizer.animate(
                         clouds,
@@ -235,7 +237,8 @@ struct VisualizerView: View {
                 appModel.debugSceneRoot = rings
                 appModel.sceneUpdateSubscription = content.subscribe(
                     to: SceneEvents.Update.self
-                ) { event in
+                ) { [weak rings] event in
+                    guard let rings else { return }
                     appModel.recordFrameDelta(event.deltaTime)
                     RingsVisualizer.animate(
                         rings,
@@ -281,7 +284,8 @@ struct VisualizerView: View {
                 appModel.debugSceneRoot = slipstream
                 appModel.sceneUpdateSubscription = content.subscribe(
                     to: SceneEvents.Update.self
-                ) { event in
+                ) { [weak slipstream] event in
+                    guard let slipstream else { return }
                     appModel.recordFrameDelta(event.deltaTime)
                     if useLiveSpawn {
                         // For LOCAL FILE: bound the scan to current
@@ -343,7 +347,8 @@ struct VisualizerView: View {
                 appModel.debugSceneRoot = ambient
                 appModel.sceneUpdateSubscription = content.subscribe(
                     to: SceneEvents.Update.self
-                ) { event in
+                ) { [weak ambient] event in
+                    guard let ambient else { return }
                     appModel.recordFrameDelta(event.deltaTime)
                     // Apply draggable-camera orientation. yaw_quat first
                     // then pitch_quat (read right-to-left in the
@@ -376,7 +381,8 @@ struct VisualizerView: View {
                 content.add(dodec)
                 appModel.sceneUpdateSubscription = content.subscribe(
                     to: SceneEvents.Update.self
-                ) { event in
+                ) { [weak dodec] event in
+                    guard let dodec else { return }
                     appModel.recordFrameDelta(event.deltaTime)
                     DodecahedronVisualizer.animate(
                         dodec,
@@ -413,7 +419,8 @@ struct VisualizerView: View {
                 content.add(fractal)
                 appModel.sceneUpdateSubscription = content.subscribe(
                     to: SceneEvents.Update.self
-                ) { event in
+                ) { [weak fractal] event in
+                    guard let fractal else { return }
                     appModel.recordFrameDelta(event.deltaTime)
                     FractalVisualizer.animate(
                         fractal,

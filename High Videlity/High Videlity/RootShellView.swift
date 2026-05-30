@@ -42,6 +42,24 @@ struct RootShellView: View {
             KeyboardShortcuts()
                 .environment(appModel)
         }
+        // CRASH FIX (2026-05-31): when the visualizer overlay closes
+        // (showVisualizer → false) the RealityView unmounts, but its
+        // `SceneEvents.Update` subscription is only ever cancelled by
+        // the NEXT make closure's reassignment (via the property's
+        // didSet). On overlay close there is no next make, so the
+        // subscription kept firing the animate loop into a
+        // half-torn-down scene graph — the render thread then drew a
+        // freed entity → EXC_BAD_ACCESS in re::encodeDrawCalls.
+        // Cancel it here on the close transition. This fires ONLY on
+        // the real show→hide flip (never on `.id(mode)` mode-cycle,
+        // which keeps showVisualizer true), so it can't cancel a live
+        // subscription out from under an active visualizer.
+        .onChange(of: appModel.showVisualizer) { _, isShown in
+            if !isShown {
+                appModel.sceneUpdateSubscription = nil
+                appModel.debugSceneRoot = nil
+            }
+        }
         // Frosted-translucent window background. The
         // VisualEffectBackground paints the system-supplied
         // material; the TransparentWindowConfigurator flips the

@@ -104,7 +104,16 @@ struct LibrarySongsListView: View {
     /// which compounded with the sort to produce the beach ball.
     struct SortableSong: Identifiable, Hashable {
         let id: MusicItemID
-        let song: Song
+        // NOTE: deliberately does NOT embed the MusicKit `Song`.
+        // `Song` is a heavyweight value type (nested artwork +
+        // relationship metadata); embedding it here meant the same
+        // ~11k Songs were retained THREE times simultaneously — once
+        // in the parent's `songs: [Song]`, once in `mappedSongs`, and
+        // again in `rows` (up to 11k more under "Show all"). That was
+        // the ~1.4 GB spike on the all-songs list. We keep only the
+        // `id` + the few display strings the table renders, and look
+        // the full `Song` back up from the parent `songs` array on the
+        // rare play/queue action (see `song(for:)`).
         let title: String
         let artist: String
         let album: String
@@ -187,6 +196,15 @@ struct LibrarySongsListView: View {
         scheduleRowsRecompute()
     }
 
+    /// Look the full `Song` back up from the parent `songs` array by
+    /// id. Used only on user-initiated play/queue — an O(n) scan over
+    /// ~11k items is microseconds and happens at most once per click,
+    /// which is the right trade for not retaining 11k Songs twice over
+    /// in `mappedSongs`/`rows`.
+    private func song(for id: SortableSong.ID) -> Song? {
+        songs.first { $0.id == id }
+    }
+
     private func makeSortable(_ song: Song) -> SortableSong {
         let album = song.albumTitle ?? ""
         let key = "\(song.title) \(song.artistName) \(album)".lowercased()
@@ -197,7 +215,6 @@ struct LibrarySongsListView: View {
         )
         return SortableSong(
             id: song.id,
-            song: song,
             title: song.title,
             artist: song.artistName,
             album: album,
@@ -270,21 +287,21 @@ struct LibrarySongsListView: View {
                 }
             }
             .contextMenu(forSelectionType: SortableSong.ID.self) { ids in
-                if let id = ids.first, let row = rows.first(where: { $0.id == id }) {
+                if let id = ids.first, let song = song(for: id) {
                     Button("Play Now") {
-                        Task { await appModel.playAppleMusicSong(row.song) }
+                        Task { await appModel.playAppleMusicSong(song) }
                     }
                     Button("Play Next") {
-                        Task { await appModel.musicKit.queueNext(row.song) }
+                        Task { await appModel.musicKit.queueNext(song) }
                     }
                     Button("Add to Queue") {
-                        Task { await appModel.musicKit.queueLast(row.song) }
+                        Task { await appModel.musicKit.queueLast(song) }
                     }
                 }
             } primaryAction: { ids in
                 // Double-click on a row plays it.
-                if let id = ids.first, let row = rows.first(where: { $0.id == id }) {
-                    Task { await appModel.playAppleMusicSong(row.song) }
+                if let id = ids.first, let song = song(for: id) {
+                    Task { await appModel.playAppleMusicSong(song) }
                 }
             }
         }
