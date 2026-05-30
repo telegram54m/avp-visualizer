@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		FCA2B49B2FBC1ADE00BD8A5D /* RealityKitContent in Frameworks */ = {isa = PBXBuildFile; productRef = FCA2B49A2FBC1ADE00BD8A5D /* RealityKitContent */; };
 		FCA2B4B12FBC1C0800BD8A5D /* AudioAnalysis in Frameworks */ = {isa = PBXBuildFile; productRef = FCA2B4B02FBC1C0800BD8A5D /* AudioAnalysis */; };
+		FCBB000012FCB000000BD8A5D /* HTDemucsSwift in Frameworks */ = {isa = PBXBuildFile; productRef = FCBB000022FCB000000BD8A5D /* HTDemucsSwift */; };
+		FCBB000042FCB000000BD8A5D /* FeatureDerive in Frameworks */ = {isa = PBXBuildFile; productRef = FCBB000052FCB000000BD8A5D /* FeatureDerive */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -44,6 +46,8 @@
 			files = (
 				FCA2B49B2FBC1ADE00BD8A5D /* RealityKitContent in Frameworks */,
 				FCA2B4B12FBC1C0800BD8A5D /* AudioAnalysis in Frameworks */,
+				FCBB000012FCB000000BD8A5D /* HTDemucsSwift in Frameworks */,
+				FCBB000042FCB000000BD8A5D /* FeatureDerive in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -97,6 +101,8 @@
 			packageProductDependencies = (
 				FCA2B49A2FBC1ADE00BD8A5D /* RealityKitContent */,
 				FCA2B4B02FBC1C0800BD8A5D /* AudioAnalysis */,
+				FCBB000022FCB000000BD8A5D /* HTDemucsSwift */,
+				FCBB000052FCB000000BD8A5D /* FeatureDerive */,
 			);
 			productName = "High Videlity";
 			productReference = FCA2B4952FBC1ADE00BD8A5D /* High Videlity.app */;
@@ -128,6 +134,8 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				FCA2B4AF2FBC1C0800BD8A5D /* XCLocalSwiftPackageReference "../AudioAnalysis" */,
+				FCBB000032FCB000000BD8A5D /* XCLocalSwiftPackageReference "../StemAnalysis/HTDemucsSwiftProbe" */,
+				FCBB000062FCB000000BD8A5D /* XCLocalSwiftPackageReference "../StemAnalysis/FeatureDeriveSwiftProbe" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = FCA2B4962FBC1ADE00BD8A5D /* Products */;
@@ -395,6 +403,14 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ../AudioAnalysis;
 		};
+		FCBB000032FCB000000BD8A5D /* XCLocalSwiftPackageReference "../StemAnalysis/HTDemucsSwiftProbe" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../StemAnalysis/HTDemucsSwiftProbe;
+		};
+		FCBB000062FCB000000BD8A5D /* XCLocalSwiftPackageReference "../StemAnalysis/FeatureDeriveSwiftProbe" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../StemAnalysis/FeatureDeriveSwiftProbe;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -405,6 +421,14 @@
 		FCA2B4B02FBC1C0800BD8A5D /* AudioAnalysis */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = AudioAnalysis;
+		};
+		FCBB000022FCB000000BD8A5D /* HTDemucsSwift */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = HTDemucsSwift;
+		};
+		FCBB000052FCB000000BD8A5D /* FeatureDerive */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = FeatureDerive;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -1,0 +1,6 @@
+# Big model weights — bundled into the app at build time when present,
+# but never committed to git. Generate via:
+#   cd StemAnalysis && .venv/bin/python \
+#     HTDemucsSwiftProbe/tools/export_weights.py htdemucs
+# then copy or symlink into this folder for `Bundle.main` lookups.
+*.safetensors
