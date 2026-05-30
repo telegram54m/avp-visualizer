@@ -129,40 +129,75 @@ enum LibraryBatchCacher {
         // first play still re-runs the 30-second AnalysisTimeline.
         // Cheap when the cache already has it (skipped); ~5-10s when
         // missing.
+        //
+        // Tier A parallelization ([[swift-sidecar-port-spec]] Phase 2
+        // follow-up): kick this off as a detached task BEFORE Shazam,
+        // cache lookups, and stem separation. AnalysisTimeline.analyze
+        // runs on the CPU via Accelerate vDSP; the stem provider's
+        // htdemucs runs on the GPU via mlx-swift Metal. They don't
+        // contend, so they get to overlap for free. Wall-clock per
+        // song drops by 5-10s of full-mix work — proportionally bigger
+        // once stems land in Release build.
+        //
+        // We await the task right before returning the Outcome so the
+        // caller sees a single done-event per entry. Errors are
+        // non-fatal: stems can still cache without frames; first play
+        // will fall back to fresh analysis.
+        let entryTitleForLog = entry.title
+        let frameTask: Task<Void, Never>?
         if FrameFeatureCache.cachedFrames(forHash: frameHash) == nil {
-            onPhase("Computing visualizer timeline…", 0.05)
-            do {
-                let audio = try AudioFileDecoder.decode(contentsOf: entry.fileURL)
-                let frames = AnalysisTimeline.analyze(audio)
-                FrameFeatureCache.storeFrames(frames, forHash: frameHash)
-            } catch {
-                // Non-fatal — stems can still cache without frames.
-                // First play will fall back to fresh analysis.
-                batchLog.notice("HV-BATCH frame pre-warm failed for \(entry.title, privacy: .public): \(String(describing: error), privacy: .public)")
+            let fileURL = entry.fileURL
+            frameTask = Task.detached(priority: .utility) {
+                do {
+                    let audio = try AudioFileDecoder.decode(contentsOf: fileURL)
+                    let frames = AnalysisTimeline.analyze(audio)
+                    FrameFeatureCache.storeFrames(frames, forHash: frameHash)
+                } catch {
+                    batchLog.notice("HV-BATCH frame pre-warm failed for \(entryTitleForLog, privacy: .public): \(String(describing: error), privacy: .public)")
+                }
+            }
+        } else {
+            frameTask = nil
+        }
+        // Closure that awaits the parallel frame task if any. Called
+        // from every return path below so the outcome reflects all
+        // work for this entry.
+        @Sendable func awaitFrameTaskIfNeeded() async {
+            if let t = frameTask {
+                await t.value
             }
         }
 
-        let primaryKey: String
+        let primaryKey: String   // canonical recording key
         let shazamID: String?
+        let isrc: String?
         switch shazamResult {
-        case .matched(let id, _, _):
-            // Shazam-key as primary unlocks the CloudKit public-DB
-            // cross-user cache. The hash-key alias goes on at the end
-            // so play-time lookup still works.
-            primaryKey = "shazam-\(id)"
-            shazamID = id
+        case .matched(let id, _, _, let code):
+            // Canonical key = the RECORDING, not the catalog entry.
+            // ISRC collapses all of a recording's Shazam IDs AND all
+            // files of it to one row; shazamID is only the fallback
+            // when the match carried no ISRC. This is the fix for the
+            // one-song-→-14-rows bug: 14 catalog IDs share one ISRC.
+            primaryKey = StemCacheKey.canonical(isrc: code, shazamID: id, fallback: hashKey)
+            shazamID = id.isEmpty ? nil : id
+            isrc = StemCacheKey.normalizeISRC(code).isEmpty ? nil : code
         case .unmatched:
             primaryKey = hashKey
             shazamID = nil
+            isrc = nil
         case .error(let reason):
+            await awaitFrameTaskIfNeeded()
             return .failed(reason: "shazam identify: \(reason)")
         }
+        // Whether we have a cross-user-shareable recording identity at
+        // all (ISRC or Shazam ID). Drives CloudKit participation.
+        let hasRecordingIdentity = (isrc != nil) || (shazamID != nil)
 
         // 2. Side-quest: if Shazam identified the song, fire the
         //    metadata lookup. It caches in UserDefaults + pushes to
         //    CloudKit private DB so other devices benefit. Fire and
         //    forget — don't block stem caching on it.
-        if case .matched(_, let title, let artist) = shazamResult {
+        if case .matched(_, let title, let artist, _) = shazamResult {
             Task.detached(priority: .background) {
                 _ = await TunebatBpmFetcher.lookup(title: title, artist: artist)
             }
@@ -184,14 +219,49 @@ enum LibraryBatchCacher {
                 if primaryKey != hashKey {
                     _ = try? await provider.alias(primaryKey: primaryKey, aliasKey: hashKey)
                 }
+                await awaitFrameTaskIfNeeded()
                 return .alreadyCached
             }
-            // Tier 2: CloudKit public DB (only when Shazam-identified).
-            if let shazamID {
+
+            // Tier 1b: the SAME recording may already be cached under a
+            // DIFFERENT key from a prior scan — its content hash, an
+            // older `shazam-<id>` row (pre-ISRC-canonicalization), or a
+            // (title, artist) match. Find it and ALIAS to the canonical
+            // key instead of recomputing. This is what stops N library
+            // entries of one recording (e.g. the same song on 13 albums,
+            // each matching a different catalog ID) from each computing
+            // their own row — they all resolve to one canonical row.
+            var aliasCandidates: [String] = [hashKey]
+            if let shazamID { aliasCandidates.append(StemCacheKey.shazam(shazamID)) }
+            for candidate in aliasCandidates where candidate != primaryKey {
+                if (try? await provider.cachedFeatures(forKey: candidate)) != nil {
+                    _ = try? await provider.alias(primaryKey: candidate, aliasKey: primaryKey)
+                    if primaryKey != hashKey {
+                        _ = try? await provider.alias(primaryKey: primaryKey, aliasKey: hashKey)
+                    }
+                    await awaitFrameTaskIfNeeded()
+                    return .alreadyCached
+                }
+            }
+            if !entry.title.isEmpty && !entry.artist.isEmpty,
+               let foundKey = try? await provider.findCacheKey(title: entry.title, artist: entry.artist),
+               foundKey != primaryKey,
+               (try? await provider.cachedFeatures(forKey: foundKey)) != nil {
+                _ = try? await provider.alias(primaryKey: foundKey, aliasKey: primaryKey)
+                if primaryKey != hashKey {
+                    _ = try? await provider.alias(primaryKey: primaryKey, aliasKey: hashKey)
+                }
+                await awaitFrameTaskIfNeeded()
+                return .alreadyCached
+            }
+
+            // Tier 2: CloudKit public DB (only when we have a
+            // cross-user recording identity — ISRC or Shazam ID).
+            if hasRecordingIdentity {
                 onPhase("Checking cloud cache…", 0.15)
             }
-            if let shazamID,
-               let cloudHit = await CloudCacheSync.shared.fetchStemFeatures(shazamID: shazamID) {
+            if hasRecordingIdentity,
+               let cloudHit = await CloudCacheSync.shared.fetchStemFeatures(isrc: isrc, shazamID: shazamID) {
                 if let blob = cloudHit.rawFeaturesBlob,
                    let metaJSON = cloudHit.rawStemsMetaJSON {
                     let meta = decodeMetaArray(metaJSON)
@@ -209,9 +279,10 @@ enum LibraryBatchCacher {
                         _ = try? await provider.alias(primaryKey: primaryKey, aliasKey: hashKey)
                     }
                 }
-                return shazamID.isEmpty
+                await awaitFrameTaskIfNeeded()
+                return (shazamID ?? "").isEmpty
                     ? .unidentifiedButCached(hashKey: primaryKey, fromCache: true)
-                    : .shazamIdentifiedAndCached(shazamID: shazamID, fromCache: true)
+                    : .shazamIdentifiedAndCached(shazamID: shazamID!, fromCache: true)
             }
 
             // Tier 3: full Demucs separation. throttleMS is set so
@@ -247,26 +318,43 @@ enum LibraryBatchCacher {
                 _ = try? await provider.alias(primaryKey: primaryKey, aliasKey: hashKey)
             }
 
-            // Push fresh stems to CloudKit public DB when Shazam-
-            // identified (matches AppModel's behavior).
-            if !result.fromCache, let shazamID {
+            // Push fresh stems to CloudKit public DB, keyed by the
+            // recording identity (ISRC preferred, Shazam ID fallback)
+            // so the GLOBAL cache holds exactly one record per
+            // recording regardless of how many catalog IDs match it.
+            if !result.fromCache, hasRecordingIdentity {
                 let titleCopy = entry.title
                 let artistCopy = entry.artist
+                let isrcCopy = isrc
+                let shazamCopy = shazamID
                 Task.detached(priority: .background) {
                     await CloudCacheSync.shared.saveStemFeatures(
-                        shazamID: shazamID,
+                        isrc: isrcCopy,
+                        shazamID: shazamCopy,
                         title: titleCopy, artist: artistCopy,
                         result: result
                     )
                 }
             }
 
+            // Wait for the parallel frame analysis to finish so the
+            // outcome reflects ALL work for this entry — if it's still
+            // running when stems finish, this is the only place we
+            // block on it. In the cache-miss case where stems take
+            // ~15s and frames take ~5-10s, this await is essentially
+            // free (frames already done). In the cache-hit case it
+            // returned earlier with its own await.
+            await awaitFrameTaskIfNeeded()
+
             if let shazamID {
                 return .shazamIdentifiedAndCached(shazamID: shazamID, fromCache: result.fromCache)
+            } else if let isrc {
+                return .shazamIdentifiedAndCached(shazamID: "isrc:\(isrc)", fromCache: result.fromCache)
             } else {
                 return .unidentifiedButCached(hashKey: primaryKey, fromCache: result.fromCache)
             }
         } catch {
+            await awaitFrameTaskIfNeeded()
             return .failed(reason: "stem separate: \(error)")
         }
     }
@@ -274,7 +362,7 @@ enum LibraryBatchCacher {
     // MARK: - Shazam offline identification
 
     private enum ShazamIdResult: Sendable {
-        case matched(shazamID: String, title: String, artist: String)
+        case matched(shazamID: String, title: String, artist: String, isrc: String)
         case unmatched
         case error(reason: String)
     }
@@ -302,7 +390,8 @@ enum LibraryBatchCacher {
                 return .matched(
                     shazamID: item.shazamID ?? "",
                     title: item.title ?? "",
-                    artist: item.artist ?? ""
+                    artist: item.artist ?? "",
+                    isrc: item.isrc ?? ""
                 )
             case .noMatch:
                 return .unmatched

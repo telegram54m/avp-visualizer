@@ -68,6 +68,20 @@ enum StemCacheAuditor {
         /// (n_frames, duration_seconds) but different (title, artist).
         /// Strong indicator of a misidentification-induced alias.
         case duplicatePayload(otherKeys: [String])
+        /// This row is a REDUNDANT duplicate of one recording: it
+        /// shares an identical payload AND identical (title, artist)
+        /// with one or more other rows, and it's one of several
+        /// `shazam-<id>` rows for that single recording. This is the
+        /// shazam-cache-key-duplicates bug — one recording matches many
+        /// Shazam catalog IDs (single / album / remaster / regional
+        /// pressings), and each minted its own ~300 KB row. Legitimate
+        /// aliasing produces at most ONE `shazam-` key per recording,
+        /// so a surplus is unambiguous. `survivorKey` is the row we
+        /// keep (the oldest `shazam-`, or an `isrc-` row if one exists);
+        /// deleting this row is safe — play-time lookup still resolves
+        /// via the survivor, the content `hash-`/`pid-` aliases, and
+        /// (going forward) the canonical `isrc-` key.
+        case redundantRecordingDuplicate(survivorKey: String)
         /// Row's stems_meta column was NULL — v1 protocol-version row.
         /// Harmless to delete (will be recomputed); shown so the user
         /// can clean up.
@@ -96,6 +110,7 @@ enum StemCacheAuditor {
         var isHighConfidence: Bool {
             for k in kinds {
                 if case .duplicatePayload = k { return true }
+                if case .redundantRecordingDuplicate = k { return true }
             }
             return false
         }
@@ -124,6 +139,8 @@ enum StemCacheAuditor {
                     let preview = otherKeys.prefix(2).joined(separator: ", ")
                     let more = otherKeys.count > 2 ? " (…)" : ""
                     return "Identical stem bytes as \(suffix) with different metadata: \(preview)\(more)"
+                case let .redundantRecordingDuplicate(survivorKey):
+                    return "Redundant duplicate of this recording (one of several Shazam-ID rows for the same song). Safe to remove — kept row: \(survivorKey)."
                 case let .staleProtocolVersion(version):
                     return "Stale protocol version \(version) — would be recomputed on next play."
                 case .untaggable:
@@ -184,6 +201,10 @@ enum StemCacheAuditor {
         // pair — those are the legitimate aliases.
         progress(Progress(stage: .correlating, completed: 0, total: rows.count))
         let dupeOtherKeysByCacheKey = correlateDuplicatePayloads(rows: rows)
+        // Redundant same-recording duplicates (the shazam-cache-key
+        // bug): surplus `shazam-` rows for one recording. Map from a
+        // redundant row's cacheKey → the survivor key we keep.
+        let redundantSurvivorByCacheKey = correlateRedundantRecordings(rows: rows)
 
         // 3. MusicBrainz duration lookups. Dedupe by (title, artist) —
         // many cache rows can share the same wrong tag (the alias-bug
@@ -230,7 +251,14 @@ enum StemCacheAuditor {
         for row in rows {
             var kinds: [FindingKind] = []
 
-            // Duplicate-payload finding.
+            // Redundant same-recording duplicate (surplus shazam- row).
+            // Checked before duplicatePayload so the more specific,
+            // safe-to-delete finding wins for these rows.
+            if let survivor = redundantSurvivorByCacheKey[row.cacheKey] {
+                kinds.append(.redundantRecordingDuplicate(survivorKey: survivor))
+            }
+
+            // Duplicate-payload finding (different metadata, same bytes).
             if let others = dupeOtherKeysByCacheKey[row.cacheKey], !others.isEmpty {
                 kinds.append(.duplicatePayload(otherKeys: others))
             }
@@ -368,6 +396,64 @@ enum StemCacheAuditor {
                 if !others.isEmpty {
                     result[r.cacheKey] = others
                 }
+            }
+        }
+        return result
+    }
+
+    /// Detect REDUNDANT same-recording duplicates — the
+    /// shazam-cache-key-duplicates bug. Within each bucket of rows that
+    /// share BOTH an identical payload signature (nFrames + duration)
+    /// AND identical (title, artist), count the `shazam-<id>` keys.
+    /// Legitimate copy-aliasing produces at most ONE `shazam-` key per
+    /// recording (plus optional `hash-`/`musicapp-pid-`/`isrc-`
+    /// aliases), so two-or-more `shazam-` keys in one bucket means the
+    /// catalog handed back multiple IDs for one recording and each
+    /// minted its own row. We keep a single survivor and mark the rest
+    /// redundant.
+    ///
+    /// Survivor preference: an `isrc-` row if present (the canonical
+    /// recording key going forward), else the OLDEST `shazam-` row.
+    /// `hash-` and `musicapp-pid-` rows are never marked redundant —
+    /// they're the content/library lookup keys the play path relies on.
+    ///
+    /// Returns a map from each redundant row's cacheKey → survivor key.
+    private static func correlateRedundantRecordings(
+        rows: [StemCacheRow]
+    ) -> [String: String] {
+        struct BucketKey: Hashable {
+            let nFrames: Int
+            let durationDeciSec: Int
+            let metadata: String  // "title|artist" lowercased
+        }
+        var buckets: [BucketKey: [StemCacheRow]] = [:]
+        for r in rows where r.nFrames > 0 && (r.durationSeconds ?? 0) > 0 {
+            let t = (r.title ?? "").lowercased()
+            let a = (r.artist ?? "").lowercased()
+            guard !t.isEmpty || !a.isEmpty else { continue }
+            let key = BucketKey(
+                nFrames: r.nFrames,
+                durationDeciSec: Int(((r.durationSeconds ?? 0) * 10).rounded()),
+                metadata: "\(t)|\(a)"
+            )
+            buckets[key, default: []].append(r)
+        }
+
+        var result: [String: String] = [:]
+        for (_, group) in buckets where group.count > 1 {
+            let shazamRows = group
+                .filter { StemCacheKey.isShazam($0.cacheKey) }
+                .sorted { $0.createdAt < $1.createdAt }  // oldest first
+            guard shazamRows.count >= 2 else { continue }  // ≤1 = legit alias
+
+            // Survivor: prefer an existing canonical isrc- row; else the
+            // oldest shazam- row.
+            let survivorKey: String = group
+                .first { StemCacheKey.isISRC($0.cacheKey) }?.cacheKey
+                ?? shazamRows.first!.cacheKey
+
+            for r in shazamRows where r.cacheKey != survivorKey {
+                result[r.cacheKey] = survivorKey
             }
         }
         return result

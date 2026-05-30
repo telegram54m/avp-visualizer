@@ -19,6 +19,53 @@
 
 import Foundation
 
+// MARK: - Cache identity
+
+/// Canonical cache-key derivation for stem features.
+///
+/// The cache's unit of identity is the **recording** (a specific
+/// master), NOT the file and NOT the Shazam catalog entry. One
+/// recording maps to many Shazam IDs (single / album / remaster /
+/// regional pressings — this is exactly why one song produced 14
+/// `shazam-*` rows) and to many files (the same song on different
+/// albums), but it has exactly one ISRC. Keying on ISRC collapses all
+/// of those to a single canonical cache row — locally and in the
+/// shared CloudKit DB — while still disambiguating genuinely different
+/// versions (radio edit / live / remaster each carry a distinct ISRC).
+///
+/// Precedence:
+///   1. `isrc-<ISRC>`   — canonical recording identity (preferred)
+///   2. `shazam-<id>`   — match returned no ISRC
+///   3. `hash-<sha256>` — no Shazam match at all (un-indexed audio)
+public enum StemCacheKey {
+    public static let isrcPrefix = "isrc-"
+    public static let shazamPrefix = "shazam-"
+
+    public static func isrc(_ raw: String) -> String { isrcPrefix + normalizeISRC(raw) }
+    public static func shazam(_ id: String) -> String { shazamPrefix + id }
+
+    /// Best available recording key from a Shazam match's fields.
+    /// `fallback` (typically a `hash-<sha256>` content key) is used
+    /// when neither ISRC nor shazamID is present.
+    public static func canonical(isrc: String?, shazamID: String?, fallback: String) -> String {
+        if let isrc, !normalizeISRC(isrc).isEmpty { return self.isrc(isrc) }
+        if let shazamID, !shazamID.isEmpty { return shazam(shazamID) }
+        return fallback
+    }
+
+    /// ISRCs are case-insensitive 12-char codes (CC-XXX-YY-NNNNN).
+    /// Uppercase + strip non-alphanumerics so "usrc17607839" and
+    /// "US-RC1-76-07839" normalize to the same key.
+    public static func normalizeISRC(_ raw: String) -> String {
+        String(raw.uppercased().unicodeScalars.filter {
+            CharacterSet.alphanumerics.contains($0)
+        })
+    }
+
+    public static func isISRC(_ key: String) -> Bool { key.hasPrefix(isrcPrefix) }
+    public static func isShazam(_ key: String) -> Bool { key.hasPrefix(shazamPrefix) }
+}
+
 // MARK: - Public types
 
 /// Per-stem derived features. All arrays are length `nFrames` and aligned
@@ -502,6 +549,16 @@ private struct ResponseEnvelope: Codable {
 /// — `MusicAppNowPlaying().query()` already returns
 /// `.musicAppNotRunning` on iOS, so `kickoffStemSeparation` early-
 /// returns before ever calling into this stub.
+// STEM_USE_SWIFT (compile-time flag set via OTHER_SWIFT_FLAGS=-DSTEM_USE_SWIFT)
+// swaps in the in-process Swift backend defined in
+// StemFeatureProviderSwiftBackend.swift via a typealias. When the flag
+// is set, neither the macOS Python-sidecar actor nor the non-macOS stub
+// below is compiled — the typealias resolves the name `StemFeatureProvider`
+// to `StemFeatureProviderSwiftBackend`.
+//
+// Default OFF for safety until the Swift backend has soaked in dev use.
+// See [[swift-sidecar-port-spec]] §"Phase 3 — Parallel run + cutover".
+#if !STEM_USE_SWIFT
 #if os(macOS)
 public actor StemFeatureProvider {
 
@@ -1176,3 +1233,4 @@ private func decodeOrThrow<T: Decodable>(_ type: T.Type, from data: Data) throws
             underlying: "\(error.localizedDescription) — snippet: \(snippet)")
     }
 }
+#endif  // !STEM_USE_SWIFT

@@ -192,27 +192,60 @@ actor CloudCacheSync {
     /// confuse newer builds.
     private static let stemFeaturesRecordType = "StemFeaturesV2"
 
-    /// Stem-features cache record name format: `shazam-<shazamID>`.
-    /// This is the same key the local SQLite cache uses for
-    /// shazam-identified songs (see #3 / `AppModel.kickoffStemSeparation`),
-    /// so a single string flows through three storage tiers.
+    /// Stem-features cache record names.
+    ///
+    /// Canonical identity is the RECORDING, keyed by ISRC:
+    /// `isrc-<NORMALIZED>`. This guarantees the shared public DB holds
+    /// exactly ONE record per recording — one song's many Shazam
+    /// catalog IDs all collapse to its single ISRC. The legacy
+    /// `shazam-<id>` form is retained ONLY as a read fallback so
+    /// records written before ISRC-canonicalization (and recordings
+    /// whose match carried no ISRC) still resolve.
+    private static func stemRecordName(isrc: String) -> String {
+        StemCacheKey.isrc(isrc)
+    }
+    private static func stemRecordName(shazamID: String) -> String {
+        StemCacheKey.shazam(shazamID)
+    }
     private static func stemRecordID(forShazamID shazamID: String) -> CKRecord.ID {
-        CKRecord.ID(recordName: "shazam-\(shazamID)")
+        CKRecord.ID(recordName: stemRecordName(shazamID: shazamID))
     }
 
-    /// Try to fetch pre-computed stem features for a song that's been
-    /// Shazam-identified. Returns nil on miss or any error. Bypasses
-    /// the local Demucs run entirely when it succeeds — the first
+    /// Fetch pre-computed stem features for a recording, preferring the
+    /// canonical ISRC record and falling back to the legacy
+    /// `shazam-<id>` record. Returns nil on miss or any error.
+    /// Bypasses the local Demucs run entirely on a hit — the first
     /// listener anywhere pays the ~30-60s separation cost, everyone
     /// else gets a sub-second cache hit.
+    func fetchStemFeatures(isrc: String?, shazamID: String?) async -> StemSeparationResult? {
+        guard cloudAvailable else { return nil }
+        var recordNames: [String] = []
+        if let isrc, !StemCacheKey.normalizeISRC(isrc).isEmpty {
+            recordNames.append(Self.stemRecordName(isrc: isrc))
+        }
+        if let shazamID, !shazamID.isEmpty {
+            recordNames.append(Self.stemRecordName(shazamID: shazamID))
+        }
+        for name in recordNames {
+            if let result = await fetchStemRecord(recordName: name) {
+                return result
+            }
+        }
+        return nil
+    }
+
+    /// Backward-compatible shim for callers that only have a Shazam ID.
     func fetchStemFeatures(shazamID: String) async -> StemSeparationResult? {
-        guard cloudAvailable, !shazamID.isEmpty else { return nil }
-        let recordID = Self.stemRecordID(forShazamID: shazamID)
+        await fetchStemFeatures(isrc: nil, shazamID: shazamID)
+    }
+
+    private func fetchStemRecord(recordName: String) async -> StemSeparationResult? {
+        let recordID = CKRecord.ID(recordName: recordName)
         do {
             let record = try await publicDatabase.record(for: recordID)
             guard let asset = record["featuresAsset"] as? CKAsset,
                   let assetURL = asset.fileURL else {
-                cloudLog.notice("HV-CLOUD public-stem record missing featuresAsset for \(shazamID, privacy: .public)")
+                cloudLog.notice("HV-CLOUD public-stem record missing featuresAsset for \(recordName, privacy: .public)")
                 return nil
             }
             let blob = try Data(contentsOf: assetURL)
@@ -229,36 +262,46 @@ actor CloudCacheSync {
                 stemsMetaJSON: stemsMetaJSON,
                 featuresBlob: blob
             )
-            cloudLog.notice("HV-CLOUD public-stem HIT for \(shazamID, privacy: .public) (\(blob.count) bytes, \(result.stems.count) stems)")
+            cloudLog.notice("HV-CLOUD public-stem HIT for \(recordName, privacy: .public) (\(blob.count) bytes, \(result.stems.count) stems)")
             return result
         } catch let ckErr as CKError {
             if ckErr.code != .unknownItem {
-                handleCKError(ckErr, op: "fetchStemFeatures")
+                handleCKError(ckErr, op: "fetchStemRecord")
             }
             return nil
         } catch {
-            cloudLog.notice("HV-CLOUD fetchStemFeatures error: \(String(describing: error), privacy: .public)")
+            cloudLog.notice("HV-CLOUD fetchStemRecord error: \(String(describing: error), privacy: .public)")
             return nil
         }
     }
 
-    /// Upload freshly-computed stem features for a Shazam-identified
-    /// song so other users skip the compute on their first listen.
-    /// Fire-and-forget; caller doesn't wait. No-op when the result
-    /// has no `rawFeaturesBlob` (e.g., the result was itself derived
-    /// from a cloud payload — we don't echo back what's already there)
-    /// or when iCloud is unavailable.
+    /// Upload freshly-computed stem features for a recording so other
+    /// users skip the compute on their first listen. Keyed by ISRC
+    /// when available (canonical), else by Shazam ID. Fire-and-forget;
+    /// caller doesn't wait. No-op when the result has no
+    /// `rawFeaturesBlob` (e.g. it was itself derived from a cloud
+    /// payload — we don't echo back what's already there), when there's
+    /// no recording identity, or when iCloud is unavailable.
     func saveStemFeatures(
-        shazamID: String,
+        isrc: String?,
+        shazamID: String?,
         title: String?, artist: String?,
         result: StemSeparationResult
     ) async {
-        guard cloudAvailable, !shazamID.isEmpty,
+        let recordName: String
+        if let isrc, !StemCacheKey.normalizeISRC(isrc).isEmpty {
+            recordName = Self.stemRecordName(isrc: isrc)
+        } else if let shazamID, !shazamID.isEmpty {
+            recordName = Self.stemRecordName(shazamID: shazamID)
+        } else {
+            return
+        }
+        guard cloudAvailable,
               let blob = result.rawFeaturesBlob,
               let metaJSON = result.rawStemsMetaJSON else {
             return
         }
-        let recordID = Self.stemRecordID(forShazamID: shazamID)
+        let recordID = CKRecord.ID(recordName: recordName)
         let record = CKRecord(recordType: Self.stemFeaturesRecordType, recordID: recordID)
         record["stemsMetaJSON"] = metaJSON as CKRecordValue
         record["model"] = result.model as CKRecordValue
@@ -274,7 +317,12 @@ actor CloudCacheSync {
         if let artist, !artist.isEmpty {
             record["artist"] = artist as CKRecordValue
         }
-        record["shazamID"] = shazamID as CKRecordValue
+        if let isrc, !StemCacheKey.normalizeISRC(isrc).isEmpty {
+            record["isrc"] = StemCacheKey.normalizeISRC(isrc) as CKRecordValue
+        }
+        if let shazamID, !shazamID.isEmpty {
+            record["shazamID"] = shazamID as CKRecordValue
+        }
 
         // Write the blob to a temp file so we can attach it as a
         // CKAsset. CloudKit handles upload + storage; the file can
@@ -297,19 +345,93 @@ actor CloudCacheSync {
                 savePolicy: .changedKeys,
                 atomically: true
             )
-            cloudLog.notice("HV-CLOUD public-stem pushed shazamID=\(shazamID, privacy: .public) (\(blob.count) bytes)")
+            cloudLog.notice("HV-CLOUD public-stem pushed \(recordName, privacy: .public) (\(blob.count) bytes)")
         } catch let ckErr as CKError {
             // Common case: another listener uploaded first → serverRecordChanged.
             // For a write-only cache this is fine; their copy is just as
             // valid as ours. Log and move on.
             if ckErr.code == .serverRecordChanged {
-                cloudLog.info("HV-CLOUD public-stem already exists for \(shazamID, privacy: .public) (raced another listener)")
+                cloudLog.info("HV-CLOUD public-stem already exists for \(recordName, privacy: .public) (raced another listener)")
             } else {
                 handleCKError(ckErr, op: "saveStemFeatures")
             }
         } catch {
             cloudLog.notice("HV-CLOUD saveStemFeatures error: \(String(describing: error), privacy: .public)")
         }
+    }
+
+    /// Backward-compatible shim for callers that only have a Shazam ID.
+    func saveStemFeatures(
+        shazamID: String,
+        title: String?, artist: String?,
+        result: StemSeparationResult
+    ) async {
+        await saveStemFeatures(isrc: nil, shazamID: shazamID,
+                               title: title, artist: artist, result: result)
+    }
+
+    // MARK: - Public-DB stem record maintenance (dedup / purge)
+
+    /// Delete public-DB stem records by exact record name (e.g.
+    /// `shazam-55329922`). Used by the duplicate-recording purge to
+    /// remove the redundant `shazam-*` records once a canonical
+    /// `isrc-*` record exists. DESTRUCTIVE and outward-facing — the
+    /// public DB is shared across all users — so callers gate this
+    /// behind explicit user confirmation. Returns the names actually
+    /// deleted (CloudKit treats deleting a missing record as success,
+    /// so a name in the result isn't proof it existed).
+    @discardableResult
+    func deleteStemRecords(recordNames: [String]) async -> [String] {
+        guard cloudAvailable, !recordNames.isEmpty else { return [] }
+        let ids = recordNames.map { CKRecord.ID(recordName: $0) }
+        do {
+            let (_, deleteResults) = try await publicDatabase.modifyRecords(
+                saving: [], deleting: ids,
+                savePolicy: .changedKeys, atomically: false
+            )
+            var deleted: [String] = []
+            for (id, res) in deleteResults {
+                switch res {
+                case .success:
+                    deleted.append(id.recordName)
+                case .failure(let err):
+                    cloudLog.notice("HV-CLOUD deleteStemRecords failed for \(id.recordName, privacy: .public): \(String(describing: err), privacy: .public)")
+                }
+            }
+            cloudLog.notice("HV-CLOUD deleteStemRecords removed \(deleted.count)/\(recordNames.count) public-stem records")
+            return deleted
+        } catch let ckErr as CKError {
+            handleCKError(ckErr, op: "deleteStemRecords")
+            return []
+        } catch {
+            cloudLog.notice("HV-CLOUD deleteStemRecords error: \(String(describing: error), privacy: .public)")
+            return []
+        }
+    }
+
+    /// Mint the canonical ISRC-keyed public record for a recording by
+    /// re-uploading a result we already hold, then (optionally) delete
+    /// the redundant legacy `shazam-*` records for the same recording.
+    /// Used by the duplicate-recording purge. Returns true if the
+    /// canonical record was written.
+    @discardableResult
+    func consolidateStemRecord(
+        isrc: String,
+        redundantShazamIDs: [String],
+        title: String?, artist: String?,
+        result: StemSeparationResult,
+        deleteRedundant: Bool
+    ) async -> Bool {
+        guard cloudAvailable, !StemCacheKey.normalizeISRC(isrc).isEmpty else { return false }
+        await saveStemFeatures(isrc: isrc, shazamID: nil,
+                               title: title, artist: artist, result: result)
+        if deleteRedundant {
+            let names = redundantShazamIDs
+                .filter { !$0.isEmpty }
+                .map { Self.stemRecordName(shazamID: $0) }
+            _ = await deleteStemRecords(recordNames: names)
+        }
+        return true
     }
 
     // MARK: - Cross-device sync

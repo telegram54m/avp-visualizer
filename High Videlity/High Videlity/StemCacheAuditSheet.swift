@@ -30,6 +30,20 @@ struct StemCacheAuditSheet: View {
     @State private var selectedKeys: Set<String> = []
     @State private var runTask: Task<Void, Never>?
     @State private var confirmDelete = false
+    /// Opt-in: also delete the redundant copies from the SHARED CloudKit
+    /// public DB. Destructive + outward-facing (affects every user's
+    /// cross-user cache), so off by default; only acts on
+    /// `cloudPurgeableKeys`.
+    @State private var purgeSharedCloud = false
+    /// Subset of flagged keys safe to purge from the public DB:
+    /// redundant-recording duplicates keyed `shazam-<id>` (local cacheKey
+    /// == public record name for those). Survivors never appear here.
+    @State private var cloudPurgeableKeys: Set<String> = []
+
+    /// Count of currently-selected keys eligible for shared-cloud purge.
+    private var selectedCloudPurgeCount: Int {
+        selectedKeys.intersection(cloudPurgeableKeys).count
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -50,7 +64,11 @@ struct StemCacheAuditSheet: View {
             Button("Remove", role: .destructive) { performDeletion() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("These rows will be erased from the local SQLite cache. Any future plays of the affected songs will recompute stems on demand. CloudKit and other devices' caches are not touched.")
+            if purgeSharedCloud && selectedCloudPurgeCount > 0 {
+                Text("Erases the selected rows from the local SQLite cache AND removes \(selectedCloudPurgeCount) redundant copy\(selectedCloudPurgeCount == 1 ? "" : "ies") from the SHARED cloud cache (affects all users). The canonical copy of each recording is kept; local rows recompute on demand.")
+            } else {
+                Text("These rows will be erased from the local SQLite cache. Any future plays of the affected songs will recompute stems on demand. CloudKit and other devices' caches are not touched.")
+            }
         }
     }
 
@@ -279,6 +297,14 @@ struct StemCacheAuditSheet: View {
                 }
             case .finished, .deleted:
                 Button("Done") { dismiss() }
+                if selectedCloudPurgeCount > 0 {
+                    Toggle(isOn: $purgeSharedCloud) {
+                        Text("Also purge \(selectedCloudPurgeCount) from shared cloud")
+                            .font(.caption)
+                    }
+                    .toggleStyle(.checkbox)
+                    .help("Removes the redundant Shazam-keyed duplicates from the cross-user CloudKit cache. The canonical copy of each recording is kept. Affects all users — leave off unless you're sure.")
+                }
                 Spacer()
                 let count = selectedKeys.count
                 Button {
@@ -316,6 +342,7 @@ struct StemCacheAuditSheet: View {
         phase = .running
         progress = nil
         selectedKeys = []
+        cloudPurgeableKeys = []
         runTask = Task {
             do {
                 let provider = await appModel.ensureStemFeatureProvider()
@@ -326,6 +353,7 @@ struct StemCacheAuditSheet: View {
                 }
                 let pre = report.findings.filter(\.isHighConfidence).map(\.id)
                 selectedKeys = Set(pre)
+                cloudPurgeableKeys = Self.cloudPurgeableKeys(from: report)
                 phase = .finished(report)
             } catch is CancellationError {
                 // Sheet was dismissed or user cancelled — nothing to
@@ -336,9 +364,31 @@ struct StemCacheAuditSheet: View {
         }
     }
 
+    /// Findings safe to also purge from the shared cloud DB: redundant-
+    /// recording duplicates keyed `shazam-<id>` (cacheKey == public
+    /// record name). Survivors and non-duplicate rows are excluded.
+    private static func cloudPurgeableKeys(
+        from report: StemCacheAuditor.Report
+    ) -> Set<String> {
+        var keys: Set<String> = []
+        for finding in report.findings {
+            guard StemCacheKey.isShazam(finding.id) else { continue }
+            let isRedundant = finding.kinds.contains {
+                if case .redundantRecordingDuplicate = $0 { return true }
+                return false
+            }
+            if isRedundant { keys.insert(finding.id) }
+        }
+        return keys
+    }
+
     private func performDeletion() {
         let toDelete = Array(selectedKeys)
         guard !toDelete.isEmpty else { return }
+        // Capture cloud-purge list before async work mutates selection.
+        let cloudToPurge: [String] = purgeSharedCloud
+            ? Array(selectedKeys.intersection(cloudPurgeableKeys))
+            : []
         phase = .deleting(completed: 0, total: toDelete.count)
         runTask?.cancel()
         runTask = Task {
@@ -346,6 +396,12 @@ struct StemCacheAuditSheet: View {
                 let provider = await appModel.ensureStemFeatureProvider()
                 let removed = try await StemCacheAuditor.deleteRows(
                     provider: provider, cacheKeys: toDelete)
+                // Mirror redundant-duplicate deletions to the shared
+                // CloudKit public DB (opt-in). Record name == cacheKey
+                // for shazam- rows; failures are logged inside.
+                if !cloudToPurge.isEmpty {
+                    _ = await CloudCacheSync.shared.deleteStemRecords(recordNames: cloudToPurge)
+                }
                 // Re-run audit so the UI reflects the new state.
                 let report = try await StemCacheAuditor.runAudit(
                     provider: provider
@@ -353,6 +409,7 @@ struct StemCacheAuditSheet: View {
                     progress = update
                 }
                 selectedKeys = Set(report.findings.filter(\.isHighConfidence).map(\.id))
+                cloudPurgeableKeys = Self.cloudPurgeableKeys(from: report)
                 phase = .deleted(count: removed, remaining: report)
             } catch is CancellationError {
                 // ignored

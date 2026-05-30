@@ -1387,6 +1387,7 @@ class AppModel {
                     title: title,
                     artist: artist,
                     shazamID: item.shazamID,
+                    isrc: item.isrc,
                     generation: stemGen
                 )
             }
@@ -2950,8 +2951,16 @@ class AppModel {
         title: String,
         artist: String,
         shazamID: String?,
+        isrc: String? = nil,
         generation: Int
     ) async {
+        // Canonical recording key (ISRC) when available — see
+        // [[StemCacheKey]]. Preferred over the shazam key everywhere
+        // below so lookups resolve the one-per-recording canonical row.
+        let isrcKey: String? = {
+            guard let isrc, !StemCacheKey.normalizeISRC(isrc).isEmpty else { return nil }
+            return StemCacheKey.isrc(isrc)
+        }()
         // Tiny helper — push stemStatus to main thread. The kickoff is
         // nonisolated; every status mutation has to hop. Captures
         // `self` weakly so a deallocated AppModel doesn't get touched.
@@ -2985,6 +2994,25 @@ class AppModel {
             let provider = await self.ensureStemFeatureProvider()
             let shazamKey = "shazam-\(shazamID)"
 
+            // Tier 0 — canonical ISRC row (the one-per-recording key).
+            // Checked before the shazam key so a recording cached under
+            // its ISRC resolves even when this play matched a different
+            // catalog ID than the one cached.
+            if let isrcKey, let isrcHit = try? await provider.cachedFeatures(forKey: isrcKey) {
+                await setStatus(.computing(fraction: nil))
+                let placeholder = MusicAppTrack(
+                    fileURL: nil, title: title, artist: artist, album: "",
+                    persistentID: shazamID,
+                    durationSeconds: isrcHit.durationSeconds ?? 0,
+                    playerPositionSeconds: 0, isPlaying: true
+                )
+                await self.applyStemResult(
+                    isrcHit, nowPlaying: placeholder,
+                    generation: generation, originLabel: "isrc-local"
+                )
+                return
+            }
+
             // Tier 1 — local SQLite. Sub-100ms.
             if let localHit = try? await provider.cachedFeatures(forKey: shazamKey) {
                 await setStatus(.computing(fraction: nil))
@@ -3009,15 +3037,18 @@ class AppModel {
 
             // Tier 2 — CloudKit public DB. Round-trip is slower
             // (~1–3s) so we only consult it after the local miss.
-            if let cloudHit = await CloudCacheSync.shared.fetchStemFeatures(shazamID: shazamID) {
-                // Persist into local SQLite so the next play of this
-                // song on this device hits Tier 1.
+            // Prefer the canonical ISRC record; fall back to legacy
+            // shazam-keyed records.
+            if let cloudHit = await CloudCacheSync.shared.fetchStemFeatures(isrc: isrc, shazamID: shazamID) {
+                // Persist into local SQLite under the canonical key so
+                // the next play of this song on this device hits Tier 0/1.
+                let localKey = isrcKey ?? shazamKey
                 if let blob = cloudHit.rawFeaturesBlob,
                    let metaJSON = cloudHit.rawStemsMetaJSON {
                     let metaArray = Self.decodeMetaArray(metaJSON)
                     Task.detached(priority: .background) {
                         try? await provider.putCachedFeatures(
-                            forKey: shazamKey,
+                            forKey: localKey,
                             featuresBlob: blob,
                             stemsMeta: metaArray,
                             durationSeconds: cloudHit.durationSeconds,
@@ -3160,8 +3191,8 @@ class AppModel {
         // `musicapp-pid-<id>` when no Shazam ID is available yet.
         let pidKey = "musicapp-pid-\(nowPlaying.persistentID)"
         let shazamKey: String? = (shazamID?.isEmpty == false) ? "shazam-\(shazamID!)" : nil
-        let primaryKey = shazamKey ?? pidKey
-        let secondaryKey: String? = (shazamKey != nil) ? pidKey : nil
+        // Canonical key precedence: ISRC (recording) → Shazam → pid.
+        let primaryKey = isrcKey ?? shazamKey ?? pidKey
 
         // Opportunistic forward-alias: if Shazam ID arrived AFTER an
         // earlier pid-keyed kickoff for this same library track, copy
@@ -3169,8 +3200,8 @@ class AppModel {
         // separate() finds it instead of recomputing. The alias action
         // gracefully no-ops when no pid row exists ("primary not found")
         // so this is safe to fire unconditionally.
-        if let shazamKey {
-            _ = try? await provider.alias(primaryKey: pidKey, aliasKey: shazamKey)
+        if primaryKey != pidKey {
+            _ = try? await provider.alias(primaryKey: pidKey, aliasKey: primaryKey)
         }
 
         // Three-tier cache hierarchy:
@@ -3191,9 +3222,10 @@ class AppModel {
             return
         }
 
-        // Tier 2: CloudKit public DB — only when Shazam ID is known.
-        if let shazamID, !shazamID.isEmpty,
-           let cloudHit = await CloudCacheSync.shared.fetchStemFeatures(shazamID: shazamID) {
+        // Tier 2: CloudKit public DB — only when we have a recording
+        // identity (ISRC or Shazam ID), preferring the canonical ISRC.
+        if (isrcKey != nil || (shazamID?.isEmpty == false)),
+           let cloudHit = await CloudCacheSync.shared.fetchStemFeatures(isrc: isrc, shazamID: shazamID) {
             // Persist into local SQLite so subsequent (potentially
             // offline) plays hit tier 1 instead of round-tripping
             // through CloudKit again. fromCloudPayload retains both
@@ -3286,15 +3318,18 @@ class AppModel {
         let capturedArtist = artist
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            guard let shazamID = await ShazamController.lookupShazamIDFromPreview(audioURL: audioURL),
-                  !shazamID.isEmpty
+            guard let identity = await ShazamController.lookupRecordingIdentityFromPreview(audioURL: audioURL),
+                  (identity.shazamID?.isEmpty == false) || (identity.isrc?.isEmpty == false)
             else {
-                stemLog("[stem] iOS cloud-only: no shazamID derived for \(capturedTitle)")
+                stemLog("[stem] iOS cloud-only: no recording identity derived for \(capturedTitle)")
                 return
             }
-            guard let cloudHit = await CloudCacheSync.shared.fetchStemFeatures(shazamID: shazamID)
+            let shazamID = identity.shazamID ?? ""
+            // Prefer the canonical ISRC record; fall back to shazamID.
+            guard let cloudHit = await CloudCacheSync.shared.fetchStemFeatures(
+                    isrc: identity.isrc, shazamID: identity.shazamID)
             else {
-                stemLog("[stem] iOS cloud-only: no cloud cache for shazamID=\(shazamID) (\(capturedTitle))")
+                stemLog("[stem] iOS cloud-only: no cloud cache for isrc=\(identity.isrc ?? "nil") shazamID=\(shazamID) (\(capturedTitle))")
                 return
             }
             // applyStemResult only reads .title for log lines — synthesize

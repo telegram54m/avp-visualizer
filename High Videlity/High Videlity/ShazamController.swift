@@ -169,7 +169,28 @@ extension ShazamController: SHSessionDelegate {
             // De-dupe: ignore repeat matches of the song we already
             // identified. Shazam re-fires every few seconds while the same
             // song keeps playing.
-            let isSameSong = self.lastMatch?.shazamID == item.shazamID
+            //
+            // The catalog routinely returns DIFFERENT shazamIDs for the
+            // same recording on successive matches (single / album /
+            // remaster / regional pressings — this is the root of the
+            // one-song-→-14-rows bug). A naive shazamID-only comparison
+            // treats each as a "new" song and re-fires onMatch, which
+            // re-kicks the whole stem pipeline. Suppress when EITHER the
+            // shazamID matches OR the ISRC matches — ISRC is the
+            // recording identity, stable across all those catalog IDs.
+            // (Title-similarity is deliberately NOT used here: onMatch
+            // also drives preview-fetch + alignment, and we don't want
+            // to swallow a genuine change to a similarly-titled song.
+            // Same-title resilience for the override/stem wipe lives
+            // downstream in AppModel.handleShazamMatch.)
+            let last = self.lastMatch
+            let sameShazamID = last?.shazamID == item.shazamID
+            let sameISRC: Bool = {
+                guard let a = last?.isrc, let b = item.isrc,
+                      !a.isEmpty, !b.isEmpty else { return false }
+                return a.caseInsensitiveCompare(b) == .orderedSame
+            }()
+            let isSameSong = sameShazamID || sameISRC
             self.lastMatch = item
             self.status = .matched(
                 title: item.title ?? "Unknown",
