@@ -95,12 +95,31 @@ struct LocalSourceView: View {
     @Environment(AppModel.self) private var appModel
     @State private var showFilePicker = false
     @State private var showLibraryBrowser = false
+    /// Inline search text. Filters all sections (Albums / Artists /
+    /// All Songs) on title + artist + album substring match,
+    /// case-insensitive. Library is small enough (~300-1k entries)
+    /// that filter runs on-keystroke without debounce.
+    @State private var filterText: String = ""
+
+    /// Lowercased + trimmed filter applied to entries. Empty string
+    /// means "no filter" — return entries unchanged.
+    private func filtered(_ entries: [LibraryEntry]) -> [LibraryEntry] {
+        let q = filterText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return entries }
+        return entries.filter { entry in
+            if entry.title.lowercased().contains(q) { return true }
+            if entry.artist.lowercased().contains(q) { return true }
+            if let album = entry.album, album.lowercased().contains(q) { return true }
+            return false
+        }
+    }
 
     var body: some View {
-        let entries = appModel.library.entries
+        let allEntries = appModel.library.entries
+        let visibleEntries = filtered(allEntries)
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                if entries.isEmpty {
+                if allEntries.isEmpty {
                     // Welcome / empty state — keep the original
                     // hero + action cards as the welcoming UI when
                     // no folder has been scanned yet.
@@ -112,14 +131,18 @@ struct LocalSourceView: View {
                     // persistent GlobalNowPlayingFooter and the Now
                     // Playing inspector; no need to duplicate it as
                     // a card here.
-                    libraryToolbar
-                    librarySections(entries: entries)
+                    libraryToolbar(totalCount: allEntries.count, matchCount: visibleEntries.count)
+                    if visibleEntries.isEmpty {
+                        emptyFilterState
+                    } else {
+                        librarySections(entries: visibleEntries)
+                    }
                 }
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 24)
-            .frame(maxWidth: entries.isEmpty ? 760 : .infinity, alignment: .topLeading)
+            .frame(maxWidth: allEntries.isEmpty ? 760 : .infinity, alignment: .topLeading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .navigationTitle("Local Library")
@@ -227,26 +250,90 @@ struct LocalSourceView: View {
     /// Compact toolbar at the top of the populated library view.
     /// Folder name + entry count on the left so the user always knows
     /// what they're looking at.
-    private var libraryToolbar: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.accentColor.opacity(0.18))
-                    .frame(width: 44, height: 44)
-                Image(systemName: "music.note.house.fill")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
+    /// Hero + filter on one row. Hero (glyph + folder name + song
+    /// count) takes the leading slot; the filter capsule sits at the
+    /// trailing edge, max-bounded so it doesn't dominate when the
+    /// window is wide. On a typical 300-song local library the
+    /// filter is O(n) per keystroke with zero perceived latency —
+    /// no debounce needed.
+    private func libraryToolbar(totalCount: Int, matchCount: Int) -> some View {
+        HStack(alignment: .center, spacing: 16) {
+            HStack(spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.18))
+                        .frame(width: 44, height: 44)
+                    Image(systemName: "music.note.house.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(appModel.library.rootURL?.lastPathComponent ?? "Your library")
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                    Text("\(appModel.library.entries.count) songs")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(appModel.library.rootURL?.lastPathComponent ?? "Your library")
-                    .font(.title3.weight(.semibold))
-                    .lineLimit(1)
-                Text("\(appModel.library.entries.count) songs")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
+            Spacer(minLength: 16)
+            filterBar(totalCount: totalCount, matchCount: matchCount)
+                .frame(maxWidth: 360)
         }
+    }
+
+    /// Inline search capsule rendered inside the libraryToolbar's
+    /// right side. Matches the LibrarySongsListView filter-bar
+    /// vocabulary so the two pages feel like the same surface.
+    private func filterBar(totalCount: Int, matchCount: Int) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Filter songs, artists, albums", text: $filterText)
+                .textFieldStyle(.plain)
+            if !filterText.isEmpty {
+                Text("\(matchCount) of \(totalCount)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                Button {
+                    filterText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear filter")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.quaternary.opacity(0.5))
+        }
+    }
+
+    /// "Filter matched nothing" placeholder. Shown in place of the
+    /// album / artist / songs sections when `filterText` excludes
+    /// every entry — friendlier than rendering empty rows.
+    private var emptyFilterState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 30))
+                .foregroundStyle(.tertiary)
+            Text("No matches")
+                .font(.headline)
+                .foregroundStyle(.secondary)
+            Text("No songs, artists, or albums in your library match the filter.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+            Button("Clear filter") { filterText = "" }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 40)
     }
 
     /// All the populated sections — recently cached carousel, album

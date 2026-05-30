@@ -1362,18 +1362,44 @@ class AppModel {
             }
         }
 
-        // Task.detached — kickoffStemSeparation contains a synchronous
-        // AppleScript query (~10-50ms) that we DON'T want on the main
-        // thread; the actor `provider.separate` call dispatches to the
-        // sidecar's executor regardless of caller thread. We hop back
-        // to main only for the final property assignment.
-        Task.detached(priority: .utility) { [weak self] in
-            await self?.kickoffStemSeparation(
-                title: title,
-                artist: artist,
-                shazamID: item.shazamID,
-                generation: stemGen
-            )
+        // Bypass the Shazam-driven stem kickoff when in-app AM is the
+        // authoritative source (musicKit.nowPlaying != nil) AND its
+        // title disagrees with what Shazam thinks the audio is.
+        // Shazam matching the tap audio can mis-attribute (one-offset
+        // spurious match against a spectrally-similar but unrelated
+        // catalog song), and we'd then look up the WRONG song's
+        // stems. AM's metadata is gospel; trust it over Shazam's
+        // best guess. If titles agree (Shazam confirming AM) or AM
+        // isn't present (system-tap of external app, mic mode),
+        // proceed with the Shazam kickoff as before.
+        let shouldKickoffShazamStems: Bool = {
+            guard let amTitle = self.musicKit.nowPlaying?.title,
+                  !amTitle.isEmpty else {
+                return true  // No AM authority — Shazam is best signal
+            }
+            let amNorm = Self.fuzzyNormalize(amTitle)
+            let shNorm = Self.fuzzyNormalize(title)
+            if Self.titlesAreSimilar(amNorm, shNorm) {
+                return true  // Shazam agrees with AM — fine to proceed
+            }
+            stemLog("[stem] skipping Shazam-driven stem kickoff — AM authority says \"\(amTitle)\", Shazam says \"\(title)\". Trusting AM.")
+            return false
+        }()
+
+        if shouldKickoffShazamStems {
+            // Task.detached — kickoffStemSeparation contains a synchronous
+            // AppleScript query (~10-50ms) that we DON'T want on the main
+            // thread; the actor `provider.separate` call dispatches to the
+            // sidecar's executor regardless of caller thread. We hop back
+            // to main only for the final property assignment.
+            Task.detached(priority: .utility) { [weak self] in
+                await self?.kickoffStemSeparation(
+                    title: title,
+                    artist: artist,
+                    shazamID: item.shazamID,
+                    generation: stemGen
+                )
+            }
         }
 
         #if os(macOS)
@@ -2030,7 +2056,47 @@ class AppModel {
             }
         }
 
-        // 5. Non-macOS: preview chain (load → tier 3 → alignment →
+        // 5. macOS-only — AM-authoritative stem cache lookup. The
+        //    Shazam-driven kickoff (handleShazamMatch) is now
+        //    bypassed when in-app AM has authoritative identity
+        //    (Fix 2 for the wrong-stems-served bug). To preserve
+        //    cache hits for songs the user has previously batch-
+        //    cached, look up stems here using AM's title/artist via
+        //    [[StemFeatureProvider.findCacheKey]]. Local-only —
+        //    CloudKit's public DB is shazamID-keyed and we don't
+        //    have the shazamID here. Cache miss is silent.
+        #if os(macOS)
+        if !sameSongAsActive {
+            stemFeatures = nil
+            hasStemFeatures = false
+            stemStatus = .idle
+        }
+        stemLookupGeneration += 1
+        let amStemGen = stemLookupGeneration
+        let amStemTitle = title
+        let amStemArtist = artist
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self = self else { return }
+            let provider = await self.ensureStemFeatureProvider()
+            guard let foundKey = try? await provider.findCacheKey(
+                    title: amStemTitle, artist: amStemArtist),
+                  let hit = try? await provider.cachedFeatures(forKey: foundKey)
+            else { return }
+            let placeholder = MusicAppTrack(
+                fileURL: nil, title: amStemTitle, artist: amStemArtist,
+                album: "", persistentID: "",
+                durationSeconds: hit.durationSeconds ?? 0,
+                playerPositionSeconds: 0, isPlaying: true
+            )
+            await self.applyStemResult(
+                hit, nowPlaying: placeholder,
+                generation: amStemGen,
+                originLabel: "am-meta(\(foundKey.prefix(20)))"
+            )
+        }
+        #endif
+
+        // 6. Non-macOS: preview chain (load → tier 3 → alignment →
         //    cloud stems lookup). macOS uses the system-audio tap
         //    instead, so the preview load is redundant there.
         #if !os(macOS)
@@ -3326,6 +3392,53 @@ class AppModel {
                 stemLog("[stem] stale \(originLabel) result for gen=\(generation) (current=\(self.stemLookupGeneration)), discarding")
                 return
             }
+            // Authoritative-identity validation. When in-app AM is
+            // playing, `musicKit.nowPlaying` is the gospel of what's
+            // actually on the audio bus. Two cross-checks against
+            // the result we're about to apply:
+            //
+            // 1. Title fuzzy-match. Catches the obvious case where
+            //    Shazam mis-attributed the audio entirely — the cache
+            //    was looked up under a wrong title and we'd serve a
+            //    different song's stems.
+            // 2. Duration check. Catches the subtler case where the
+            //    title comparison passes (cache row was retagged via
+            //    findCacheKey alias, OR Shazam now agrees with AM)
+            //    BUT the underlying stem data is still from a
+            //    different file — the cache row's stored
+            //    `durationSeconds` won't match AM's catalog duration
+            //    if the bytes are for a different song.
+            //
+            // Discarding rejected results leaves the visualizer on
+            // the band-split fallback — visibly less reactive but
+            // correctly aligned, which beats wrong-song alignment.
+            if let amNowPlaying = self.musicKit.nowPlaying {
+                let amTitle = amNowPlaying.title
+                if !amTitle.isEmpty,
+                   !nowPlaying.title.isEmpty,
+                   !Self.titlesAreSimilar(
+                       Self.fuzzyNormalize(amTitle),
+                       Self.fuzzyNormalize(nowPlaying.title)
+                   ) {
+                    stemLog("[stem] REJECT \(originLabel) — title mismatch. AM says \"\(amTitle)\", stems tagged \"\(nowPlaying.title)\". Likely a Shazam misidentification. Discarding to avoid wrong-song alignment.")
+                    self.stemStatus = .idle
+                    return
+                }
+                // Duration check. AM's `Song.duration` is the catalog-
+                // canonical length. Cached stems carry `durationSeconds`
+                // from whatever file generated them. Tolerate a 4s
+                // slop — radio edits / fade variants can differ that
+                // much across releases of the same recording, and we
+                // don't want to false-reject those.
+                if let amDuration = amNowPlaying.duration,
+                   let stemDuration = result.durationSeconds,
+                   amDuration > 0, stemDuration > 0,
+                   abs(amDuration - stemDuration) > 4.0 {
+                    stemLog("[stem] REJECT \(originLabel) — duration mismatch. AM song is \(String(format: "%.1f", amDuration))s, cached stems are for a \(String(format: "%.1f", stemDuration))s file. Different recording — wrong stems served via title-keyed cache alias. Discarding.")
+                    self.stemStatus = .idle
+                    return
+                }
+            }
             self.stemFeatures = result
             self.hasStemFeatures = true
             self.stemStatus = .ready(fromCache: result.fromCache)
@@ -3337,6 +3450,22 @@ class AppModel {
                   "feat=\(result.timing.featureSeconds)s " +
                   "offset=\(self.stemFrameOffset) (songPos=\(String(format: "%.1f", self.currentSongPosition))s, liveFrames=\(self.frames.count))")
         }
+    }
+
+    /// Same fuzzy normalization shape used by [[LocalShazamMatcher]]
+    /// — strip common parenthetical suffixes ("(feat. X)", "(Live)",
+    /// "(Remix)") + "feat./ft." text + lowercase + collapse
+    /// whitespace, so a live or remix version of a track doesn't
+    /// false-positive a conflict against the canonical recording.
+    nonisolated static func fuzzyNormalize(_ s: String) -> String {
+        var out = s.lowercased()
+        if let r = out.range(of: " (") { out = String(out[..<r.lowerBound]) }
+        if let r = out.range(of: " [") { out = String(out[..<r.lowerBound]) }
+        for marker in [" feat. ", " feat ", " ft. ", " ft "] {
+            if let r = out.range(of: marker) { out = String(out[..<r.lowerBound]) }
+        }
+        out = out.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// One-line diagnostic comparing stem-array length, frames-array

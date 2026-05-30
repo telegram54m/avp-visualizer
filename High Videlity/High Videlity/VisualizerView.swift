@@ -453,77 +453,32 @@ struct VisualizerView: View {
                 EmptyStatePrompt()
             }
         }
-        // Mode-cycle button in the lower-left so the user can switch
-        // visualizers without navigating back to ContentView. Placed
-        // outside the macOS-only block since mode-switching is useful
-        // on every platform. FPS badge sits next to it as a small
-        // debug aid — useful when tuning per-mode entity counts.
-        .overlay(alignment: .bottomLeading) {
-            HStack(spacing: 8) {
-                ModeCycleButton()
-                    .environment(appModel)
-                FrameRateBadge()
-                    .environment(appModel)
-                BeatBadge()
-                    .environment(appModel)
-                #if os(macOS)
-                StemsBadge()
-                    .environment(appModel)
-                #else
-                // On iOS / iPadOS / visionOS, stems aren't computed
-                // locally — the relevant signal here is which TIER of
-                // frame data is driving the visualizer (preview-
-                // extrapolated vs. AB-augmented vs. real).
-                TierBadge()
-                    .environment(appModel)
-                #endif
-                #if !os(macOS)
-                // iOS / iPadOS / visionOS only — surface MicListener's
-                // session config + streaming-analyzer frame counter
-                // on-screen so we can debug the mic pipeline without
-                // Console.app. Only visible while mic mode is active.
-                if appModel.useMic {
-                    MicDiagBadge()
-                        .environment(appModel)
-                }
-                #endif
-                #if os(iOS)
-                // System-music pivot — small badge with the current
-                // Music.app track + playhead. Visible while in that
-                // mode so the user can see at a glance that the
-                // visualizer is following the song they're playing.
-                if appModel.useSystemMusic {
-                    SystemMusicBadge()
-                        .environment(appModel)
-                }
-                #endif
-            }
-            .padding(16)
-        }
+        // Mode-cycle + BPM debug pill moved to the GlobalNowPlayingFooter
+        // chrome — viz canvas is fully clean now, no floating
+        // bottom-leading widgets.
         #if os(macOS)
-        // Small "now playing" badge in the lower-right — only when system
-        // audio is the source. Shows which app we're tapping + the Shazam-
-        // identified song so the user always has context for what the
-        // cluster is reacting to. Hidden while the Now-Playing inspector
-        // is open — the drawer carries the same info (and more) and the
-        // badge's expand-button is redundant when the drawer is already
-        // up. Reappears the moment the drawer is dismissed.
-        .overlay(alignment: .bottomTrailing) {
-            if !appModel.showNowPlayingInspector {
-                NowPlayingBadge()
-                    .environment(appModel)
-                    .padding(16)
-                    .transition(.opacity)
-            }
+        // macOS: float the same GlobalNowPlayingFooter at the bottom
+        // of the viz. Replaces what used to be three separate
+        // overlays — NowPlayingBadge (system-audio readout),
+        // LocalPlaybackHUD (local transport), and the right-side
+        // inspector for Up Next / Lyrics. Footer carries all three
+        // by virtue of its source block + transport + popover
+        // affordances. Less chrome, more parity with the main
+        // window's footer.
+        .overlay(alignment: .bottom) {
+            GlobalNowPlayingFooter()
+                .environment(appModel)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+                .padding(.horizontal, 24)
+                .padding(.bottom, 18)
         }
-        .animation(.easeInOut(duration: 0.15), value: appModel.showNowPlayingInspector)
-        #endif
+        #else
         // Local-file transport HUD (play/pause/restart + next-track
         // for library mode) — visible only when a local AVAudioPlayer
         // is the active source (imported file OR library pick).
-        // Positioned bottom-trailing to match the macOS NowPlayingBadge
-        // pattern; a single "current source" element on each
-        // platform's preferred edge.
+        // Positioned bottom-trailing on iOS / iPadOS / visionOS where
+        // the macOS footer doesn't apply.
         .overlay(alignment: .bottomTrailing) {
             if appModel.hasLocalPlaybackSource {
                 LocalPlaybackHUD()
@@ -531,6 +486,7 @@ struct VisualizerView: View {
                     .padding(16)
             }
         }
+        #endif
         #if os(iOS)
         // fullScreenCover on iOS has no built-in dismiss gesture
         // (unlike .sheet which has swipe-down). Provide an explicit
@@ -592,34 +548,12 @@ struct VisualizerView: View {
         // visualizer — matches Music.app behavior.
         .onAppear { appModel.startPlayback() }
         #if os(macOS)
-        // Mirror ContentView's Now-Playing inspector here so the
-        // panel can be opened/closed without backing out of the
-        // visualizer. Same AppModel state drives both, so toggling
-        // from either screen keeps things in sync — and a panel
-        // left open in ContentView stays open when the user pushes
-        // into the visualizer.
-        //
-        // Toggle is a floating overlay rather than a toolbar item:
-        // the NavigationStack title bar would only carry it on
-        // macOS, and even there it competes with the user's "this
-        // should feel like an immersive viz" expectation. A small
-        // bezel-matched button overlay survives platform changes
-        // (iOS fullScreenCover, future hidden-toolbar viz modes,
-        // visionOS Phase 7 reshape) without ever depending on
-        // chrome that may not exist.
-        .inspector(isPresented: Binding(
-            get: { appModel.showNowPlayingInspector },
-            set: { appModel.showNowPlayingInspector = $0 }
-        )) {
-            // See ContentView's matching site for the rationale on
-            // the conditional mount. The viz is even more sensitive
-            // to spurious invalidations than the main screen.
-            if appModel.showNowPlayingInspector {
-                NowPlayingView()
-                    .environment(appModel)
-                    .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
-            }
-        }
+        // Inspector drawer removed — replaced by the floating
+        // GlobalNowPlayingFooter overlay above, which carries the
+        // same Up Next + Lyrics content via its source-block
+        // popover. The legacy ContentView path on iOS still uses
+        // an inspector; the shell-level RootShellView + viz now
+        // share the footer as the canonical surface.
         #endif
     }
 
@@ -711,7 +645,7 @@ private struct EmptyStatePrompt: View {
 /// Bottom-left pill in the visualizer: shows the current mode and
 /// advances to the next on tap. Mode list = `VisualizerMode.allCases`,
 /// wraps around at the end.
-private struct ModeCycleButton: View {
+struct ModeCycleButton: View {
     @Environment(AppModel.self) private var appModel
 
     var body: some View {
@@ -748,6 +682,66 @@ private struct ModeCycleButton: View {
 /// visualizer's animate subscription — keeps redraw load minimal
 /// while still feeling live. Style matches `ModeCycleButton` so the
 /// two read as a paired set in the corner.
+/// Condensed BPM pill that opens a popover with the full debug
+/// readout. Replaces the row of FPS / Beat / Stems / Mic / System-
+/// Music badges that used to fill the viz's bottom-left corner —
+/// quieter chrome by default, full diagnostics still reachable in
+/// one click.
+struct BpmPillExpander: View {
+    @Environment(AppModel.self) private var appModel
+    @State private var expanded = false
+
+    var body: some View {
+        Button {
+            expanded.toggle()
+        } label: {
+            Text(bpmLabel)
+                .font(.caption.weight(.medium).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.thinMaterial, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("Tap for full debug readout")
+        .popover(isPresented: $expanded, arrowEdge: .leading) {
+            VStack(alignment: .leading, spacing: 10) {
+                FrameRateBadge().environment(appModel)
+                BeatBadge().environment(appModel)
+                #if os(macOS)
+                StemsBadge().environment(appModel)
+                #else
+                TierBadge().environment(appModel)
+                if appModel.useMic {
+                    MicDiagBadge().environment(appModel)
+                }
+                #if os(iOS)
+                if appModel.useSystemMusic {
+                    SystemMusicBadge().environment(appModel)
+                }
+                #endif
+                #endif
+            }
+            .padding(14)
+        }
+    }
+
+    /// Same selection logic as BeatBadge but stripped to just the
+    /// bpm number — the popover carries the full compound when the
+    /// user wants details. Shazam-verified bpm gets the ✓; tracker-
+    /// inferred bpm is shown plain (or "—" when confidence is
+    /// below the display threshold).
+    private var bpmLabel: String {
+        if let override = appModel.shazamBpmOverride {
+            return "\(Int(override.rounded())) bpm ✓"
+        }
+        let conf = appModel.publishedBeatConfidence
+        if conf < 0.3 { return "— bpm" }
+        let folded = BeatHelpers.octaveFoldBpm(appModel.publishedBeatBpm)
+        return "\(Int(folded.rounded())) bpm"
+    }
+}
+
 struct FrameRateBadge: View {
     @Environment(AppModel.self) private var appModel
 

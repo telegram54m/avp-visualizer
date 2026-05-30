@@ -89,29 +89,12 @@ struct RootShellView: View {
                 sidebar
             } detail: {
                 detail
-                    // Now-Playing inspector slides in from the right of
-                    // the detail column. Visibility lives on AppModel so
-                    // both the footer toggle and the visualizer's badge
-                    // can drive it from anywhere in the shell. Mount
-                    // conditionally — NowPlayingView's 8 Hz
-                    // playbackTime invalidations keep firing while
-                    // mounted, which would shave fps off the viz even
-                    // after the user collapses the panel.
-                    .inspector(isPresented: Binding(
-                        get: { appModel.showNowPlayingInspector },
-                        set: { appModel.showNowPlayingInspector = $0 }
-                    )) {
-                        if appModel.showNowPlayingInspector {
-                            NowPlayingView()
-                                .environment(appModel)
-                                .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
-                        }
-                    }
             }
             // Persistent footer below the SplitView, spanning both
-            // columns. Match the macOS chrome with a thin material
-            // background + top divider — quietly present without
-            // competing with the source detail panels for attention.
+            // columns. Now the canonical home for transport +
+            // Up Next + Lyrics — the right-side inspector drawer
+            // was retired in favor of a popover from the footer's
+            // source block.
             GlobalNowPlayingFooter()
                 .environment(appModel)
         }
@@ -229,24 +212,14 @@ struct RootShellView: View {
     // MARK: - Visualizer overlay
 
     private var visualizerOverlay: some View {
+        // Back-chevron overlay removed — the floating
+        // GlobalNowPlayingFooter inside the viz carries the same
+        // toggle ("Close Visualizer" pill on the right edge), so a
+        // separate top-leading button is redundant. Closing happens
+        // exactly where the user already looks to manage playback.
         VisualizerView()
             .environment(appModel)
             .ignoresSafeArea()
-            .overlay(alignment: .topLeading) {
-                Button {
-                    appModel.showVisualizer = false
-                } label: {
-                    Image(systemName: "chevron.backward")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .padding(10)
-                        .background(.thinMaterial, in: Circle())
-                }
-                .buttonStyle(.plain)
-                .padding(16)
-                .help("Back to library")
-                .accessibilityLabel("Back to library")
-            }
     }
 }
 
@@ -262,12 +235,15 @@ struct RootShellView: View {
 struct GlobalNowPlayingFooter: View {
 
     @Environment(AppModel.self) private var appModel
+    /// Popover toggle for the source block. Replaces the inspector
+    /// drawer — Up Next + Lyrics live inside [[NowPlayingPopover]].
+    @State private var showSourcePopover = false
 
     var body: some View {
         VStack(spacing: 0) {
             Divider()
             HStack(spacing: 16) {
-                sourceBlock
+                sourceBlockTappable
                 Spacer(minLength: 16)
                 // Pick the transport that matches the active source.
                 // Local wins if local playback is current (the queue
@@ -277,10 +253,19 @@ struct GlobalNowPlayingFooter: View {
                         .environment(appModel)
                 } else if appModel.musicKit.isPlaying || appModel.musicKit.nowPlaying != nil {
                     MiniTransport(musicKit: appModel.musicKit)
+                        .environment(appModel)
                 }
                 Spacer(minLength: 16)
-                nowPlayingInspectorToggle
-                openVisualizerButton
+                // Visualizer chrome — the unified control chip
+                // (current mode | next mode | open/close) reads as
+                // one capsule. The BPM pill stays adjacent as a
+                // separate debug widget; it's not part of the
+                // viz-control vocabulary, so blending it in would
+                // dilute the chip's "viz controls" message.
+                BpmPillExpander()
+                    .environment(appModel)
+                VisualizerControlChip()
+                    .environment(appModel)
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 14)
@@ -313,6 +298,40 @@ struct GlobalNowPlayingFooter: View {
     /// footer needs an explicit check to render its source block.
     private var isLocalPlaybackActive: Bool {
         appModel.hasLocalPlaybackSource || appModel.localQueue.currentItem != nil
+    }
+
+    /// True when there's enough context to render the popover (some
+    /// kind of track is loaded, or the AM player has a queue worth
+    /// surfacing). When false the source block stays tap-inert.
+    private var hasPopoverContext: Bool {
+        appModel.musicKit.nowPlaying != nil
+            || isLocalPlaybackActive
+            || !appModel.musicKit.upcomingItems.isEmpty
+            || !(isLocalPlaybackActive ? appModel.localQueue.upcomingItems.isEmpty : true)
+    }
+
+    /// The source block wrapped in a Button that opens a popover
+    /// carrying Up Next + Lyrics — the same content the inspector
+    /// drawer used to host. Click anywhere on the block (artwork,
+    /// title, artist) to open.
+    @ViewBuilder
+    private var sourceBlockTappable: some View {
+        if hasPopoverContext {
+            Button {
+                showSourcePopover.toggle()
+            } label: {
+                sourceBlock
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showSourcePopover, arrowEdge: .bottom) {
+                NowPlayingPopover()
+                    .environment(appModel)
+                    .frame(width: 380, height: 460)
+            }
+        } else {
+            sourceBlock
+        }
     }
 
     // Left side: source-agnostic now-playing block. When MusicKit has
@@ -430,45 +449,11 @@ struct GlobalNowPlayingFooter: View {
         return SystemAudioSourcePicker.friendlyName(raw)
     }
 
-    private var openVisualizerButton: some View {
-        Button {
-            appModel.showVisualizer = true
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "sparkles")
-                Text("Open Visualizer")
-                    .fontWeight(.semibold)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background {
-                Capsule().fill(Color.accentColor.gradient)
-            }
-            .foregroundStyle(.white)
-        }
-        .buttonStyle(.plain)
-        .shadow(color: .accentColor.opacity(0.35), radius: 6, x: 0, y: 2)
-    }
+    // openVisualizerButton retired — its open/close toggle is now
+    // the third segment of [[VisualizerControlChip]], paired with
+    // the current-mode name + next-mode cycle in one unified
+    // capsule.
 
-    /// Toggle for the Now Playing inspector panel (slides in from
-    /// the right of the detail column). Mirrors the toolbar button
-    /// the legacy ContentView shell exposes; lives here so the new
-    /// RootShellView gets the same affordance.
-    private var nowPlayingInspectorToggle: some View {
-        Button {
-            appModel.showNowPlayingInspector.toggle()
-        } label: {
-            Image(systemName: appModel.showNowPlayingInspector ? "sidebar.right" : "music.note.list")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 32, height: 32)
-                .background {
-                    Circle().fill(.quaternary.opacity(0.5))
-                }
-        }
-        .buttonStyle(.plain)
-        .help(appModel.showNowPlayingInspector ? "Hide Now Playing panel" : "Show Now Playing panel")
-    }
 }
 
 // MARK: - Local mini transport
@@ -481,9 +466,25 @@ struct GlobalNowPlayingFooter: View {
 /// protocol yet, just two parallel shapes.
 private struct LocalMiniTransport: View {
     @Environment(AppModel.self) private var appModel
+    @State private var showSessionControls = false
 
     var body: some View {
         HStack(spacing: 14) {
+            // Sleep timer — leftmost. Note the timer acts on
+            // ApplicationMusicPlayer only; for local playback it's
+            // a no-op (footer in the popover explains). Kept here
+            // for layout parity with the AM transport.
+            Button {
+                showSessionControls.toggle()
+            } label: {
+                Image(systemName: appModel.musicKit.sleepTimerActive ? "moon.zzz.fill" : "moon.zzz")
+            }
+            .buttonStyle(.plain)
+            .help(appModel.musicKit.sleepTimerActive ? "Sleep timer running" : "Sleep timer")
+            .popover(isPresented: $showSessionControls, arrowEdge: .bottom) {
+                SessionControlsView().environment(appModel)
+            }
+
             Button {
                 Task { await appModel.localPlayerSkipToPrevious() }
             } label: {
@@ -492,6 +493,14 @@ private struct LocalMiniTransport: View {
             .buttonStyle(.plain)
             .disabled(!appModel.localQueue.hasPrevious)
             .help("Previous")
+
+            Button {
+                appModel.restartLocalPlayback()
+            } label: {
+                Image(systemName: "arrow.counterclockwise")
+            }
+            .buttonStyle(.plain)
+            .help("Restart track")
 
             Button {
                 if appModel.isLocalPlaybackPlaying {
@@ -514,6 +523,14 @@ private struct LocalMiniTransport: View {
             .buttonStyle(.plain)
             .disabled(!appModel.localQueue.hasNext)
             .help("Next")
+
+            // AirPlay — rightmost. macOS routes the entire system
+            // audio output through the picked device, so local
+            // playback via AVAudioPlayer follows the AirPlay
+            // selection too.
+            AirPlayButton()
+                .frame(width: 28, height: 22)
+                .help("AirPlay output")
         }
         .font(.system(size: 14, weight: .semibold))
         .foregroundStyle(.primary)
@@ -612,9 +629,24 @@ struct KeyboardShortcuts: View {
 // the footer body. Same lesson as Phase 6's ScrubberRow extraction.
 private struct MiniTransport: View {
     let musicKit: MusicKitController
+    @Environment(AppModel.self) private var appModel
+    @State private var showSessionControls = false
 
     var body: some View {
         HStack(spacing: 14) {
+            // Sleep timer — leftmost (per spec). Glyph fills while
+            // a timer is armed.
+            Button {
+                showSessionControls.toggle()
+            } label: {
+                Image(systemName: musicKit.sleepTimerActive ? "moon.zzz.fill" : "moon.zzz")
+            }
+            .buttonStyle(.plain)
+            .help(musicKit.sleepTimerActive ? "Sleep timer running" : "Sleep timer")
+            .popover(isPresented: $showSessionControls, arrowEdge: .bottom) {
+                SessionControlsView().environment(appModel)
+            }
+
             Button {
                 Task { await musicKit.skipToPrevious() }
             } label: {
@@ -622,6 +654,14 @@ private struct MiniTransport: View {
             }
             .buttonStyle(.plain)
             .help("Previous")
+
+            Button {
+                musicKit.restartCurrent()
+            } label: {
+                Image(systemName: "arrow.counterclockwise")
+            }
+            .buttonStyle(.plain)
+            .help("Restart track")
 
             Button {
                 Task { await musicKit.togglePlayPause() }
@@ -639,6 +679,13 @@ private struct MiniTransport: View {
             }
             .buttonStyle(.plain)
             .help("Next")
+
+            // AirPlay route picker — rightmost. AVRoutePickerView
+            // controls the macOS system audio output, so works for
+            // every source (AM, local, mic-monitored, system-tap).
+            AirPlayButton()
+                .frame(width: 28, height: 22)
+                .help("AirPlay output")
         }
         .font(.system(size: 14, weight: .semibold))
         .foregroundStyle(.primary)
