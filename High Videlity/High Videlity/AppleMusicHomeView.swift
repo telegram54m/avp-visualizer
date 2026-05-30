@@ -68,7 +68,15 @@ struct AppleMusicHomeView: View {
     var body: some View {
         let mk = appModel.musicKit
         ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
+            // LazyVStack so each section (For You row, Top Songs,
+            // Top Albums, Top Playlists, library sections) is only
+            // materialized when it scrolls into the viewport. The
+            // For You feed routinely returns 6-10 sections, each
+            // owning a horizontal scroll of cards; building them all
+            // up front was the source of the initial-render lag.
+            // The horizontal LazyHStack inside each section is
+            // unchanged — already lazy on the cross axis.
+            LazyVStack(alignment: .leading, spacing: 28) {
                 searchAndScopeRow
                     .padding(.horizontal, 24)
                     .padding(.top, 8)
@@ -104,25 +112,6 @@ struct AppleMusicHomeView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .navigationTitle("Apple Music")
-        .toolbar {
-            if mk.isAuthorized && mk.canPlayCatalogContent {
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        switch scope {
-                        case .catalog:
-                            feedLoaded = false
-                            Task { await loadFeed(force: true) }
-                        case .library:
-                            libraryLoaded = false
-                            Task { await loadLibrary(force: true) }
-                        }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .help(scope == .catalog ? "Refresh feed" : "Reload library")
-                }
-            }
-        }
         .task { await loadFeed() }
         // Subscription status resolves asynchronously after the
         // subscription observer's first emit. If `loadFeed` ran
@@ -651,7 +640,11 @@ private struct SearchResultsContent: View {
             )
             .frame(minHeight: 200)
         } else {
-            VStack(alignment: .leading, spacing: 28) {
+            // Lazy on the vertical axis so the four search sections
+            // (Songs / Albums / Artists / Playlists) only build
+            // when scrolled to. Mirrors the home feed's LazyVStack
+            // strategy.
+            LazyVStack(alignment: .leading, spacing: 28) {
                 if !mk.searchResults.isEmpty {
                     songsSection(songs: mk.searchResults)
                 }

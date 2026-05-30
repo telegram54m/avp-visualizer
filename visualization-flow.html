@@ -187,7 +187,7 @@
 
 <header>
   <h1>High Videlity — Visualization Data Flow</h1>
-  <div class="subtitle">How audio reaches the visualizer across every playback mode. Generated 2026-05-29.</div>
+  <div class="subtitle">How audio reaches the visualizer across every playback mode. Generated 2026-05-29, updated 2026-05-30.</div>
 </header>
 
 <p class="lede">There are three orthogonal axes to keep straight when reasoning about how a song ends up animating: <strong>audio source</strong> (what's making sound), <strong>feature source</strong> (what's filling <code>frames[]</code>), and <strong>clock source</strong> (what <code>playbackTime</code> the visualizer indexes into <code>frames</code> with). Each playback mode wires these three differently. Mixing them up is the most common source of <em>"the visualizer is animating but audio is silent"</em> / <em>"audio plays but viz is frozen"</em> bugs.</p>
@@ -216,7 +216,9 @@ flowchart TD
     Analyze --> FrameCacheW[FrameFeatureCache.storeFrames]
     LocalPath --> StemMeta[kickoffMetadataAndStemsForLocalFile]
     StemMeta --> Tunebat[BPM / key / mood overrides<br/>TunebatBpmFetcher]
-    StemMeta --> StemLookup[Stem features<br/>local SQLite -> CloudKit public DB]
+    StemMeta --> StemLookup[Stem features lookup only<br/>local SQLite → CloudKit public DB<br/><i>no fresh compute on play</i>]
+    BatchAction([Library Browser:<br/>Cache Features]) -.->|explicit user action| StemCompute[Demucs sidecar fresh compute]
+    StemCompute --> StemLookup
 
     %% AM in-app — sound + feature shapes differ by platform.
     %% macOS: AM plays through RemotePlayerService and we tap THAT,
@@ -272,7 +274,7 @@ flowchart TD
     classDef bg fill:#1a1f2c,stroke:#2a3144,color:#e8eaf2;
     class Viz sink;
     class FramesArr,StemArr,Overrides,Clock store;
-    class LocalPath,AMPath,SysTap,MicEng,SysMusic,SongLoad,AMPreview,FrameCacheL,FrameCacheW,Analyze,StemMeta,Tunebat,StemLookup,OnTrackChange,KickoffPipeline,EnsureMacAM,StreamAn,ShazamID,AVPlayer,AMPlayer bg;
+    class LocalPath,AMPath,SysTap,MicEng,SysMusic,SongLoad,AMPreview,FrameCacheL,FrameCacheW,Analyze,StemMeta,Tunebat,StemLookup,StemCompute,OnTrackChange,KickoffPipeline,EnsureMacAM,StreamAn,ShazamID,AVPlayer,AMPlayer bg;
 </pre>
 </div>
 
@@ -287,7 +289,7 @@ flowchart TD
     <td><code>AVAudioPlayer</code> (private, on AppModel)</td>
     <td><code>FrameFeatureCache</code> hit, else background <code>AnalysisTimeline.analyze</code></td>
     <td><code>audioPlayer.currentTime</code></td>
-    <td><code>loadAndPlayLocalFast</code> is the fast queue path. End-of-track → <code>LocalQueueController.audioPlayerDidFinishPlaying</code> → auto-advance.</td>
+    <td><code>loadAndPlayLocalFast</code> is the fast queue path. End-of-track → <code>LocalQueueController.audioPlayerDidFinishPlaying</code> → auto-advance. Stem features are <em>looked up</em> (Tier 1/1b/2) but never freshly computed here — see invariants.</td>
   </tr>
   <tr>
     <td>AM in-app — macOS<br><span class="pill">song / album / playlist / station / advance</span></td>
@@ -341,12 +343,14 @@ flowchart TD
   </div>
   <div class="cache-card">
     <h4>Stem cache</h4>
-    <p style="margin:0 0 8px;color:var(--fg-dim);">Demucs source-separated features (drums / bass / vocals / other).</p>
+    <p style="margin:0 0 8px;color:var(--fg-dim);">Demucs source-separated features (drums / bass / vocals / other). Looked up on every play; populated only by the explicit library-browser batch action.</p>
     <ul>
-      <li><strong>Tier 1:</strong> local SQLite</li>
-      <li><strong>Tier 2:</strong> CloudKit <em>public</em> DB — shared across all users</li>
-      <li><strong>Tier 3:</strong> fresh Demucs compute via Python sidecar — <em>only</em> triggered by explicit "Cache Features" batch action; never auto on play</li>
-      <li>~6× realtime on M1 Pro, hence the deliberate gating</li>
+      <li><strong>Tier 1 — local SQLite.</strong> Sub-100ms read, keyed by <code>shazam-&lt;id&gt;</code> or <code>musicapp-pid-&lt;id&gt;</code></li>
+      <li><strong>Tier 1b — title+artist alias fallback.</strong> Finds rows under <code>hash-&lt;sha&gt;</code> (from batch-caching) or stale pid-keys; aliases to <code>shazam-&lt;id&gt;</code> so subsequent plays hit Tier&nbsp;1 directly</li>
+      <li><strong>Tier 2 — CloudKit public DB.</strong> Cross-user shared cache; populates Tier 1 on hit so the next offline play is instant</li>
+      <li><strong>Tier 3 — fresh Demucs compute.</strong> <em>Removed from the play path 2026-05-30.</em> Available <em>only</em> via the Library Browser's "Cache Features" batch action. Demucs runs at ~6× realtime on M1 Pro and saturates Metal hard enough to glitch audio — that tradeoff didn't pencil out during playback</li>
+      <li><strong>Apply-side validator.</strong> Before any lookup result lands in <code>stemFeatures</code>, <code>applyStemResult</code> cross-checks the row's stored title against AM's authoritative now-playing title and the cached <code>durationSeconds</code> against AM's catalog duration (4 s slop). Mismatches are rejected and the viz stays on band-split — guards against the alias-bug class of wrong-song serves</li>
+      <li><strong>Maintenance: "Verify stem cache".</strong> The Visualizers page exposes an audit that flags rows whose stem bytes don't match their tagged metadata (duplicate-payload-with-different-titles, plus an info-only MusicBrainz duration cross-check) and lets the user delete corrupted rows</li>
     </ul>
   </div>
 </div>
@@ -358,6 +362,7 @@ flowchart TD
 <div class="invariant-card"><strong><code>frames</code> is <code>@ObservationIgnored</code>.</strong> Reading it from a SwiftUI body causes a 30 Hz invalidation cascade that halves FPS. Use the <code>framesCount</code> mirror for "is anything loaded yet" gating.</div>
 <div class="invariant-card"><strong><code>stopPlayback()</code> releases the AVAudioPlayer and clears its delegate.</strong> Any code path that creates a new player must re-call <code>localQueue.attach(to: player)</code> to re-establish the auto-advance delegate. <code>loadAndPlayLocalFast</code> does this implicitly via <code>startPlayback</code>.</div>
 <div class="invariant-card"><strong><code>registerPreviewForAlignment</code> is for Shazam-driven preview-catalog matching.</strong> Load-bearing for AM / system-audio / mic paths (they need the preview signature to align live audio to pre-analyzed frames). <em>Not</em> load-bearing for local files — they have the full source on disk.</div>
+<div class="invariant-card"><strong>Stem cache LOOKUPS run on play; stem cache POPULATION does not.</strong> <code>kickoffStemSeparation</code> and <code>kickoffCloudOnlyStems</code> still fire Tier 1 / Tier 1b / Tier 2 lookups when a track changes — those are cheap and benefit batch-cached songs immediately. They do <em>not</em> call <code>provider.separate(...)</code>; that pathway was removed 2026-05-30 and the function bails with <code>[stem] kickoff bail: no cache hit and in-playback compute disabled</code> when every tier misses. Resurrection means restoring the old <code>do/catch</code> at the bottom of <code>kickoffStemSeparation</code> — don't quietly add it back.</div>
 <div class="invariant-card"><strong>Cross-source handoff is symmetric on macOS.</strong> Both directions need an explicit teardown of the other source.
   <br><strong>Local → AM:</strong> every AM entry point flows through <code>kickoffTrackPipeline</code> (<code>playAppleMusicSong</code>; <code>musicKit.play(album:)</code> / <code>play(playlist:)</code> / <code>play(station:)</code>; queue auto-advance via <code>musicKit.onTrackChange</code>). That calls <code>ensureMacOSAMPlaybackPath</code>: stops any <code>AVAudioPlayer</code> and engages the system tap on <code>RemotePlayerService</code> with the load-bearing 800 ms delay.
   <br><strong>AM → local:</strong> <code>loadAndPlayLocalFast</code> calls <code>ensureLocalPlaybackPath</code>: stops <code>ApplicationMusicPlayer</code> (which also clears <code>musicKit.nowPlaying</code>) and flips <code>useSystemAudio</code> off. Without this, <code>startPlayback</code>'s guards silently fail.
@@ -371,7 +376,9 @@ flowchart TD
   <li><code>MusicKitController.swift</code> — AM playback, <code>onTrackChange</code>, AM queue</li>
   <li><code>SongLoader.swift</code> — load + analyze pipeline + frame cache lookup</li>
   <li><code>StreamingAnalyzer.swift</code> — live frame appending for system-audio / mic</li>
-  <li><code>StemFeatureProvider.swift</code> — 3-tier stem cache + Demucs sidecar</li>
+  <li><code>StemFeatureProvider.swift</code> — Swift bridge to the Demucs sidecar; lookups + alias + audit + delete</li>
+  <li><code>LibraryBatchCacher.swift</code> — the only call site that triggers fresh Demucs compute, invoked from the Library Browser</li>
+  <li><code>StemCacheAuditor.swift</code> + <code>StemCacheAuditSheet.swift</code> — "Verify stem cache" maintenance: flags duplicate-payload-different-metadata rows and MB duration mismatches</li>
   <li><code>FrameFeatureCache.swift</code> — local frame cache (HVFF v2 format)</li>
   <li><code>VisualizerView.swift</code> — the consumer; reads frames / stems / overrides / clock</li>
 </ul>

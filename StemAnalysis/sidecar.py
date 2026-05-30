@@ -872,6 +872,84 @@ def action_cache_find_by_metadata(req: dict[str, Any]) -> dict[str, Any]:
     return {"found": True, "cache_key": row[0]}
 
 
+def action_cache_audit(req: dict[str, Any]) -> dict[str, Any]:
+    """Return one row per cache_key with the metadata + payload-shape
+    signature the Swift auditor needs to detect corrupted alias rows.
+
+    Per-row fields:
+      • cache_key, model, title, artist, duration_seconds, created_at
+      • file_size_bytes  — LENGTH(features_blob), i.e. the compressed
+        size on disk. A good proxy for "do these rows hold the same
+        underlying audio"; combined with n_frames it's a tight
+        signature.
+      • n_frames  — extracted from stems_meta JSON (max across stems;
+        all stems in a row share the song duration so this is also
+        just one stem's value). 0 when stems_meta is NULL (v1 rows).
+      • protocol_version  — so the Swift side can dim v1 rows in the UI
+        (they'll be recomputed on next play; deletion is harmless).
+
+    This is intentionally read-only and cheap; the row body
+    (features_blob) is NOT returned — that'd be MBs per row × hundreds
+    of rows.
+    """
+    conn = _ensure_cache()
+    rows: list[dict[str, Any]] = []
+    for row in conn.execute(
+        "SELECT cache_key, model, protocol_version, duration_seconds, "
+        "title, artist, created_at, LENGTH(features_blob), stems_meta "
+        "FROM stem_features ORDER BY created_at DESC"
+    ):
+        (
+            cache_key, model, proto, duration, title, artist,
+            created_at, file_size, stems_meta_json,
+        ) = row
+        n_frames = 0
+        if stems_meta_json:
+            try:
+                meta = json.loads(stems_meta_json)
+                if isinstance(meta, list) and meta:
+                    n_frames = max(
+                        int(m.get("n_frames", 0)) for m in meta
+                        if isinstance(m, dict)
+                    )
+            except Exception:
+                n_frames = 0
+        rows.append({
+            "cache_key": cache_key,
+            "model": model,
+            "protocol_version": proto,
+            "duration_seconds": duration,
+            "title": title,
+            "artist": artist,
+            "created_at": created_at,
+            "file_size_bytes": int(file_size or 0),
+            "n_frames": n_frames,
+        })
+    return {"rows": rows}
+
+
+def action_cache_delete(req: dict[str, Any]) -> dict[str, Any]:
+    """Delete a single row by cache_key. Used by the "Verify stem
+    cache" maintenance UI after the user reviews audit findings and
+    chooses to remove a corrupted alias row.
+
+    Returns `{deleted: bool, rows_deleted: int}`. `deleted=false` with
+    `rows_deleted=0` means no row existed for the key (harmless — the
+    UI may have already removed it in a previous run).
+    """
+    cache_key = req.get("cache_key", "")
+    if not cache_key:
+        return {"deleted": False, "rows_deleted": 0, "reason": "empty cache_key"}
+    conn = _ensure_cache()
+    cur = conn.execute(
+        "DELETE FROM stem_features WHERE cache_key = ?", (cache_key,)
+    )
+    conn.commit()
+    rows_deleted = cur.rowcount if cur.rowcount is not None else 0
+    log(f"cache row deleted: {cache_key!r} ({rows_deleted} rows)")
+    return {"deleted": rows_deleted > 0, "rows_deleted": int(rows_deleted)}
+
+
 def action_cache_put_binary(req: dict[str, Any]) -> dict[str, Any]:
     """Insert pre-computed binary features into the local SQLite cache.
     Used when the Swift side fetches features from the CloudKit public
@@ -914,6 +992,8 @@ ACTIONS = {
     "cache_put_binary": action_cache_put_binary,
     "cache_clear_all": action_cache_clear_all,
     "cache_find_by_metadata": action_cache_find_by_metadata,
+    "cache_audit": action_cache_audit,
+    "cache_delete": action_cache_delete,
 }
 
 

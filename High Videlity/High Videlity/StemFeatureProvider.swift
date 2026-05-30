@@ -367,6 +367,34 @@ public struct StemSeparationResult: Sendable, Codable {
     }
 }
 
+/// One row in the stem-features cache, as returned by
+/// `cacheAudit()`. Lean shape — metadata + payload-shape signature
+/// only; no feature timelines. Used by [[StemCacheAuditor]] to find
+/// rows whose metadata disagrees with the underlying stem data
+/// (alias-bug corruption from prior Shazam misidentifications).
+public struct StemCacheRow: Sendable, Codable {
+    public let cacheKey: String
+    public let model: String
+    public let protocolVersion: Int
+    public let durationSeconds: Double?
+    public let title: String?
+    public let artist: String?
+    public let createdAt: Int
+    public let fileSizeBytes: Int
+    public let nFrames: Int
+
+    enum CodingKeys: String, CodingKey {
+        case cacheKey = "cache_key"
+        case model
+        case protocolVersion = "protocol_version"
+        case durationSeconds = "duration_seconds"
+        case title, artist
+        case createdAt = "created_at"
+        case fileSizeBytes = "file_size_bytes"
+        case nFrames = "n_frames"
+    }
+}
+
 /// Reported by `cacheStats()` — diagnostic counts for the persistent
 /// stem-features cache.
 public struct StemCacheStats: Sendable, Codable {
@@ -827,6 +855,37 @@ public actor StemFeatureProvider {
         }
     }
 
+    /// Enumerate every row in the local SQLite stem-features cache.
+    /// Cheap — payload blobs are NOT returned; only the (cache_key,
+    /// metadata, payload-shape signature) tuple per row, ordered
+    /// newest-first. Used by [[StemCacheAuditor]] to find rows whose
+    /// metadata disagrees with the underlying stem bytes.
+    public func cacheAudit() async throws -> [StemCacheRow] {
+        struct AuditResult: Decodable { let rows: [StemCacheRow] }
+        let result: AuditResult = try await sendRequest(action: "cache_audit", payload: [:])
+        return result.rows
+    }
+
+    /// Delete a single row by cache_key. Used by the "Verify stem
+    /// cache" maintenance UI after the user confirms removal of a
+    /// corrupted alias row. Returns true when a row was actually
+    /// deleted; false when no row existed for the key (idempotent —
+    /// not an error).
+    @discardableResult
+    public func deleteCacheRow(forKey key: String) async throws -> Bool {
+        struct DeleteResult: Decodable {
+            let deleted: Bool
+            let rowsDeleted: Int
+            enum CodingKeys: String, CodingKey {
+                case deleted
+                case rowsDeleted = "rows_deleted"
+            }
+        }
+        let result: DeleteResult = try await sendRequest(
+            action: "cache_delete", payload: ["cache_key": key])
+        return result.deleted
+    }
+
     /// Signal the sidecar to abandon any in-flight throttled separation
     /// at the next chunk boundary. Fire-and-forget — we don't await
     /// the ack here because the *real* effect is on the currently-
@@ -1093,6 +1152,11 @@ public actor StemFeatureProvider {
     }
 
     public func abandon() async throws {}
+
+    public func cacheAudit() async throws -> [StemCacheRow] { [] }
+
+    @discardableResult
+    public func deleteCacheRow(forKey key: String) async throws -> Bool { false }
 }
 
 #endif

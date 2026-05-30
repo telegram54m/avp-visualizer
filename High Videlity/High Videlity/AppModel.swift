@@ -59,18 +59,21 @@ enum FrameTier: Int, Sendable {
 }
 
 /// Phase 7 — top-level sources surfaced in the macOS sidebar.
-/// Local + Apple Music are real today; Spotify and YouTube Music are
-/// stubs ("coming soon") so the user can SEE the eventual shape
-/// without us building a speculative abstraction against them. The
-/// real `MusicSource` protocol-or-not decision is deferred until a
-/// second SDK actually lands.
+/// Each case here has a real, functional surface. Speculative
+/// "coming soon" placeholders for Spotify / YouTube Music were
+/// removed 2026-05-30 once the realistic story for both became
+/// clear: macOS users can already visualize them via the [[mac]]
+/// system-audio tap, and the in-app browse/play SDKs that would
+/// have justified dedicated surfaces either don't exist on Apple
+/// platforms (YouTube Music) or are actively closing off (Spotify).
+/// If a credible second-SDK source ever lands (Tidal is the most
+/// realistic candidate per [[apple-music-tos-guardrails]]), reopen
+/// the `MusicSource` abstraction question then.
 enum SidebarSource: String, Identifiable, CaseIterable, Hashable {
     case appleMusic
     case local
     case mac           // macOS only — system-audio tap (Music.app / Spotify / browser / etc.)
     case microphone    // all platforms — live external audio via mic
-    case spotify
-    case youTubeMusic
     case visualizers   // formerly "settings" — the page is now a visualizer-mode picker
 
     var id: String { rawValue }
@@ -81,8 +84,6 @@ enum SidebarSource: String, Identifiable, CaseIterable, Hashable {
         case .local:         return "Local Library"
         case .mac:           return "Mac"
         case .microphone:    return "Microphone"
-        case .spotify:       return "Spotify"
-        case .youTubeMusic:  return "YouTube Music"
         case .visualizers:   return "Visualizers"
         }
     }
@@ -93,37 +94,26 @@ enum SidebarSource: String, Identifiable, CaseIterable, Hashable {
         case .local:         return "music.note.house.fill"
         case .mac:           return "desktopcomputer"
         case .microphone:    return "mic.fill"
-        case .spotify:       return "music.note"
-        case .youTubeMusic:  return "play.rectangle.fill"
         case .visualizers:   return "sparkles"
         }
     }
 
     /// Brand-ish tint used in the sidebar so each source has a small
     /// visual identity without requiring real logos. Apple Music
-    /// borrows the signature red-pink; Spotify gets green; YouTube
-    /// Music gets red. Local / Mac / Microphone / Visualizers use
-    /// the system accent so they don't compete with the third-party
-    /// brand cues.
+    /// borrows the signature red-pink; Local / Mac / Microphone /
+    /// Visualizers use the system accent.
     var tintColorRGB: (r: Double, g: Double, b: Double)? {
         switch self {
         case .appleMusic:    return (0.98, 0.18, 0.36)  // AM red-pink
-        case .spotify:       return (0.11, 0.73, 0.33)  // Spotify green
-        case .youTubeMusic:  return (1.00, 0.00, 0.00)  // YT red
         case .local, .mac, .microphone, .visualizers:
             return nil  // use system accent
         }
     }
 
-    /// True when this source has a real, functional UI today.
-    /// `false` for Spotify / YouTube Music — they render as a
-    /// "coming soon" placeholder rather than a working surface.
-    var isImplemented: Bool {
-        switch self {
-        case .appleMusic, .local, .mac, .microphone, .visualizers: return true
-        case .spotify, .youTubeMusic: return false
-        }
-    }
+    /// True when this source has a real, functional UI today. Kept
+    /// as a hook for future placeholders; everything currently
+    /// surfaced returns true.
+    var isImplemented: Bool { true }
 }
 
 enum VisualizerMode: String, CaseIterable, Identifiable {
@@ -2545,6 +2535,19 @@ class AppModel {
         audioPlayer?.play()
     }
 
+    /// Seek the local AVAudioPlayer to an absolute time in seconds.
+    /// Clamped to [0, duration]. No-op when no local player. Continues
+    /// playing if the player was already playing; leaves it paused
+    /// otherwise. Backs the local-source footer scrubber.
+    func seekLocalPlayback(to seconds: TimeInterval) {
+        guard let player = audioPlayer else { return }
+        let dur = player.duration
+        let clamped = max(0, min(seconds, max(dur, 0)))
+        let wasPlaying = player.isPlaying
+        player.currentTime = clamped
+        if wasPlaying { player.play() }
+    }
+
     /// Seek the local AVAudioPlayer back to position 0 and continue
     /// playing if it was playing. No-op when no local player.
     func restartLocalPlayback() {
@@ -3219,84 +3222,24 @@ class AppModel {
             return
         }
 
-        // Tier 3: full Demucs separation.
-        do {
-            let result = try await provider.separate(
-                filePath: fileURL.path,
-                cacheKey: primaryKey,
-                forceRefresh: false,
-                title: title.isEmpty ? nowPlaying.title : title,
-                artist: artist.isEmpty ? nowPlaying.artist : artist,
-                throttleMS: throttleMS
-            )
-
-            // Backward-alias after a FRESH computation: the row now
-            // lives under primaryKey; mirror it to secondaryKey so
-            // future lookups by either pid or shazam-id hit the cache.
-            // Skipped on cache hits (the alias was already done either
-            // on a prior run or by the forward-alias above).
-            if let secondaryKey, !result.fromCache {
-                Task.detached(priority: .background) {
-                    _ = try? await provider.alias(
-                        primaryKey: primaryKey, aliasKey: secondaryKey)
-                }
-            }
-
-            // CloudKit public-DB push: only on fresh computations and
-            // when we know the Shazam ID (the cross-user key). Other
-            // listeners' first plays of this song will get a cloud
-            // cache hit and skip the ~30-60s Demucs run.
-            if !result.fromCache, let shazamID, !shazamID.isEmpty {
-                let resultForUpload = result  // capture explicitly
-                let titleForUpload = title.isEmpty ? nowPlaying.title : title
-                let artistForUpload = artist.isEmpty ? nowPlaying.artist : artist
-                Task.detached(priority: .background) {
-                    await CloudCacheSync.shared.saveStemFeatures(
-                        shazamID: shazamID,
-                        title: titleForUpload,
-                        artist: artistForUpload,
-                        result: resultForUpload
-                    )
-                }
-            }
-
-            await self.applyStemResult(
-                result,
-                nowPlaying: nowPlaying,
-                generation: generation,
-                originLabel: result.fromCache ? "local-fallback-cache" : "fresh"
-            )
-        } catch StemSidecarError.abandoned(let reason) {
-            // Expected when a newer kickoff superseded us. The newer
-            // task has already set its own status (.computing) so we
-            // leave stemStatus alone. Log quietly.
-            stemLog("[stem] separation abandoned for \(nowPlaying.title): \(reason)")
-            // Queue this kickoff for later — when Music.app pauses
-            // (user takes a break, song ends, etc.), the idle-drain
-            // timer will pop it and finish the work in the background.
-            // Doesn't waste the partial compute since the sidecar
-            // doesn't persist mid-flight features, but at least we
-            // don't FORCE the user to manually replay the track to
-            // get its stems cached.
-            let deferred = DeferredKickoff(
-                cacheKey: primaryKey,
-                fileURL: fileURL,
-                title: nowPlaying.title,
-                artist: nowPlaying.artist
-            )
-            await MainActor.run { [weak self] in
-                self?.enqueueDeferredKickoff(deferred)
-            }
-        } catch {
-            stemLog("[stem] separation failed for \(nowPlaying.title): \(error)")
-            // Fall back to band-split. Only revert status if this
-            // task is still the current one — a newer kickoff may
-            // have already set .computing.
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                if generation == self.stemLookupGeneration {
-                    self.stemStatus = .idle
-                }
+        // Tier 3 (fresh Demucs compute) is DISABLED during playback.
+        // The compute glitches audio (Metal contention) and adds
+        // 30-60s of UI churn for a result the visualizer can only
+        // start using after the track is half over. Cache POPULATION
+        // is now a manual operation — invoke [[LibraryBatchCacher]]
+        // via the Library browser to seed cache rows ahead of time,
+        // then plays of those songs get instant Tier-1 hits here.
+        // Cache LOOKUPS (Tier 1 SQLite, Tier 2 CloudKit, Tier 1b
+        // title+artist alias) above continue to fire during playback
+        // and are the entire point of this function on the play path.
+        // To re-enable in-playback compute, restore the do/catch
+        // block previously at this spot (see git history around
+        // 2026-05-30).
+        stemLog("[stem] kickoff bail: no cache hit and in-playback compute disabled (use Library Browser to batch-cache)")
+        await MainActor.run { [weak self] in
+            guard let self else { return }
+            if generation == self.stemLookupGeneration {
+                self.stemStatus = .idle
             }
         }
     }

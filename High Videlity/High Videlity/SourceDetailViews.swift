@@ -711,6 +711,7 @@ struct LocalArtTile: View {
 struct SettingsSourceView: View {
 
     @Environment(AppModel.self) private var appModel
+    @State private var showStemCacheAudit = false
 
     var body: some View {
         ScrollView {
@@ -719,6 +720,8 @@ struct SettingsSourceView: View {
                 grid
                 Divider()
                 cycleToggleRow
+                Divider()
+                stemCacheMaintenanceRow
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 24)
@@ -727,6 +730,33 @@ struct SettingsSourceView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .navigationTitle("Visualizers")
+        .sheet(isPresented: $showStemCacheAudit) {
+            StemCacheAuditSheet()
+                .environment(appModel)
+                .frame(minWidth: 640, minHeight: 480)
+        }
+    }
+
+    /// "Verify stem cache" entry point. The audit reads every cached
+    /// row and looks up each (title, artist) against MusicBrainz to
+    /// find rows whose stored stem bytes likely came from a different
+    /// song — see [[StemCacheAuditor]] for the detection strategy +
+    /// the alias-bug history that motivates this.
+    private var stemCacheMaintenanceRow: some View {
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Verify stem cache")
+                    .font(.callout)
+                Text("Scan the on-disk stem-features cache for rows whose metadata disagrees with the audio they were computed from. Cross-checks each entry against MusicBrainz. Slow — about a second per cached song.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 16)
+            Button("Verify…") { showStemCacheAudit = true }
+                .buttonStyle(.borderedProminent)
+        }
+        .frame(maxWidth: 600, alignment: .leading)
     }
 
     private var hero: some View {
@@ -993,43 +1023,6 @@ struct SystemAudioSourcePicker: View {
         switch raw {
         case "RemotePlayerService": return "Apple Music"
         default: return raw
-        }
-    }
-}
-
-// MARK: - Coming soon (Spotify / YouTube Music)
-
-struct ComingSoonView: View {
-    let source: SidebarSource
-
-    var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: source.systemImage)
-                .font(.system(size: 56))
-                .foregroundStyle(.secondary)
-            Text(source.displayName)
-                .font(.title2.weight(.semibold))
-            Text("Coming after first release.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Text(rationale)
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 320)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .navigationTitle(source.displayName)
-    }
-
-    private var rationale: String {
-        switch source {
-        case .spotify:
-            return "Spotify's MusicKit-equivalent SDK was deprecated in late 2024. We're tracking the API shape that replaces it before designing this surface."
-        case .youTubeMusic:
-            return "YouTube Music doesn't expose a first-party playback SDK on Apple platforms. We'll revisit when one arrives."
-        default:
-            return ""
         }
     }
 }

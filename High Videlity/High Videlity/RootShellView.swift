@@ -114,8 +114,6 @@ struct RootShellView: View {
                 row(.mac)
                 #endif
                 row(.microphone)
-                row(.spotify)
-                row(.youTubeMusic)
             } header: {
                 sectionHeader("SOURCES")
             }
@@ -196,14 +194,13 @@ struct RootShellView: View {
             #if os(macOS)
             NavigationStack { MacSourceView() }
             #else
-            NavigationStack { ComingSoonView(source: .mac) }
+            // .mac is sidebar-listed only on macOS (#if at row site),
+            // so this branch is unreachable on iOS/visionOS. Empty
+            // placeholder keeps the switch exhaustive.
+            NavigationStack { EmptyView() }
             #endif
         case .microphone:
             NavigationStack { MicrophoneSourceView() }
-        case .spotify:
-            NavigationStack { ComingSoonView(source: .spotify) }
-        case .youTubeMusic:
-            NavigationStack { ComingSoonView(source: .youTubeMusic) }
         case .visualizers:
             NavigationStack { SettingsSourceView() }
         }
@@ -469,6 +466,20 @@ private struct LocalMiniTransport: View {
     @State private var showSessionControls = false
 
     var body: some View {
+        VStack(spacing: 6) {
+            transportRow
+            // The scrubber sits inside this VStack so its width
+            // exactly matches the transport row above. Using
+            // `.frame(maxWidth: .infinity)` lets the scrubber expand
+            // to the VStack's column width, which the transport row
+            // (the wider of the two) already establishes.
+            LocalFooterScrubber()
+                .environment(appModel)
+                .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var transportRow: some View {
         HStack(spacing: 14) {
             // Sleep timer — leftmost. Note the timer acts on
             // ApplicationMusicPlayer only; for local playback it's
@@ -633,6 +644,14 @@ private struct MiniTransport: View {
     @State private var showSessionControls = false
 
     var body: some View {
+        VStack(spacing: 6) {
+            transportRow
+            AMFooterScrubber(musicKit: musicKit)
+                .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var transportRow: some View {
         HStack(spacing: 14) {
             // Sleep timer — leftmost (per spec). Glyph fills while
             // a timer is armed.
@@ -689,6 +708,182 @@ private struct MiniTransport: View {
         }
         .font(.system(size: 14, weight: .semibold))
         .foregroundStyle(.primary)
+    }
+}
+
+// MARK: - Footer scrubber
+
+/// AM scrubber — binds to `musicKit.playbackTime` (an @Observable
+/// property updated by the ApplicationMusicPlayer polling loop at
+/// ~30 Hz). Uses the same scrub-draft pattern as
+/// [[NowPlayingView.ScrubberRow]]: hold thumb position locally while
+/// dragging, only seek on release.
+private struct AMFooterScrubber: View {
+    let musicKit: MusicKitController
+    @State private var scrubDraft: Double?
+
+    var body: some View {
+        let duration = max(musicKit.currentDuration, 1)
+        let displayed = scrubDraft ?? musicKit.playbackTime
+        scrubberLayout(
+            current: displayed,
+            duration: duration,
+            onChange: { newValue in scrubDraft = newValue },
+            onCommit: {
+                if let draft = scrubDraft {
+                    musicKit.seek(to: draft)
+                    scrubDraft = nil
+                }
+            }
+        )
+    }
+}
+
+/// Local-file scrubber. AVAudioPlayer's `currentTime` isn't
+/// observable — it's freshly read on each access — so we drive a
+/// 4 Hz redraw via TimelineView. Enough cadence for the thumb to look
+/// fluid without burning UI work the rest of the footer doesn't need.
+/// Same scrub-draft pattern as the AM row: thumb sticks under the
+/// cursor during drag, seek fires on release.
+private struct LocalFooterScrubber: View {
+    @Environment(AppModel.self) private var appModel
+    @State private var scrubDraft: Double?
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.25)) { _ in
+            let current = appModel.localPlaybackCurrentTime ?? 0
+            let duration = max(appModel.localPlaybackDuration ?? 0, 1)
+            let displayed = scrubDraft ?? current
+            scrubberLayout(
+                current: displayed,
+                duration: duration,
+                onChange: { newValue in scrubDraft = newValue },
+                onCommit: {
+                    if let draft = scrubDraft {
+                        appModel.seekLocalPlayback(to: draft)
+                        scrubDraft = nil
+                    }
+                }
+            )
+        }
+    }
+}
+
+/// Shared scrubber layout — glass scrubber track with elapsed /
+/// remaining timestamps tucked beneath. Pulled out so both
+/// source-specific scrubbers share the visual vocabulary without
+/// duplicating it.
+@ViewBuilder
+private func scrubberLayout(
+    current: Double,
+    duration: Double,
+    onChange: @escaping (Double) -> Void,
+    onCommit: @escaping () -> Void
+) -> some View {
+    VStack(spacing: 2) {
+        GlassScrubber(
+            current: current,
+            duration: duration,
+            onChange: onChange,
+            onCommit: onCommit
+        )
+        HStack {
+            Text(formatScrubberTime(current))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text("-" + formatScrubberTime(max(duration - current, 0)))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private func formatScrubberTime(_ seconds: TimeInterval) -> String {
+    let total = Int(seconds.rounded())
+    let m = total / 60
+    let s = total % 60
+    return String(format: "%d:%02d", m, s)
+}
+
+/// Custom scrubber matching the footer's calm-chrome vocabulary: a
+/// 2pt material track + a small (7pt) translucent bead rendered with
+/// the same `.glassEffect()` as the sidebar's GlassIcon. Replaces the
+/// default SwiftUI Slider so we can shrink the thumb to ~half the
+/// default size and make it read as glass rather than a solid puck.
+///
+/// Drag anywhere along the bar to scrub — the thumb is small enough
+/// that requiring the user to hit it exactly would be cruel. The
+/// `onChange` callback fires continuously during drag (so the live
+/// elapsed/remaining text updates), and `onCommit` fires once on
+/// release (when we seek the underlying player).
+private struct GlassScrubber: View {
+    let current: Double
+    let duration: Double
+    let onChange: (Double) -> Void
+    let onCommit: () -> Void
+
+    /// Half the SwiftUI Slider's default thumb diameter (~14pt) per
+    /// design ask. Affects hit-target friendliness — the whole row
+    /// captures drag, but the visual bead is intentionally small.
+    private let thumbDiameter: CGFloat = 7
+    private let trackHeight: CGFloat = 2
+    /// Vertical hit target — generous so the user can grab the bar
+    /// without precision aim despite the small bead.
+    private let rowHeight: CGFloat = 14
+
+    var body: some View {
+        GeometryReader { proxy in
+            let w = proxy.size.width
+            let safeDuration = max(duration, 1)
+            let progress = min(max(current / safeDuration, 0), 1)
+            let usableWidth = max(w - thumbDiameter, 0)
+            let thumbX = usableWidth * CGFloat(progress)
+            let fillWidth = thumbX + thumbDiameter / 2
+
+            ZStack(alignment: .leading) {
+                // Background track.
+                Capsule()
+                    .fill(.quaternary)
+                    .frame(height: trackHeight)
+                // Progress fill — primary tint at low opacity so it
+                // reads as "filled" without competing with the bead.
+                Capsule()
+                    .fill(.primary.opacity(0.55))
+                    .frame(width: max(0, fillWidth), height: trackHeight)
+                // Glass bead. `.fill(.clear)` + `.glassEffect()`
+                // produces the translucent-puck look — same modifier
+                // as [[GlassIcon]] but applied to a circle. A thin
+                // outer stroke gives the bead a subtle defined edge
+                // against the gradient-tinted footer background.
+                Circle()
+                    .fill(Color.clear)
+                    .frame(width: thumbDiameter, height: thumbDiameter)
+                    .glassEffect(in: Circle())
+                    .overlay {
+                        Circle()
+                            .stroke(.primary.opacity(0.25), lineWidth: 0.5)
+                    }
+                    .offset(x: thumbX)
+            }
+            .frame(height: rowHeight)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        guard usableWidth > 0 else { return }
+                        // Map x to track position. Subtract half the
+                        // thumb so a tap at x=0 puts the bead's
+                        // center at the left edge, not the bead's
+                        // left edge — feels more natural.
+                        let localX = g.location.x - thumbDiameter / 2
+                        let frac = min(max(Double(localX / usableWidth), 0), 1)
+                        onChange(frac * safeDuration)
+                    }
+                    .onEnded { _ in onCommit() }
+            )
+        }
+        .frame(height: rowHeight)
     }
 }
 
