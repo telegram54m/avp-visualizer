@@ -28,3 +28,18 @@ Package.resolved
 *.log
 *.tmp
 *.swp
+
+# ---- Python bytecode (catch anywhere, incl. StemAnalysis sidecar) ----
+__pycache__/
+*.pyc
+
+# ---- ML model weights & probe artifacts (large binaries — never commit) ----
+*.pkl
+*.safetensors
+*.f32
+StemAnalysis/mlx_checkpoints/
+StemAnalysis/**/artifacts/
+
+# ---- Editor scratch / fixtures ----
+*.bak
+StemAnalysis/**/tools/*.wav
