@@ -219,11 +219,12 @@ Ranked by likely payoff:
    removed; it now reads `store.X` and its loadFeed/loadLibrary delegate
    to the store (idempotent). Data survives navigation → single retained
    copy, no re-fetch on return to the landing page. Build green.
-   FOLLOW-UP (small, deferred): `AppleMusicLibraryView` (legacy `.sheet`
-   in ContentView, capped `librarySongs(limit:100)` fetches, freed on
-   dismiss) still has its own @State — smaller + short-lived, left as-is.
-   It may also be dead UI (ContentView is the old shell; RootShellView is
-   current). Could migrate or delete later.
+   FOLLOW-UP: ~~`AppleMusicLibraryView`~~ **DELETED 2026-05-31** — it was
+   dead UI (only referenced in a `#if os(macOS)` block of ContentView,
+   which is no longer the macOS root; RootShellView replaced it in Phase
+   7). Removed the file + its ContentView refs (showAppleMusicLibrary
+   state, "My Library" button, sheet). AM library browsing lives inline
+   as the Library scope in AppleMusicHomeView now.
 2. **frames: [FeatureFrame] uncapped in live/mic mode** (latent leak).
    `appendLiveFrames`, AppModel.swift:1167 — appends 30/s forever, no
    eviction; track-change wipe is throttled 60s + suppressed same-song.
