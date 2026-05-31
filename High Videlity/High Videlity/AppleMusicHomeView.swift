@@ -49,21 +49,12 @@ struct AppleMusicHomeView: View {
     }
     @State private var scope: HomeScope = .catalog
 
-    // Feed data — cached for the session. Reset only on reload.
-    @State private var recommendations: [MusicPersonalRecommendation] = []
-    @State private var charts: MusicKitController.Charts = .init()
-    @State private var feedLoaded = false
-    @State private var feedLoading = false
-
-    // Library cache — populated on first switch to library scope
-    // and reused across navigation back to this view. Reload
-    // re-fetches both feeds.
-    @State private var librarySongs: [Song] = []
-    @State private var libraryAlbums: [Album] = []
-    @State private var libraryArtists: [Artist] = []
-    @State private var libraryPlaylists: [Playlist] = []
-    @State private var libraryLoaded = false
-    @State private var libraryLoading = false
+    // Feed + library data now live in `appModel.appleMusic` (a long-
+    // lived AppleMusicStore) instead of per-view @State, so navigating
+    // away from and back to this landing page no longer re-fetches and
+    // re-holds the recommendations / charts / full-library arrays. The
+    // store loads once (idempotent) and is reused across navigations.
+    private var store: AppleMusicStore { appModel.appleMusic }
 
     var body: some View {
         let mk = appModel.musicKit
@@ -245,7 +236,7 @@ struct AppleMusicHomeView: View {
 
     @ViewBuilder
     private var feedContent: some View {
-        if feedLoading && recommendations.isEmpty && charts.songs.isEmpty {
+        if store.feedLoading && store.recommendations.isEmpty && store.charts.songs.isEmpty {
             HStack {
                 Spacer()
                 ProgressView()
@@ -253,28 +244,28 @@ struct AppleMusicHomeView: View {
             }
             .padding(.top, 40)
         } else {
-            if !recommendations.isEmpty {
-                ForEach(recommendations, id: \.id) { rec in
+            if !store.recommendations.isEmpty {
+                ForEach(store.recommendations, id: \.id) { rec in
                     recommendationSection(rec)
                 }
             }
-            if !charts.songs.isEmpty {
+            if !store.charts.songs.isEmpty {
                 horizontalRow(title: "Top Songs") {
-                    ForEach(charts.songs.prefix(20)) { song in
+                    ForEach(store.charts.songs.prefix(20)) { song in
                         SongCard(song: song, appModel: appModel)
                     }
                 }
             }
-            if !charts.albums.isEmpty {
+            if !store.charts.albums.isEmpty {
                 horizontalRow(title: "Top Albums") {
-                    ForEach(charts.albums.prefix(20)) { album in
+                    ForEach(store.charts.albums.prefix(20)) { album in
                         AlbumCard(album: album, appModel: appModel)
                     }
                 }
             }
-            if !charts.playlists.isEmpty {
+            if !store.charts.playlists.isEmpty {
                 horizontalRow(title: "Top Playlists") {
-                    ForEach(charts.playlists.prefix(20)) { pl in
+                    ForEach(store.charts.playlists.prefix(20)) { pl in
                         PlaylistCard(playlist: pl, appModel: appModel)
                     }
                 }
@@ -292,7 +283,7 @@ struct AppleMusicHomeView: View {
     /// in modern music apps are expected to be exhaustive.
     @ViewBuilder
     private var libraryContent: some View {
-        if libraryLoading && allLibraryEmpty {
+        if store.libraryLoading && allLibraryEmpty {
             HStack {
                 Spacer()
                 ProgressView()
@@ -352,12 +343,12 @@ struct AppleMusicHomeView: View {
                         Spacer()
                         NavigationLink {
                             LibrarySongsListView(
-                                songs: librarySongs,
+                                songs: store.librarySongs,
                                 appModel: appModel
                             )
                         } label: {
                             HStack(spacing: 3) {
-                                Text("Show all (\(librarySongs.count))")
+                                Text("Show all (\(store.librarySongs.count))")
                                 Image(systemName: "chevron.right")
                                     .font(.caption2)
                             }
@@ -379,12 +370,7 @@ struct AppleMusicHomeView: View {
         }
     }
 
-    private var allLibraryEmpty: Bool {
-        librarySongs.isEmpty
-            && libraryAlbums.isEmpty
-            && libraryArtists.isEmpty
-            && libraryPlaylists.isEmpty
-    }
+    private var allLibraryEmpty: Bool { store.allLibraryEmpty }
 
     private var allVisibleLibraryEmpty: Bool {
         visibleLibrarySongs.isEmpty
@@ -404,8 +390,8 @@ struct AppleMusicHomeView: View {
 
     private var visibleLibrarySongs: [Song] {
         let q = libraryQuery
-        guard !q.isEmpty else { return librarySongs }
-        return librarySongs.filter {
+        guard !q.isEmpty else { return store.librarySongs }
+        return store.librarySongs.filter {
             $0.title.lowercased().contains(q)
                 || $0.artistName.lowercased().contains(q)
                 || ($0.albumTitle?.lowercased().contains(q) ?? false)
@@ -414,8 +400,8 @@ struct AppleMusicHomeView: View {
 
     private var visibleLibraryAlbums: [Album] {
         let q = libraryQuery
-        guard !q.isEmpty else { return libraryAlbums }
-        return libraryAlbums.filter {
+        guard !q.isEmpty else { return store.libraryAlbums }
+        return store.libraryAlbums.filter {
             $0.title.lowercased().contains(q)
                 || $0.artistName.lowercased().contains(q)
         }
@@ -423,14 +409,14 @@ struct AppleMusicHomeView: View {
 
     private var visibleLibraryArtists: [Artist] {
         let q = libraryQuery
-        guard !q.isEmpty else { return libraryArtists }
-        return libraryArtists.filter { $0.name.lowercased().contains(q) }
+        guard !q.isEmpty else { return store.libraryArtists }
+        return store.libraryArtists.filter { $0.name.lowercased().contains(q) }
     }
 
     private var visibleLibraryPlaylists: [Playlist] {
         let q = libraryQuery
-        guard !q.isEmpty else { return libraryPlaylists }
-        return libraryPlaylists.filter {
+        guard !q.isEmpty else { return store.libraryPlaylists }
+        return store.libraryPlaylists.filter {
             $0.name.lowercased().contains(q)
                 || ($0.curatorName?.lowercased().contains(q) ?? false)
         }
@@ -520,59 +506,16 @@ struct AppleMusicHomeView: View {
 
     // MARK: - Loading
 
+    // Feed + library loading now live on the shared AppleMusicStore so
+    // the data survives navigation. These thin wrappers keep the
+    // .task / .onChange call sites unchanged. Both store methods are
+    // idempotent (load-once unless `force`).
     private func loadFeed(force: Bool = false) async {
-        let mk = appModel.musicKit
-        // Only gate on authorization. Catalog-subscription state
-        // resolves async; gating on it would race with the observer
-        // and stall the feed until the user manually hit Refresh.
-        // If they're authorized but unsubscribed, the requests still
-        // return what they can (or empty), and the body's
-        // subscription prompt handles UX above the empty feed.
-        guard mk.isAuthorized else { return }
-        if !force && feedLoaded { return }
-        guard !feedLoading else { return }
-        feedLoading = true
-        defer { feedLoading = false }
-        async let recs = mk.recommendations()
-        async let chartsResult = mk.charts()
-        recommendations = await recs
-        charts = await chartsResult
-        feedLoaded = true
+        await store.loadFeed(mk: appModel.musicKit, force: force)
     }
 
-    /// Stream the full library in 100-item pages. Each bucket
-    /// (songs / albums / artists / playlists) is paginated in
-    /// parallel; rows progressively fill in as pages arrive so the
-    /// user sees results before all pages have landed. `force=true`
-    /// resets the state arrays first so reload starts fresh.
     private func loadLibrary(force: Bool = false) async {
-        let mk = appModel.musicKit
-        guard mk.isAuthorized else { return }
-        if !force && libraryLoaded { return }
-        guard !libraryLoading else { return }
-        if force {
-            librarySongs = []
-            libraryAlbums = []
-            libraryArtists = []
-            libraryPlaylists = []
-        }
-        libraryLoading = true
-        defer { libraryLoading = false }
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { @MainActor in
-                await mk.libraryAllSongs { page in librarySongs.append(contentsOf: page) }
-            }
-            group.addTask { @MainActor in
-                await mk.libraryAllAlbums { page in libraryAlbums.append(contentsOf: page) }
-            }
-            group.addTask { @MainActor in
-                await mk.libraryAllArtists { page in libraryArtists.append(contentsOf: page) }
-            }
-            group.addTask { @MainActor in
-                await mk.libraryAllPlaylists { page in libraryPlaylists.append(contentsOf: page) }
-            }
-        }
-        libraryLoaded = true
+        await store.loadLibrary(mk: appModel.musicKit, force: force)
     }
 }
 

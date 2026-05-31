@@ -891,6 +891,12 @@ class AppModel {
     /// the user hits skip-forward during library playback.
     let library = LibraryStore()
 
+    /// Long-lived home for the Apple Music landing page's feed + full
+    /// library data. Hoisted out of AppleMusicHomeView's per-view @State
+    /// so navigating away and back doesn't re-fetch + re-hold the
+    /// recommendations / charts / library arrays (footprint reducer).
+    let appleMusic = AppleMusicStore()
+
     /// AM-style queue layer for local-file playback. Owns the
     /// entries + current pointer; AppModel owns the AVAudioPlayer.
     /// Wired to `loadSong` via `onAdvance` so end-of-track + manual

@@ -210,16 +210,20 @@ The `ps` RSS poller's big number is misleading. **Physical footprint was
 
 ## Remaining footprint reducers (none cause a crash; do if it matters)
 Ranked by likely payoff:
-1. **Per-view MusicKit @State arrays** ("cause A2", NOT done). Each AM
-   surface re-fetches + holds ~100 hydrated items × several categories:
-   - AppleMusicHomeView @State: recommendations, charts, librarySongs,
-     libraryAlbums, libraryArtists, libraryPlaylists
-   - AppleMusicLibraryView @State: songs, albums, artists, playlists
-   Fix: hoist into ONE long-lived @Observable store on AppModel (mirror
-   the existing `let library = LibraryStore()`), load-once, reuse across
-   navigations. User floated "just drop the AM lazy-load caches and re-
-   lazy-load each time" — measurement said that bucket is smaller than
-   feared, but hoisting to a shared store is the cleaner equivalent.
+1. ~~**Per-view MusicKit @State arrays** ("cause A2")~~ **DONE 2026-05-31
+   for AppleMusicHomeView.** New `AppleMusicStore` (@MainActor @Observable,
+   macOS-only + stub) holds the feed (recommendations/charts) + full
+   paginated library (songs/albums/artists/playlists) + loaded/loading
+   flags. Held as `let appleMusic = AppleMusicStore()` on AppModel
+   (mirrors `let library = LibraryStore()`). AppleMusicHomeView's @State
+   removed; it now reads `store.X` and its loadFeed/loadLibrary delegate
+   to the store (idempotent). Data survives navigation → single retained
+   copy, no re-fetch on return to the landing page. Build green.
+   FOLLOW-UP (small, deferred): `AppleMusicLibraryView` (legacy `.sheet`
+   in ContentView, capped `librarySongs(limit:100)` fetches, freed on
+   dismiss) still has its own @State — smaller + short-lived, left as-is.
+   It may also be dead UI (ContentView is the old shell; RootShellView is
+   current). Could migrate or delete later.
 2. **frames: [FeatureFrame] uncapped in live/mic mode** (latent leak).
    `appendLiveFrames`, AppModel.swift:1167 — appends 30/s forever, no
    eviction; track-change wipe is throttled 60s + suppressed same-song.
