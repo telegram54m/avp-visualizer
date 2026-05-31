@@ -67,6 +67,15 @@ struct SlipstreamGateComponent: Component {
     let hue: Float
     let loudness: Float
     let harmonicComplexity: Float
+    /// Live recycle pool (render-crash fix, 2026-05-31): in live mode the
+    /// gates are a FIXED pre-allocated pool (see `makeSlipstreamLive`).
+    /// A slot that's flowed past the camera — or been freed on track change
+    /// — carries `active = false` and `isEnabled = false`; `animate` skips
+    /// it (no Z update, no eviction) and `configureGate` reactivates it on
+    /// the next onset. So the scene graph is never structurally mutated in
+    /// live mode. Defaults to `true` so the preview path (`makeSlipstream`,
+    /// every gate real) is unaffected.
+    var active: Bool = true
 }
 
 /// Per-root state — the live-spawn cursor + track-change watcher. Same
@@ -173,6 +182,15 @@ struct SlipstreamRootComponent: Component {
     /// rebuild needs gating.
     var lastAppliedFogBrightness: CGFloat = .nan
     var lastAppliedFogHue: Float = .nan
+    /// True when this root is a LIVE recycle pool (`makeSlipstreamLive`).
+    /// In that mode gate eviction + track-change reset DEACTIVATE slots in
+    /// place (no removeFromParent) — the render-crash fix. Preview
+    /// (`makeSlipstream`) leaves this false and keeps the original
+    /// remove-on-evict behaviour (gates are transient, built at scene
+    /// create, never recycled). NOTE: preview therefore still removes gates
+    /// per-tick in `animate` — a latent version of the same race, but it's
+    /// not the observed (live-mode) crash; tracked as a follow-up.
+    var isLivePool: Bool = false
 }
 
 /// Tag for the fog backdrop entity so `animate` can find and update it
@@ -238,6 +256,13 @@ enum SlipstreamVisualizer {
     /// gates persist longer than usual). Inside the slow-corridor case
     /// the cap converts gradual FPS drift into a hard ceiling.
     static let liveModeGateCap = 80
+
+    /// Max nested rings any gate can have. `nestedRingCount` =
+    /// `1 + round(harmonicComplexity × 2)` ∈ [1, 3]. The live pool builds
+    /// every gate with this many ring children up front and toggles the
+    /// unused ones' `isEnabled` per onset — so a recycled slot can render
+    /// any gate's ring structure without adding/removing children.
+    static let maxNestedRings = 3
 
     /// Radius of the reactive fog backdrop sphere. Inside the global
     /// black backdrop (radius 50, added by VisualizerView) but outside
@@ -535,11 +560,27 @@ enum SlipstreamVisualizer {
         var state = SlipstreamRootComponent()
         state.lastSeenFrameIndex = startingFrameIndex
         state.lastSeenResetCounter = startingResetCounter
+        state.isLivePool = true
         root.components.set(state)
         // Same fog backdrop as the preview path — animate() drives it
         // from `frames[playbackIndex]` each tick.
         root.addChild(makeFogSphere())
         root.addChild(makeVocalGlow())
+
+        // RECYCLE POOL (render-crash fix, 2026-05-31). Mirrors the Crystal
+        // fix: pre-allocate the full fixed pool of `liveModeGateCap` gates
+        // here, once, all inactive (isEnabled=false, active=false). After
+        // this no child is ever added or removed in live mode —
+        // `scanForNewOnsets` reconfigures a free slot per onset and `animate`
+        // deactivates slots that flow past the camera, all in place. So the
+        // render thread can never race a `removeFromParent` against its draw
+        // (the EXC_BAD_ACCESS in re::encodeDrawCalls). The fog sphere +
+        // vocal glow added above carry no SlipstreamGateComponent, so the
+        // gate-only scans skip them and they're preserved.
+        let glow = sharedGlowTexture()
+        for _ in 0..<liveModeGateCap {
+            root.addChild(buildEmptyGate(glow: glow))
+        }
         return root
     }
 
@@ -586,13 +627,15 @@ enum SlipstreamVisualizer {
         let drumsOnset: [Bool]? = stemFeatures?.stems["drums"]?.onset
 
         if state.lastSeenResetCounter != appResetCounter {
-            // Only wipe gates — keep the fog sphere so the backdrop
-            // doesn't blink out at track change. Animate will reset
+            // Track change: DEACTIVATE every gate slot in place (no child
+            // removal — keeps the scene graph stable so the render thread
+            // can't race a removeFromParent). The fog sphere + vocal glow
+            // carry no gate component, so they're untouched. Animate resets
             // the fog's smoothing state separately.
             for child in root.children
                 where child.components[SlipstreamGateComponent.self] != nil
             {
-                child.removeFromParent()
+                deactivateGate(child)
             }
             state.lastSeenFrameIndex = frames.count
             state.liveGateCount = 0
@@ -606,6 +649,21 @@ enum SlipstreamVisualizer {
             upper = frames.count
         }
         guard upper > state.lastSeenFrameIndex else {
+            root.components.set(state)
+            return
+        }
+
+        // The fixed pool, gathered once. Slot for onset N is
+        // `liveGateCount % cap` — round-robin, so the oldest-spawned slot is
+        // the next reused (it has almost always already flowed past the
+        // camera and deactivated). When onset density genuinely exceeds the
+        // cap, the oldest in-flight gate is silently repurposed — the same
+        // behaviour as the old count-cap eviction, with zero scene mutation.
+        let gates = root.children.filter {
+            $0.components[SlipstreamGateComponent.self] != nil
+        }
+        let cap = gates.count
+        guard cap > 0 else {
             root.components.set(state)
             return
         }
@@ -628,16 +686,20 @@ enum SlipstreamVisualizer {
                 triggered = frames[k].onset
             }
             if triggered {
-                // Live spawn — record current corridor odometer so this
-                // gate's Z starts at -spawnDistance regardless of how
-                // far the corridor has already flowed.
-                let gate = spawnGate(
+                // Reconfigure the pool slot at `liveGateCount % cap` in
+                // place — record current corridor odometer so this gate's Z
+                // starts at -spawnDistance regardless of how far the corridor
+                // has already flowed. No addChild/removeFromParent; the cap
+                // is now the fixed pool size, so the old count-based eviction
+                // loop is gone.
+                let slot = gates[state.liveGateCount % cap]
+                configureGate(
+                    slot,
                     frame: frames[k],
                     glow: glow,
                     spawnedOdometer: state.corridorOdometer
                 )
-                gate.position.z = -spawnDistance
-                root.addChild(gate)
+                slot.position.z = -spawnDistance
                 state.liveGateCount += 1
                 spawnedThisTick += 1
                 // Onset pulse — each new onset bumps the pulse value,
@@ -646,32 +708,6 @@ enum SlipstreamVisualizer {
                 // of back-to-back onsets doesn't accumulate into a giant
                 // scale spike.
                 state.onsetPulse = min(1.2, state.onsetPulse + 0.9)
-
-                // Safety cap. Z-based eviction in animate() handles
-                // pruning naturally most of the time; this guards
-                // against pathologically-dense onset streams AND
-                // the speed-reactivity case where the corridor flows
-                // slowly during quiet passages (gates live longer).
-                //
-                // CRITICAL: only evict GATE children. The fog sphere is
-                // also a child of root and was added FIRST, so
-                // `root.children.first` would always remove it before
-                // any gate — destroying the backdrop after one cap-hit
-                // session. Iterate looking for the first gate-tagged
-                // child and remove that one.
-                while root.children.count > liveModeGateCap {
-                    var didEvict = false
-                    for child in root.children
-                        where child.components[SlipstreamGateComponent.self] != nil
-                    {
-                        child.removeFromParent()
-                        didEvict = true
-                        break
-                    }
-                    // No gates left to evict (only fog + non-gate children
-                    // remain) — bail to avoid an infinite loop.
-                    if !didEvict { break }
-                }
             }
         }
         state.lastSeenFrameIndex = upper
@@ -731,6 +767,38 @@ enum SlipstreamVisualizer {
         loudness: Float,
         glow: TextureResource
     ) -> ModelEntity {
+        let ent = buildEmptyRing()
+        configureRing(ent, radius: radius, hue: hue, loudness: loudness, glow: glow)
+        return ent
+    }
+
+    /// Build the bare ring skeleton — quad mesh + BillboardComponent +
+    /// placeholder material — with no per-onset appearance. `configureRing`
+    /// fills in the material + instanced particle transforms.
+    @MainActor
+    private static func buildEmptyRing() -> ModelEntity {
+        let mesh = makeQuadMesh(size: particleSize)
+        let ent = ModelEntity(mesh: mesh, materials: [UnlitMaterial()])
+        // BillboardComponent: each particle always faces the camera, so
+        // the glow texture reads as a soft round dot from any angle —
+        // critical because the camera moves along Z and we don't want
+        // particles to disappear edge-on as they pass.
+        ent.components.set(BillboardComponent())
+        return ent
+    }
+
+    /// Apply one onset's appearance to an existing ring entity: material
+    /// (hue + loudness-driven HDR) + a fresh ring of `particleCount`
+    /// instanced billboard transforms at `radius`. Pure component updates —
+    /// safe to call from the render tick (no scene-graph structural change).
+    @MainActor
+    private static func configureRing(
+        _ ent: ModelEntity,
+        radius: Float,
+        hue: Float,
+        loudness: Float,
+        glow: TextureResource
+    ) {
         // Particle count scales with loudness — loud onsets feel denser.
         let particleCount = particleBase + Int(loudness * Float(particleGain))
 
@@ -754,14 +822,7 @@ enum SlipstreamVisualizer {
         // on the inner-ring edges. Additive-style soft overlap is the
         // visual goal anyway.
         material.writesDepth = false
-
-        let mesh = makeQuadMesh(size: particleSize)
-        let ent = ModelEntity(mesh: mesh, materials: [material])
-        // BillboardComponent: each particle always faces the camera, so
-        // the glow texture reads as a soft round dot from any angle —
-        // critical because the camera moves along Z and we don't want
-        // particles to disappear edge-on as they pass.
-        ent.components.set(BillboardComponent())
+        ent.model?.materials = [material]
 
         var instances = MeshInstancesComponent()
         do {
@@ -779,8 +840,97 @@ enum SlipstreamVisualizer {
             print("SlipstreamVisualizer: LowLevelInstanceData init failed: \(error)")
         }
         ent.components.set(instances)
+    }
 
-        return ent
+    // MARK: - Live recycle pool (gate build / configure / free)
+
+    /// Build one inactive pool gate: a parent Entity with `maxNestedRings`
+    /// ring children, all disabled, plus an inactive SlipstreamGateComponent.
+    /// `configureGate` activates and dresses it per onset. Live mode only.
+    @MainActor
+    private static func buildEmptyGate(glow: TextureResource) -> Entity {
+        let gate = Entity()
+        var comp = SlipstreamGateComponent(
+            spawnTime: 0,
+            spawnedOdometer: 0,
+            baseRadius: baseRadius,
+            hue: 0,
+            loudness: 0,
+            harmonicComplexity: 0
+        )
+        comp.active = false
+        gate.components.set(comp)
+        gate.isEnabled = false
+        for _ in 0..<maxNestedRings {
+            let ring = buildEmptyRing()
+            ring.isEnabled = false
+            gate.addChild(ring)
+        }
+        return gate
+    }
+
+    /// Dress an existing pool gate for one onset frame, in place: set its
+    /// SlipstreamGateComponent (active), enable it, reset any leftover pulse
+    /// scale, and configure / enable exactly `nestedRingCount` ring children
+    /// (disabling the rest). No add/removeFromParent. MUST fully overwrite
+    /// every visual the prior occupant set.
+    @MainActor
+    private static func configureGate(
+        _ gate: Entity,
+        frame: FeatureFrame,
+        glow: TextureResource,
+        spawnedOdometer: Float
+    ) {
+        let radius = baseRadius + Float(frame.loudness) * radiusGain
+        // Harmonic complexity ∈ [0, 1] → 1..3 nested rings.
+        let nestedRingCount = 1 + Int((frame.harmonicComplexity * 2).rounded())
+
+        var comp = SlipstreamGateComponent(
+            spawnTime: frame.time,
+            spawnedOdometer: spawnedOdometer,
+            baseRadius: radius,
+            hue: Float(frame.color.hue),
+            loudness: Float(frame.loudness),
+            harmonicComplexity: Float(frame.harmonicComplexity)
+        )
+        comp.active = true
+        gate.components.set(comp)
+        gate.isEnabled = true
+        // Clear any pulse-scale left on the slot by its prior occupant;
+        // animate sets the live pulse scale next tick.
+        gate.scale = SIMD3<Float>(repeating: 1)
+
+        let rings = gate.children
+        for ringIdx in 0..<rings.count {
+            guard let ring = rings[ringIdx] as? ModelEntity else { continue }
+            if ringIdx < nestedRingCount {
+                // Inner rings step inward by 18% of the previous radius.
+                let ringR = radius * (1.0 - Float(ringIdx) * 0.18)
+                configureRing(
+                    ring,
+                    radius: ringR,
+                    hue: Float(frame.color.hue),
+                    loudness: Float(frame.loudness),
+                    glow: glow
+                )
+                ring.isEnabled = true
+            } else {
+                ring.isEnabled = false
+            }
+        }
+    }
+
+    /// Free a pool gate without removing it from the scene: mark its
+    /// component inactive and disable it. `animate` then skips it and
+    /// `configureGate` can reclaim it on a later onset. The core of the
+    /// no-structural-mutation render-crash fix.
+    @MainActor
+    private static func deactivateGate(_ gate: Entity) {
+        if var comp = gate.components[SlipstreamGateComponent.self] {
+            comp.active = false
+            gate.components.set(comp)
+        }
+        gate.isEnabled = false
     }
 
     // MARK: - Animate (per-frame)
@@ -816,7 +966,13 @@ enum SlipstreamVisualizer {
             for child in root.children
                 where child.components[SlipstreamGateComponent.self] != nil
             {
-                child.removeFromParent()
+                // Live pool: free the slot in place (no scene mutation).
+                // Preview: gates are transient, remove as before.
+                if state.isLivePool {
+                    deactivateGate(child)
+                } else {
+                    child.removeFromParent()
+                }
             }
             state.lastSeenFrameIndex = frames.count
             state.liveGateCount = 0
@@ -1157,9 +1313,18 @@ enum SlipstreamVisualizer {
         var toEvict: [Entity] = []
         for child in root.children {
             guard let gc = child.components[SlipstreamGateComponent.self] else { continue }
+            // Live pool: skip free slots (inactive — already flowed past the
+            // camera or reset). Preview gates are always active.
+            guard gc.active else { continue }
             let z = -spawnDistance + (state.corridorOdometer - gc.spawnedOdometer)
             if z > evictionThreshold {
-                toEvict.append(child)
+                // Live pool: free the slot in place (no removeFromParent —
+                // the render-crash fix). Preview: collect for removal.
+                if state.isLivePool {
+                    deactivateGate(child)
+                } else {
+                    toEvict.append(child)
+                }
                 continue
             }
             child.position.z = z

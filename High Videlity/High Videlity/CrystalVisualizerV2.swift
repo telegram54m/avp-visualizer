@@ -344,12 +344,32 @@ enum CrystalVisualizerV2 {
         // Warm the shared additive program now so `scanForNewOnsets` (which
         // is synchronous) can read it from the cache without ever blocking
         // on async build.
-        _ = await sharedAdditiveProgram()
+        let additiveProgram = await sharedAdditiveProgram()
         // Pre-build the canonical mesh palette so the first live spawn
         // doesn't pay 5× MeshResource-build cost on the audio-driven scan.
         warmMeshPalette()
         let root = Entity()
         root.position = [0, 1.3, -1.5]
+
+        // RECYCLE POOL (render-crash fix, 2026-05-31). Previously live mode
+        // grew the cluster via addChild per onset and evicted the oldest via
+        // removeFromParent — both STRUCTURAL mutations of the scene graph,
+        // performed from inside the SceneEvents.Update closure while
+        // RealityKit's render thread concurrently draws that same graph. The
+        // per-tick remove raced the draw → use-after-free crash on the CoreRE
+        // render thread (EXC_BAD_ACCESS in re::encodeDrawCalls).
+        //
+        // Fix mirrors Clouds (the one live mode never implicated): pre-build
+        // the FULL fixed pool of `liveModeShardCap` shardGroups here, once,
+        // all inactive (scale .zero, ShardComponent.active = false → animate
+        // skips them, nothing renders). `scanForNewOnsets` then RECONFIGURES
+        // an existing slot per onset instead of adding/removing. After this
+        // call no structural mutation ever happens again, so the render
+        // thread has nothing to race.
+        for _ in 0..<liveModeShardCap {
+            root.addChild(buildEmptyShardGroup(additiveProgram: additiveProgram))
+        }
+
         var state = CrystalLiveStateComponent()
         state.lastSeenFrameIndex = startingFrameIndex
         state.lastSeenResetCounter = startingResetCounter
@@ -372,9 +392,22 @@ enum CrystalVisualizerV2 {
         guard var state = root.components[CrystalLiveStateComponent.self] else { return }
         guard let additiveProgram = cachedAdditiveProgram else { return }
 
+        // The pool was pre-allocated in `makeCrystalLive`; its size is the
+        // recycle capacity. (Guard against an empty root in case this is
+        // ever called on a non-pool entity.)
+        let pool = root.children
+        let cap = pool.count
+        guard cap > 0 else {
+            root.components.set(state)
+            return
+        }
+
         // Track-change reset: AppModel bumped `liveModeResetCounter` (e.g.
-        // Shazam detected a new song or user clicked next/restart). Drop
-        // every spawned shardGroup and start fresh.
+        // Shazam detected a new song or user clicked next/restart). DEACTIVATE
+        // every pool slot in place rather than removing children — no
+        // structural mutation, so nothing for the render thread to race.
+        // `active = false` + onsetTime → ∞ makes `animate` skip the slot
+        // (hidden, excluded from camera targeting) until it's reconfigured.
         //
         // Seed `lastSeenFrameIndex` to the CURRENT `frames.count`, not 0.
         // Between the reset firing and this tick running, the polling task
@@ -384,8 +417,13 @@ enum CrystalVisualizerV2 {
         // we wait for genuinely-new frames, giving a gradual buildup that
         // matches the song's onset rate.
         if state.lastSeenResetCounter != appResetCounter {
-            for child in root.children {
-                child.removeFromParent()
+            for slot in pool {
+                if var info = slot.components[ShardComponent.self] {
+                    info.active = false
+                    info.onsetTime = .infinity
+                    slot.components.set(info)
+                }
+                slot.scale = .zero
             }
             state.lastSeenFrameIndex = frames.count
             state.liveShardCount = 0
@@ -406,24 +444,23 @@ enum CrystalVisualizerV2 {
                 let phiInverse = 0.6180339887498949
                 let frac = (Double(state.liveShardCount) * phiInverse)
                     .truncatingRemainder(dividingBy: 1.0)
-                let shardGroup = spawnShardGroup(
+
+                // Reconfigure the slot at `liveShardCount % cap` in place.
+                // When the count wraps past `cap`, the oldest occupant is
+                // silently overwritten — the same eviction behaviour as the
+                // old `removeFromParent` loop, but with zero scene-graph
+                // mutation. `frame.time` is monotonic in live mode, so the
+                // reused slot's onsetTime always moves FORWARD; `animate`
+                // sees age ≈ 0 and pops it back in fresh.
+                let slotIndex = state.liveShardCount % cap
+                configure(
+                    pool[slotIndex],
                     frame: frames[k],
                     elevationFraction: frac,
                     indexForWobble: state.liveShardCount,
                     additiveProgram: additiveProgram
                 )
-                root.addChild(shardGroup)
                 state.liveShardCount += 1
-
-                // Recycle oldest: cap visible shards so render perf stays
-                // stable over a long session. Each shard is 3 additive
-                // child meshes; at the cap that's ~600 meshes, well
-                // under the v1 dropout point (~700). The cluster looks
-                // visually full at ~200 anyway — going past that just
-                // fills already-occupied solid angles.
-                while root.children.count > liveModeShardCap {
-                    root.children.first?.removeFromParent()
-                }
             }
         }
         state.lastSeenFrameIndex = upper
@@ -439,9 +476,73 @@ enum CrystalVisualizerV2 {
     /// the first eviction out to several minutes in for typical music.
     static let liveModeShardCap: Int = 300
 
+    /// Find a shardGroup's child by its BeamRole. Children are added in a
+    /// fixed order (shard, halo, core) but we look up by role so `configure`
+    /// stays robust to ordering.
+    @MainActor
+    private static func child(_ group: Entity, _ kind: BeamRole.Kind) -> ModelEntity? {
+        for c in group.children {
+            if let role = c.components[BeamRole.self], role.kind == kind {
+                return c as? ModelEntity
+            }
+        }
+        return nil
+    }
+
+    /// Build the entity SKELETON for one shardGroup — the three child
+    /// ModelEntities (shard / halo / core) with shared canonical meshes,
+    /// placeholder materials, BeamRole tags and zeroed opacity — but NO
+    /// per-frame appearance. Starts inactive (scale .zero,
+    /// `ShardComponent.active = false`) so `animate` skips it until
+    /// `configure` activates it.
+    ///
+    /// Live mode pre-allocates `liveModeShardCap` of these once in
+    /// `makeCrystalLive`, then recycles them via `configure` — so the scene
+    /// graph is never structurally mutated after build (the render-crash fix).
+    @MainActor
+    private static func buildEmptyShardGroup(additiveProgram: UnlitMaterial.Program) -> Entity {
+        let shardGroup = Entity()
+        shardGroup.position = .zero
+        shardGroup.scale = .zero
+        var inactive = ShardComponent(
+            onsetTime: .infinity,
+            direction: SIMD3<Float>(0, 1, 0),
+            length: 0.3,
+            wobbleFreq: 1,
+            wobblePhase: 0
+        )
+        inactive.active = false
+        shardGroup.components.set(inactive)
+
+        // Shard: non-additive translucent spike. Canonical mesh + placeholder
+        // material; `configure` swaps in the real per-frame mesh + tint.
+        let shardEnt = ModelEntity(mesh: Self.sharedShardMesh(sides: 4), materials: [UnlitMaterial()])
+        shardEnt.components.set(BeamRole(.shard))
+        shardEnt.components.set(OpacityComponent(opacity: 0))
+        shardGroup.addChild(shardEnt)
+
+        // Halo: additive colored envelope.
+        var haloMaterial = UnlitMaterial(program: additiveProgram)
+        haloMaterial.writesDepth = false
+        let haloEnt = ModelEntity(mesh: Self.sharedBeamMesh(), materials: [haloMaterial])
+        haloEnt.components.set(BeamRole(.halo))
+        haloEnt.components.set(OpacityComponent(opacity: 0))
+        shardGroup.addChild(haloEnt)
+
+        // Core: additive white-hot filament.
+        var coreMaterial = UnlitMaterial(program: additiveProgram)
+        coreMaterial.writesDepth = false
+        let coreEnt = ModelEntity(mesh: Self.sharedBeamMesh(), materials: [coreMaterial])
+        coreEnt.components.set(BeamRole(.core))
+        coreEnt.components.set(OpacityComponent(opacity: 0))
+        shardGroup.addChild(coreEnt)
+
+        return shardGroup
+    }
+
     /// Build one shardGroup entity (cone shard + additive halo + core beam)
-    /// for a single onset frame. Used both by the preview-mode `makeCrystal`
-    /// loop and by live-mode `scanForNewOnsets`.
+    /// for a single onset frame. Used by the preview-mode `makeCrystal` loop.
+    /// (Live mode builds empty pool slots and `configure`s them in place.)
     ///
     /// `elevationFraction` is the fraction-of-sphere coordinate that
     /// determines the shard's polar angle (0 → south pole, 1 → north pole).
@@ -453,6 +554,35 @@ enum CrystalVisualizerV2 {
         indexForWobble i: Int,
         additiveProgram: UnlitMaterial.Program
     ) -> Entity {
+        let group = buildEmptyShardGroup(additiveProgram: additiveProgram)
+        configure(
+            group,
+            frame: frame,
+            elevationFraction: elevationFraction,
+            indexForWobble: i,
+            additiveProgram: additiveProgram
+        )
+        return group
+    }
+
+    /// Apply one onset frame's full appearance to an EXISTING shardGroup —
+    /// direction / length / colors / scales / positions / ShardComponent —
+    /// mutating its three child entities in place. This is the recycle
+    /// primitive: live mode calls it on a pre-allocated pool slot per onset
+    /// (no add/removeFromParent), and `spawnShardGroup` calls it once on a
+    /// freshly-built skeleton for the preview path.
+    ///
+    /// MUST fully reset every visual the previous occupant could have set, or
+    /// stale appearance bleeds across a recycle. Soak-test by wrapping the
+    /// pool (>`liveModeShardCap` onsets in one session).
+    @MainActor
+    private static func configure(
+        _ shardGroup: Entity,
+        frame: FeatureFrame,
+        elevationFraction: Double,
+        indexForWobble i: Int,
+        additiveProgram: UnlitMaterial.Program
+    ) {
         // Pitch-class hue → azimuth. Elevation from caller — `i/n` for the
         // preview path (HTML's `buildCrystals` behavior), or a golden-ratio
         // sequence for live mode that gives any prefix a well-distributed
@@ -498,11 +628,10 @@ enum CrystalVisualizerV2 {
             // the centroid sat at dir*length/2 and breathing stretched
             // symmetrically around it — both base AND tip moved (the base
             // even drifted into negative-dir territory at breath > 1).
-            let shardGroup = Entity()
             shardGroup.orientation = simd_quatf(from: [0, 1, 0], to: dir)
             shardGroup.position = .zero
             shardGroup.scale = .zero    // hidden until onset; animate flips it on
-            shardGroup.components.set(ShardComponent(
+            var shardInfo = ShardComponent(
                 onsetTime: frame.time,
                 direction: dir,
                 length: length,
@@ -513,7 +642,9 @@ enum CrystalVisualizerV2 {
                 // live mode) so phase distribution matches the spherical
                 // distribution.
                 wobblePhase: elevationFraction * 2 * .pi
-            ))
+            )
+            shardInfo.active = true     // wake the slot — animate now drives it
+            shardGroup.components.set(shardInfo)
 
             let hue = CGFloat(frame.color.hue)
 
@@ -551,7 +682,10 @@ enum CrystalVisualizerV2 {
             // the same x/z factor. See the "Shared mesh palette" comment
             // block above for the leak history this fixes.
             let shardMesh = Self.sharedShardMesh(sides: shardSides)
-            let shardEnt = ModelEntity(mesh: shardMesh, materials: [shardMaterial])
+            // Mutate the pre-built child in place (no add/removeFromParent).
+            guard let shardEnt = Self.child(shardGroup, .shard) else { return }
+            shardEnt.model?.mesh = shardMesh
+            shardEnt.model?.materials = [shardMaterial]
             let shardRadialScale = baseRadius / canonicalShardBaseRadius
             shardEnt.scale = SIMD3<Float>(
                 shardRadialScale,
@@ -569,9 +703,7 @@ enum CrystalVisualizerV2 {
             // behaviour. (Unchanged from the unique-mesh era; the
             // position-offset formula uses the desired post-scale length.)
             shardEnt.position = [0, length / 2, 0]
-            shardEnt.components.set(BeamRole(.shard))
             shardEnt.components.set(OpacityComponent(opacity: 0))
-            shardGroup.addChild(shardEnt)
 
             // --- Beam: halo (colored envelope) + core (white-hot filament) ---
             // Both additive. Scaled up alongside shards (~2.7×) so beams
@@ -629,7 +761,9 @@ enum CrystalVisualizerV2 {
             // materials. Additive blending also doesn't need depth write —
             // contributions sum regardless of order.
             haloMaterial.writesDepth = false
-            let haloEnt = ModelEntity(mesh: haloMesh, materials: [haloMaterial])
+            guard let haloEnt = Self.child(shardGroup, .halo) else { return }
+            haloEnt.model?.mesh = haloMesh
+            haloEnt.model?.materials = [haloMaterial]
             let haloRadialScale = haloBottom / canonicalBeamBottomRadius
             haloEnt.scale = SIMD3<Float>(
                 haloRadialScale,
@@ -637,9 +771,7 @@ enum CrystalVisualizerV2 {
                 haloRadialScale
             )
             haloEnt.position = [0, beamCenterY, 0]
-            haloEnt.components.set(BeamRole(.halo))
             haloEnt.components.set(OpacityComponent(opacity: 0))
-            shardGroup.addChild(haloEnt)
 
             // Core: thin near-white-hot filament inside the halo. HDR
             // boost 1.5 — enough to drive optical bloom on visionOS and
@@ -663,7 +795,9 @@ enum CrystalVisualizerV2 {
             var coreMaterial = UnlitMaterial(program: additiveProgram)
             coreMaterial.color = .init(tint: coreColor)
             coreMaterial.writesDepth = false
-            let coreEnt = ModelEntity(mesh: coreMesh, materials: [coreMaterial])
+            guard let coreEnt = Self.child(shardGroup, .core) else { return }
+            coreEnt.model?.mesh = coreMesh
+            coreEnt.model?.materials = [coreMaterial]
             let coreRadialScale = coreBottom / canonicalBeamBottomRadius
             coreEnt.scale = SIMD3<Float>(
                 coreRadialScale,
@@ -671,10 +805,6 @@ enum CrystalVisualizerV2 {
                 coreRadialScale
             )
             coreEnt.position = [0, beamCenterY, 0]
-            coreEnt.components.set(BeamRole(.core))
             coreEnt.components.set(OpacityComponent(opacity: 0))
-            shardGroup.addChild(coreEnt)
-
-        return shardGroup
     }
 }

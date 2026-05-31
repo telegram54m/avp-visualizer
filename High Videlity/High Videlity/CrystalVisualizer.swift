@@ -37,6 +37,13 @@ struct ShardComponent: Component {
     var length: Float
     var wobbleFreq: Double
     var wobblePhase: Double
+    /// Live-mode recycle pool: slots are pre-allocated at scene build and
+    /// reused in place (no add/removeFromParent — see CrystalVisualizerV2
+    /// `makeCrystalLive`). An unconfigured or track-change-deactivated slot
+    /// carries `active = false`; `animate` skips it entirely so it neither
+    /// renders nor pollutes camera targeting. Defaults to `true` so the
+    /// preview path (`makeCrystal`, every shardGroup real) is unaffected.
+    var active: Bool = true
 }
 
 /// Tags each child of a v2 shardGroup so `animate` can pick the right HTML
@@ -77,6 +84,15 @@ enum CrystalVisualizer {
 
         for shard in crystal.children {
             guard let info = shard.components[ShardComponent.self] else { continue }
+
+            // Live-mode recycle pool: skip inactive slots (pre-allocated but
+            // not yet configured, or deactivated on track change). Keep them
+            // hidden and exclude them from camera-target tracking below so a
+            // placeholder direction never captures the camera.
+            if !info.active {
+                shard.scale = .zero
+                continue
+            }
 
             // Track the next shard still to appear — the camera anticipates it.
             if info.onsetTime > clock && info.onsetTime < nextOnset {
