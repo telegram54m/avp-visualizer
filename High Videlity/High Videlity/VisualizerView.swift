@@ -129,10 +129,11 @@ struct VisualizerView: View {
 
             switch appModel.mode {
             case .crystal:
-                // V2 only. The legacy v1 (stacked cylinders) was
-                // retired with the Visualizers-page rebuild —
-                // CrystalVisualizer.swift is dead code now, kept on
-                // disk for diff context only.
+                // Scene construction is V2 only (the legacy v1 stacked-
+                // cylinder builder was retired with the Visualizers-page
+                // rebuild). NOTE: CrystalVisualizer.swift is NOT dead — it
+                // still hosts the shared ShardComponent / BeamRole and the
+                // `CrystalVisualizer.animate` driver both Crystal paths use.
                 let crystal: Entity
                 if isLive {
                     crystal = await CrystalVisualizerV2.makeCrystalLive(
@@ -649,46 +650,6 @@ private struct EmptyStatePrompt: View {
     }
 }
 
-/// Bottom-left pill in the visualizer: shows the current mode and
-/// advances to the next on tap. Mode list = `VisualizerMode.allCases`,
-/// wraps around at the end.
-struct ModeCycleButton: View {
-    @Environment(AppModel.self) private var appModel
-
-    var body: some View {
-        Button {
-            cycleMode()
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "sparkles")
-                Text(appModel.mode.displayName)
-                    .lineLimit(1)
-                    .fixedSize()
-                Image(systemName: "arrow.right.circle.fill")
-            }
-            .font(.caption.weight(.medium))
-            .foregroundStyle(.primary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.thinMaterial, in: Capsule())
-        }
-        .buttonStyle(.plain)
-        .help("Switch to next visualizer mode")
-    }
-
-    private func cycleMode() {
-        let modes = VisualizerMode.allCases
-        guard let idx = modes.firstIndex(of: appModel.mode) else { return }
-        let next = modes[(idx + 1) % modes.count]
-        appModel.mode = next
-    }
-}
-
-/// Small debug pill showing the visualizer's frame rate. Reads
-/// `appModel.publishedFPS`, which is updated at ~2 Hz from each
-/// visualizer's animate subscription — keeps redraw load minimal
-/// while still feeling live. Style matches `ModeCycleButton` so the
-/// two read as a paired set in the corner.
 /// Condensed BPM pill that opens a popover with the full debug
 /// readout. Replaces the row of FPS / Beat / Stems / Mic / System-
 /// Music badges that used to fill the viz's bottom-left corner —
@@ -961,8 +922,8 @@ struct MicDiagBadge: View {
 /// iOS-only badge for the system-music-follow mode. Shows what Music.app
 /// reports playing + the live playhead in seconds, plus prev/play-pause/
 /// next transport controls. Companion to MicDiagBadge for the other
-/// (mic-based) iOS audio path. Mirrors the macOS NowPlayingBadge's
-/// transport row.
+/// (mic-based) iOS audio path. Mirrors the macOS now-playing
+/// transport row in the global footer.
 struct SystemMusicBadge: View {
     @Environment(AppModel.self) private var appModel
 
@@ -1029,146 +990,5 @@ struct SystemMusicBadge: View {
 }
 #endif
 
-#if os(macOS)
-/// Small in-corner readout: which process is being tapped + what's
-/// playing + (when AM is playing in-app) transport controls so the user
-/// can prev/restart/play-pause/next without leaving the visualizer.
-/// Hidden when not in live system-audio mode.
-private struct NowPlayingBadge: View {
-    @Environment(AppModel.self) private var appModel
-
-    var body: some View {
-        if appModel.useSystemAudio {
-            VStack(alignment: .trailing, spacing: 4) {
-                HStack(spacing: 6) {
-                    // Opens the full Now-Playing inspector. The badge
-                    // hides while the inspector is up (see
-                    // VisualizerView's bottom-trailing overlay), so
-                    // this button only ever needs the "open"
-                    // affordance. Left-aligned so it pairs visually
-                    // with the source label that follows it.
-                    Button {
-                        appModel.showNowPlayingInspector = true
-                    } label: {
-                        Image(systemName: "sidebar.right")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Open Now Playing panel")
-                    .accessibilityLabel("Open Now Playing panel")
-
-                    if let source = appModel.systemAudio.tappedProcessName {
-                        sourceLabel(for: source)
-                    }
-                }
-                Text(nowPlayingLabel)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                // Show transport controls when we can drive *something*:
-                //   • in-app AM playback via ApplicationMusicPlayer, OR
-                //   • Music.app system-audio-tap mode via SystemMusicPlayer
-                //     (public MusicKit API — drives Music.app's own
-                //     transport, the visualizer resets cleanly on each
-                //     next/prev via `bumpLiveResetForTrackChange`).
-                // For Spotify / browser sources we can't drive playback —
-                // skip the controls to avoid misleading buttons.
-                if appModel.isControllingSystemMusic
-                    || appModel.musicKit.isPlaying
-                    || appModel.musicKit.nowPlaying != nil
-                {
-                    transportControls
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
-            .frame(maxWidth: 320, alignment: .trailing)
-        }
-    }
-
-    private var transportControls: some View {
-        HStack(spacing: 14) {
-            Button {
-                Task { await appModel.playerSkipToPrevious() }
-            } label: {
-                Image(systemName: "backward.fill")
-            }
-            .help("Previous song")
-
-            Button {
-                appModel.playerRestart()
-            } label: {
-                Image(systemName: "arrow.counterclockwise")
-            }
-            .help("Restart this song")
-
-            Button {
-                Task { await appModel.playerTogglePlayPause() }
-            } label: {
-                Image(systemName: appModel.isPlayingForUI
-                      ? "pause.fill" : "play.fill")
-            }
-            .help(appModel.isPlayingForUI ? "Pause" : "Play")
-
-            Button {
-                Task { await appModel.playerSkipToNext() }
-            } label: {
-                Image(systemName: "forward.fill")
-            }
-            .help("Next song")
-        }
-        .buttonStyle(.plain)
-        .font(.system(size: 14, weight: .semibold))
-        .foregroundStyle(.primary)
-        .padding(.top, 2)
-    }
-
-    private var nowPlayingLabel: String {
-        // When we control AM playback in-app, prefer the live nowPlaying
-        // song over the Shazam-identified title — the AM metadata is
-        // authoritative for what's actually playing right now and
-        // updates instantly on next/prev (Shazam takes ~10s to catch up).
-        if let np = appModel.musicKit.nowPlaying {
-            return "\(np.title) — \(np.artistName)"
-        }
-        switch appModel.shazam.status {
-        case .matched(let title, let artist):
-            return "\(title) — \(artist)"
-        case .listening:
-            return "Identifying…"
-        case .failed(let msg):
-            return msg
-        case .idle:
-            return ""
-        }
-    }
-
-    /// Friendly source label for the tap-process row. Special-cases
-    /// `RemotePlayerService` — the macOS helper process Apple Music
-    /// uses to render audio — to the Apple-logo + "Music" treatment
-    /// so the badge matches the user's mental model. Other sources
-    /// keep the speaker glyph + raw process name (Spotify renders as
-    /// "Spotify", Safari as "Safari", etc.).
-    @ViewBuilder
-    private func sourceLabel(for raw: String) -> some View {
-        if raw == "RemotePlayerService" {
-            Label {
-                Text("Music")
-            } icon: {
-                Image(systemName: "applelogo")
-            }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-        } else {
-            Label(raw, systemImage: "speaker.wave.2.fill")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-    }
-}
-#endif
 
 #endif

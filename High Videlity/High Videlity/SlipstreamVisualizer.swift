@@ -79,8 +79,8 @@ struct SlipstreamGateComponent: Component {
 }
 
 /// Per-root state — the live-spawn cursor + track-change watcher. Same
-/// shape as `CrystalLiveStateComponent` / `ArchLiveStateComponent` so the
-/// reset / replay-burst protection patterns transfer directly.
+/// shape as `CrystalLiveStateComponent` so the reset / replay-burst
+/// protection patterns transfer directly.
 struct SlipstreamRootComponent: Component {
     /// Index into `appModel.frames` we've already scanned for onsets.
     var lastSeenFrameIndex: Int = 0
@@ -194,8 +194,8 @@ struct SlipstreamRootComponent: Component {
 }
 
 /// Tag for the fog backdrop entity so `animate` can find and update it
-/// each tick. Identical pattern to Crystal's BeamRole / Architecture's
-/// ArchRingComponent for tagged-entity lookups.
+/// each tick. Identical pattern to Crystal's BeamRole for tagged-entity
+/// lookups.
 struct SlipstreamFogComponent: Component {}
 
 /// Tag for the vocal-source glow at the corridor horizon. The vocalist
