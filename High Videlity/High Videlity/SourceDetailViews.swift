@@ -10,8 +10,9 @@
 //  ContentView pre-Phase-7. The intent is NOT to redesign the
 //  surfaces — that's risky and the user just wants the IA to make
 //  sense. The Apple Music / Local detail views still trigger the
-//  same sheets (LibraryBrowserView, AppleMusicLibraryView, etc.)
-//  they did before. Settings carries the controls that used to be
+//  same sheets (LibraryBrowserView, etc.) they did before, and the
+//  AM library now lives inline as a scope in AppleMusicHomeView.
+//  Settings carries the controls that used to be
 //  inline with the rest of ContentView's mode picker block.
 //
 

@@ -14,8 +14,9 @@
 //       each rendered as a horizontal scroll of artwork cards.
 //    3. Top Charts — Top Songs, Top Albums, Top Playlists rows,
 //       each horizontal-scroll of cards.
-//    4. "Your Library" — a featured card that pushes
-//       AppleMusicLibraryView via NavigationLink (no more modal).
+//    4. "Library" scope — the user's own saved songs / albums /
+//       artists / playlists, rendered inline via the scope picker
+//       (the old AppleMusicLibraryView modal was retired in Phase 7).
 //
 //  Loading is opportunistic: recommendations + charts fetched on
 //  appear, cached across navigation within the session. A reload

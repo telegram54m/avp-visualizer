@@ -33,7 +33,6 @@ struct ContentView: View {
     /// VisualizerView can toggle and observe the same state — see
     /// AppModel.showNowPlayingInspector for the rationale.
     #if os(macOS)
-    @State private var showAppleMusicLibrary = false
     @State private var showBrowse = false
     #endif
 
@@ -303,12 +302,6 @@ struct ContentView: View {
                 // search results for screen real estate.
                 HStack(spacing: 8) {
                     Button {
-                        showAppleMusicLibrary = true
-                    } label: {
-                        Label("My Library", systemImage: "music.note.house")
-                    }
-                    .buttonStyle(.bordered)
-                    Button {
                         showBrowse = true
                     } label: {
                         Label("Browse", systemImage: "rectangle.grid.2x2")
@@ -332,9 +325,6 @@ struct ContentView: View {
             }
         }
         #if os(macOS)
-        .sheet(isPresented: $showAppleMusicLibrary) {
-            AppleMusicLibraryView(appModel: appModel)
-        }
         .sheet(isPresented: $showBrowse) {
             BrowseView(appModel: appModel)
         }
